@@ -1,0 +1,47 @@
+name: Feature request
+description: Propose a connector or product capability grounded in a real workflow
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Link is building the data intake foundation first. A strong proposal explains the user problem, source boundary, and observable result before suggesting implementation details.
+  - type: textarea
+    id: problem
+    attributes:
+      label: User problem
+      description: What cannot be done today, and who experiences it?
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Desired outcome
+      description: Describe the successful workflow from the user's point of view.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Product area
+      options:
+        - New connector
+        - LinkAgent desktop experience
+        - Raw data browsing
+        - Web crawler
+        - Deployment and operations
+        - Developer experience
+    validations:
+      required: true
+  - type: textarea
+    id: source
+    attributes:
+      label: Source and authorization boundary
+      description: For connector ideas, explain where the data lives and what the user should authorize.
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Examples or evidence
+      description: Add sanitized examples, comparable workflows, or links that clarify the need.

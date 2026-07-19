@@ -1,33 +1,65 @@
 name: Bug report
-description: 报告可复现的问题，不要附带真实用户数据或凭据
-title: "[Bug] "
-labels: [bug]
+description: Report a reproducible problem in Link or LinkAgent
+title: "[Bug]: "
+labels:
+  - bug
 body:
-  - type: textarea
-    id: problem
+  - type: markdown
     attributes:
-      label: 问题描述
-      description: 说明预期行为和实际行为。
-    validations:
-      required: true
-  - type: textarea
-    id: reproduce
+      value: |
+        Thanks for helping improve Link. Remove tokens, private paths, and raw conversation content before attaching logs or screenshots.
+  - type: dropdown
+    id: component
     attributes:
-      label: 复现步骤
-      description: 使用脱敏数据提供最小复现步骤。
+      label: Component
+      options:
+        - Link Web / platform API
+        - LinkAgent
+        - Codex connector
+        - Web crawler
+        - Docker / deployment
+        - Documentation
     validations:
       required: true
   - type: input
     id: version
     attributes:
-      label: Link 版本
-      placeholder: 0.2.0
+      label: Version
+      placeholder: 0.2.1 Developer Preview or commit SHA
     validations:
       required: true
-  - type: checkboxes
-    id: privacy
+  - type: textarea
+    id: problem
     attributes:
-      label: 隐私确认
-      options:
-        - label: 我已移除对话、令牌、本机路径和其他个人数据
-          required: true
+      label: What happened?
+      description: Describe the behavior and why it is a problem.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction steps
+      placeholder: |
+        1. Open ...
+        2. Click ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      placeholder: macOS version, CPU architecture, Docker version, browser
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Sanitized diagnostics
+      description: Include only the smallest useful log excerpt. Never include credentials or raw personal data.
