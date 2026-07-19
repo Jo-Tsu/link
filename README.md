@@ -2,13 +2,14 @@
 
 Link 是一个本地优先的原始数据接入平台。它通过 LinkAgent 在用户电脑上读取获得授权的数据，以增量批次写入 PostgreSQL 原始池，并在 Web 端按“连接器 → 来源容器 → 原始记录”完成浏览与追溯。
 
-当前版本是 `0.2.0 Developer Preview`，目标是验证数据接入闭环，不包含多租户、邮箱登录、数据治理、记忆、知识库和检索。不要把当前版本直接部署到公网。
+当前版本是 `0.2.1 Developer Preview`，目标是验证数据接入闭环，不包含多租户、邮箱登录、数据治理、记忆、知识库和检索。不要把当前版本直接部署到公网。
 
 ## 当前能力
 
 - Codex 本地历史只读接入
 - 用户输入、Codex 输出、CLI、工具和技能线索原始入池
 - LinkAgent macOS 客户端配对、心跳、增量同步和离线队列
+- LinkAgent 菜单栏快捷浮层、最近接入状态和一键同步
 - 连接器、来源容器和原始记录浏览
 - 独立网页采集器
 - Docker Compose 本地运行
@@ -42,6 +43,12 @@ docker compose down
 ```
 
 详细说明见 [本地运行文档](docs/local-stable-run.md)。
+
+## 阿里云私有测试部署
+
+当前版本可以部署到 ECS，但由于尚无邮箱登录和多租户鉴权，只支持通过 SSH 隧道访问的私有测试方式。ECS 上的 Link、PostgreSQL 和 Crawler 均只监听回环地址，安全组只允许受信任 IP 访问 SSH。
+
+部署步骤、隧道命令和安全边界见 [阿里云私有测试部署](docs/aliyun-private-deployment.md)。
 
 ## LinkAgent 开发
 
@@ -78,6 +85,6 @@ npm run build
 
 ## 许可证
 
-当前代码采用 [Business Source License 1.1](LICENSE) 进行源代码开放。允许个人、开发测试和内部业务使用，但未经商业授权不得将 Link 的主要功能作为第三方托管或管理服务提供。`0.2.0` 计划在 `2030-07-19` 转为 Apache-2.0。
+当前代码采用 [Business Source License 1.1](LICENSE) 进行源代码开放。允许个人、开发测试和内部业务使用，但未经商业授权不得将 Link 的主要功能作为第三方托管或管理服务提供。`0.2.1` 计划在 `2030-07-19` 转为 Apache-2.0。
 
 BSL 不是 OSI 认可的开源许可证，因此本项目对外使用“源代码开放”或 `source available` 表述。

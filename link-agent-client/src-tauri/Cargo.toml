@@ -1,6 +1,6 @@
 [package]
 name = "link-agent-client"
-version = "0.2.0"
+version = "0.2.1"
 description = "Link local connector agent"
 authors = ["Link Project"]
 license = "BUSL-1.1"

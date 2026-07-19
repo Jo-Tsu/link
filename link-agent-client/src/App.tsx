@@ -1,8 +1,10 @@
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { disable, enable, isEnabled } from "@tauri-apps/plugin-autostart";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   Activity,
+  ArrowUpRight,
   Cable,
   CheckCircle2,
   ChevronRight,
@@ -44,7 +46,18 @@ type AgentState = {
   codexPath: string;
   syncing: boolean;
   queuedBatches: number;
+  usageToday: TokenUsage;
   lastSync?: SyncSummary;
+};
+
+type TokenUsage = {
+  inputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
+  reasoningOutputTokens: number;
+  totalTokens: number;
+  date: string;
+  updatedAt: string;
 };
 
 type Page = "device" | "connectors" | "sync" | "settings";
@@ -55,13 +68,22 @@ const emptyState: AgentState = {
   agentId: "",
   displayName: "",
   status: "unpaired",
-  version: "0.2.0",
+  version: "0.2.1",
   lastSeenAt: "",
   codexAvailable: false,
   codexAuthorized: false,
   codexPath: "",
   syncing: false,
   queuedBatches: 0,
+  usageToday: {
+    inputTokens: 0,
+    cachedInputTokens: 0,
+    outputTokens: 0,
+    reasoningOutputTokens: 0,
+    totalTokens: 0,
+    date: "",
+    updatedAt: "",
+  },
 };
 
 const pages: Array<{ id: Page; label: string; icon: typeof Laptop }> = [
@@ -71,7 +93,14 @@ const pages: Array<{ id: Page; label: string; icon: typeof Laptop }> = [
   { id: "settings", label: "设置", icon: Settings },
 ];
 
+const isQuickPanel = getCurrentWindow().label === "quick";
+if (isQuickPanel) document.documentElement.classList.add("quick-window");
+
 function App() {
+  return isQuickPanel ? <QuickPanel /> : <DashboardApp />;
+}
+
+function DashboardApp() {
   const [state, setState] = useState<AgentState>(emptyState);
   const [page, setPage] = useState<Page>("device");
   const [loading, setLoading] = useState(true);
@@ -243,6 +272,138 @@ function App() {
         )}
       </main>
     </div>
+  );
+}
+
+function QuickPanel() {
+  const [state, setState] = useState<AgentState>(emptyState);
+  const [loading, setLoading] = useState(true);
+  const [working, setWorking] = useState(false);
+  const [error, setError] = useState("");
+
+  const refresh = useCallback(async () => {
+    try {
+      setState(await invoke<AgentState>("get_agent_state"));
+      setError("");
+    } catch (loadError) {
+      setError(toMessage(loadError));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+    const timer = window.setInterval(() => void refresh(), 10_000);
+    return () => window.clearInterval(timer);
+  }, [refresh]);
+
+  async function sync() {
+    setWorking(true);
+    setError("");
+    try {
+      setState((current) => ({ ...current, syncing: true }));
+      await invoke<SyncSummary>("sync_codex");
+      await refresh();
+    } catch (syncError) {
+      setError(toMessage(syncError));
+      setState((current) => ({ ...current, syncing: false }));
+    } finally {
+      setWorking(false);
+    }
+  }
+
+  if (loading) {
+    return (
+      <div className="quick-boot">
+        <LoaderCircle className="spin" />
+      </div>
+    );
+  }
+
+  return (
+    <main className="quick-shell">
+      <header className="quick-header">
+        <div className="quick-brand">
+          <span className="brand-mark">L</span>
+          <div>
+            <strong>LinkAgent</strong>
+            <span>{state.displayName || "这台 Mac"}</span>
+          </div>
+        </div>
+        <div className="quick-presence">
+          <StatusDot status={state.status} />
+          {statusLabel(state.status)}
+        </div>
+      </header>
+
+      <section className="quick-current">
+        <span className="quick-kicker">{state.syncing ? "正在接入" : "最近接入"}</span>
+        <div className="quick-current-row">
+          <div className={state.syncing ? "quick-source syncing" : "quick-source"}>
+            {state.syncing ? <LoaderCircle className="spin" /> : <Terminal />}
+          </div>
+          <div>
+            <h1>{state.syncing ? "正在同步 Codex" : "Codex 本地历史"}</h1>
+            <p>
+              {state.lastSync
+                ? `${formatDate(state.lastSync.completedAt)} · 上传 ${state.lastSync.uploaded.toLocaleString()} 条`
+                : "等待第一次同步"}
+            </p>
+          </div>
+        </div>
+      </section>
+
+      <section className="quick-metrics" aria-label="同步状态">
+        <div>
+          <span>今日 Token</span>
+          <strong>{formatCompactNumber(state.usageToday.totalTokens)}</strong>
+        </div>
+        <div>
+          <span>缓存输入</span>
+          <strong>{formatCompactNumber(state.usageToday.cachedInputTokens)}</strong>
+        </div>
+        <div>
+          <span>待上传批次</span>
+          <strong>{state.queuedBatches.toLocaleString()}</strong>
+        </div>
+      </section>
+
+      {error && (
+        <div className="quick-error">
+          <CircleAlert />
+          <span>{error}</span>
+        </div>
+      )}
+
+      <section className="quick-actions">
+        <button
+          className="quick-primary"
+          disabled={working || state.syncing || !state.codexAuthorized}
+          onClick={() => void sync()}
+        >
+          {working || state.syncing ? <LoaderCircle className="spin" /> : <Play />}
+          {working || state.syncing ? "正在同步" : "同步 Codex"}
+        </button>
+        <button className="quick-action" onClick={() => void invoke("open_link_platform")}>
+          <Cloud />
+          打开 Link
+          <ArrowUpRight />
+        </button>
+        <button className="quick-action" onClick={() => void invoke("show_dashboard")}>
+          <Settings />
+          管理连接器
+          <ChevronRight />
+        </button>
+      </section>
+
+      <footer className="quick-footer">
+        <span>权限和凭据只保存在本机</span>
+        <button title="刷新状态" onClick={() => void refresh()}>
+          <RefreshCw />
+        </button>
+      </footer>
+    </main>
   );
 }
 
@@ -651,6 +812,13 @@ function formatDate(value: string) {
     hour: "2-digit",
     minute: "2-digit",
   }).format(new Date(value));
+}
+
+function formatCompactNumber(value: number) {
+  return new Intl.NumberFormat("zh-CN", {
+    notation: "compact",
+    maximumFractionDigits: 1,
+  }).format(value);
 }
 
 function formatLog(line: string) {

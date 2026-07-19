@@ -33,6 +33,43 @@ async function normalizeCatastrophicSsrResponse(response: Response) {
 
 async function intakeApi(request: Request): Promise<Response | undefined> {
   const url = new URL(request.url);
+  if (url.pathname === "/api/crawler" || url.pathname.startsWith("/api/crawler/")) {
+    const crawlerBaseUrl = process.env.CRAWLER_API_URL || "http://127.0.0.1:18744/api";
+    const crawlerPath = url.pathname.slice("/api/crawler".length).replace(/^\//, "");
+    const upstream = new URL(`${crawlerBaseUrl.replace(/\/$/, "")}/${crawlerPath}${url.search}`);
+    const headers = new Headers();
+    const contentType = request.headers.get("content-type");
+    if (contentType) headers.set("content-type", contentType);
+
+    try {
+      const response = await fetch(upstream, {
+        method: request.method,
+        headers,
+        body:
+          request.method === "GET" || request.method === "HEAD"
+            ? undefined
+            : await request.arrayBuffer(),
+      });
+      const responseHeaders = new Headers();
+      for (const name of ["content-type", "content-disposition", "cache-control"]) {
+        const value = response.headers.get(name);
+        if (value) responseHeaders.set(name, value);
+      }
+      return new Response(response.body, {
+        status: response.status,
+        statusText: response.statusText,
+        headers: responseHeaders,
+      });
+    } catch (error) {
+      return Response.json(
+        {
+          ok: false,
+          error: error instanceof Error ? error.message : "Crawler service is unavailable",
+        },
+        { status: 502 },
+      );
+    }
+  }
   const database = await import("./lib/server-db");
   const bearerToken = () => request.headers.get("authorization")?.replace(/^Bearer\s+/i, "") || "";
   const jsonBody = async () => (await request.json()) as Record<string, unknown>;

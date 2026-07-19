@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "LinkAgent",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "identifier": "com.smallink.agent",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -19,6 +19,22 @@
         "minWidth": 760,
         "minHeight": 560,
         "center": true
+      },
+      {
+        "label": "quick",
+        "title": "LinkAgent Quick Panel",
+        "width": 380,
+        "height": 500,
+        "minWidth": 380,
+        "minHeight": 500,
+        "maxWidth": 380,
+        "maxHeight": 500,
+        "visible": false,
+        "decorations": false,
+        "resizable": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "shadow": true
       }
     ],
     "security": {
@@ -29,6 +45,10 @@
     "active": true,
     "targets": "all",
     "category": "Productivity",
+    "macOS": {
+      "signingIdentity": "-",
+      "hardenedRuntime": false
+    },
     "shortDescription": "Link 本地数据连接器客户端",
     "longDescription": "在本机安全运行连接器，并将用户授权的原始数据同步到 Link 平台。",
     "icon": [

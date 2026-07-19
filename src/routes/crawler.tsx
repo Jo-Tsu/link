@@ -60,7 +60,7 @@ type Job = {
     truncated: boolean;
   } | null;
 };
-const api = "http://127.0.0.1:18744/api";
+const api = "/api/crawler";
 const modeLabel: Record<Mode, string> = {
   static: "静态 HTTP",
   dynamic: "动态浏览器",

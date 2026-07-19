@@ -1,5 +1,5 @@
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use chrono::Utc;
+use chrono::{Local, Utc};
 use ed25519_dalek::SigningKey;
 use keyring::Entry;
 use rand_core::OsRng;
@@ -17,8 +17,8 @@ use std::{
 };
 use tauri::{
     menu::{Menu, MenuItem},
-    tray::TrayIconBuilder,
-    AppHandle, Manager, RunEvent,
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    AppHandle, Manager, PhysicalPosition, RunEvent,
 };
 use tauri_plugin_autostart::MacosLauncher;
 use tauri_plugin_opener::OpenerExt;
@@ -35,6 +35,7 @@ struct RuntimeState {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(default)]
 struct AgentConfig {
     platform_url: String,
     agent_id: String,
@@ -44,6 +45,7 @@ struct AgentConfig {
     last_seen_at: String,
     codex_authorized: bool,
     codex_cursor: String,
+    usage_today: TokenUsage,
     last_sync: Option<SyncSummary>,
 }
 
@@ -62,7 +64,20 @@ struct AgentStateView {
     codex_path: String,
     syncing: bool,
     queued_batches: usize,
+    usage_today: TokenUsage,
     last_sync: Option<SyncSummary>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TokenUsage {
+    input_tokens: u64,
+    cached_input_tokens: u64,
+    output_tokens: u64,
+    reasoning_output_tokens: u64,
+    total_tokens: u64,
+    date: String,
+    updated_at: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -243,13 +258,25 @@ fn state_view(app: &AppHandle, status: &str) -> Result<AgentStateView, String> {
     let config = read_config(app)?.unwrap_or_default();
     let codex_path = codex_home(app)?;
     let paired = !config.agent_id.is_empty() && !config.platform_url.is_empty();
+    let cached_online = chrono::DateTime::parse_from_rfc3339(&config.last_seen_at)
+        .map(|last_seen| Utc::now().signed_duration_since(last_seen).num_seconds() < 90)
+        .unwrap_or(false);
+    let resolved_status = if status == "cached" {
+        if cached_online {
+            "online"
+        } else {
+            "offline"
+        }
+    } else {
+        status
+    };
     Ok(AgentStateView {
         paired,
         platform_url: config.platform_url,
         agent_id: config.agent_id,
         display_name: config.display_name,
         status: if paired {
-            status.to_string()
+            resolved_status.to_string()
         } else {
             "unpaired".to_string()
         },
@@ -260,6 +287,7 @@ fn state_view(app: &AppHandle, status: &str) -> Result<AgentStateView, String> {
         codex_path: codex_path.to_string_lossy().to_string(),
         syncing: app.state::<RuntimeState>().syncing.load(Ordering::SeqCst),
         queued_batches: queued_batch_count(app),
+        usage_today: config.usage_today,
         last_sync: config.last_sync,
     })
 }
@@ -276,7 +304,7 @@ fn validate_platform_url(value: &str) -> Result<String, String> {
 
 #[tauri::command]
 fn get_agent_state(app: AppHandle) -> Result<AgentStateView, String> {
-    state_view(&app, "offline")
+    state_view(&app, "cached")
 }
 
 #[tauri::command]
@@ -457,7 +485,7 @@ async fn sync_codex_inner(app: &AppHandle) -> Result<SyncSummary, String> {
     }
     append_log(app, "codex_sync_started", json!({}));
     let mut totals = flush_queue(app, &config).await?;
-    let records = collect_codex_records(app, &config.codex_cursor)?;
+    let (records, usage_today) = collect_codex_records(app, &config.codex_cursor)?;
     let selected = records.len();
     let latest = records
         .iter()
@@ -483,6 +511,7 @@ async fn sync_codex_inner(app: &AppHandle) -> Result<SyncSummary, String> {
     if selected > 0 {
         config.codex_cursor = latest;
     }
+    config.usage_today = usage_today;
     let summary = SyncSummary {
         selected,
         uploaded: totals.0,
@@ -546,11 +575,18 @@ async fn flush_queue(
     Ok(totals)
 }
 
-fn collect_codex_records(app: &AppHandle, cursor: &str) -> Result<Vec<UploadRecord>, String> {
+fn collect_codex_records(
+    app: &AppHandle,
+    cursor: &str,
+) -> Result<(Vec<UploadRecord>, TokenUsage), String> {
     let home = app.path().home_dir().map_err(|error| error.to_string())?;
     let codex = codex_home(app)?;
     let index = read_session_index(&codex.join("session_index.jsonl"));
     let mut records = Vec::new();
+    let mut usage = TokenUsage {
+        date: Local::now().date_naive().to_string(),
+        ..TokenUsage::default()
+    };
     for directory in [codex.join("sessions"), codex.join("archived_sessions")] {
         if !directory.exists() {
             continue;
@@ -561,11 +597,21 @@ fn collect_codex_records(app: &AppHandle, cursor: &str) -> Result<Vec<UploadReco
             {
                 continue;
             }
-            records.extend(parse_session_file(entry.path(), &index, &home, cursor)?);
+            records.extend(parse_session_file(
+                entry.path(),
+                &index,
+                &home,
+                cursor,
+                &mut usage,
+            )?);
         }
     }
+    if usage.total_tokens > 0 {
+        usage.updated_at = Utc::now().to_rfc3339();
+        records.push(make_usage_record(&usage));
+    }
     records.sort_by(|left, right| left.occurred_at.cmp(&right.occurred_at));
-    Ok(records)
+    Ok((records, usage))
 }
 
 #[derive(Default)]
@@ -608,6 +654,7 @@ fn parse_session_file(
     index: &HashMap<String, IndexEntry>,
     home: &Path,
     cursor: &str,
+    usage: &mut TokenUsage,
 ) -> Result<Vec<UploadRecord>, String> {
     let file = fs::File::open(path).map_err(|error| error.to_string())?;
     let rows = BufReader::new(file)
@@ -674,6 +721,9 @@ fn parse_session_file(
             .and_then(Value::as_str)
             .unwrap_or_default();
         let row_type = row.get("type").and_then(Value::as_str).unwrap_or_default();
+        if row_type == "event_msg" && payload_type == "token_count" {
+            accumulate_token_usage(usage, &payload, &timestamp);
+        }
         if row_type == "response_item" && payload_type == "message" {
             let role = payload
                 .get("role")
@@ -802,6 +852,76 @@ fn parse_session_file(
         }
     }
     Ok(records)
+}
+
+fn accumulate_token_usage(usage: &mut TokenUsage, payload: &Value, timestamp: &str) {
+    let is_today = chrono::DateTime::parse_from_rfc3339(timestamp)
+        .map(|value| value.with_timezone(&Local).date_naive() == Local::now().date_naive())
+        .unwrap_or(false);
+    if !is_today {
+        return;
+    }
+    let Some(last) = payload
+        .get("info")
+        .and_then(|value| value.get("last_token_usage"))
+    else {
+        return;
+    };
+    usage.input_tokens += last
+        .get("input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    usage.cached_input_tokens += last
+        .get("cached_input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    usage.output_tokens += last
+        .get("output_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    usage.reasoning_output_tokens += last
+        .get("reasoning_output_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    usage.total_tokens += last
+        .get("total_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+}
+
+fn make_usage_record(usage: &TokenUsage) -> UploadRecord {
+    let container_id = format!("codex-usage:{}", usage.date);
+    UploadRecord {
+        source: "codex".to_string(),
+        source_thread_id: container_id.clone(),
+        source_container_id: container_id.clone(),
+        source_record_id: container_id,
+        raw_type: "usage".to_string(),
+        raw_label: "Token 使用统计".to_string(),
+        raw_text: format!(
+            "{} Codex 使用 {:} Token：输入 {:}，缓存输入 {:}，输出 {:}，推理输出 {:}。",
+            usage.date,
+            usage.total_tokens,
+            usage.input_tokens,
+            usage.cached_input_tokens,
+            usage.output_tokens,
+            usage.reasoning_output_tokens
+        ),
+        summary: format!("今日 Codex 使用 {} Token", usage.total_tokens),
+        occurred_at: usage.updated_at.clone(),
+        project_path: String::new(),
+        thread_title: format!("Codex 使用统计 {}", usage.date),
+        source_uri: "codex://usage".to_string(),
+        metadata: json!({
+            "connector": "codex_usage",
+            "date": usage.date,
+            "input_tokens": usage.input_tokens,
+            "cached_input_tokens": usage.cached_input_tokens,
+            "output_tokens": usage.output_tokens,
+            "reasoning_output_tokens": usage.reasoning_output_tokens,
+            "total_tokens": usage.total_tokens
+        }),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -971,7 +1091,10 @@ mod tests {
             "token: abc123 password='hidden' api-key-example /Users/test/project",
             Path::new("/Users/test"),
         );
-        assert_eq!(result, "token: *** password='***' api-key-example ~/project");
+        assert_eq!(
+            result,
+            "token: *** password='***' api-key-example ~/project"
+        );
     }
 
     #[test]
@@ -981,6 +1104,35 @@ mod tests {
         );
         assert_eq!(result.len(), 1);
         assert!(result.contains("research"));
+    }
+
+    #[test]
+    fn token_usage_uses_last_turn_values() {
+        let mut usage = TokenUsage {
+            date: Local::now().date_naive().to_string(),
+            ..TokenUsage::default()
+        };
+        accumulate_token_usage(
+            &mut usage,
+            &json!({
+                "info": {
+                    "last_token_usage": {
+                        "input_tokens": 120,
+                        "cached_input_tokens": 80,
+                        "output_tokens": 30,
+                        "reasoning_output_tokens": 10,
+                        "total_tokens": 150
+                    },
+                    "total_token_usage": { "total_tokens": 999_999 }
+                }
+            }),
+            &Utc::now().to_rfc3339(),
+        );
+        assert_eq!(usage.input_tokens, 120);
+        assert_eq!(usage.cached_input_tokens, 80);
+        assert_eq!(usage.output_tokens, 30);
+        assert_eq!(usage.reasoning_output_tokens, 10);
+        assert_eq!(usage.total_tokens, 150);
     }
 }
 
@@ -1015,6 +1167,39 @@ fn show_main_window(app: &AppHandle) {
     }
 }
 
+#[tauri::command]
+fn show_dashboard(app: AppHandle) {
+    show_main_window(&app);
+}
+
+#[tauri::command]
+fn open_link_platform(app: AppHandle) -> Result<(), String> {
+    let config = read_config(&app)?.ok_or_else(|| "LinkAgent 尚未连接平台".to_string())?;
+    app.opener()
+        .open_url(config.platform_url, None::<&str>)
+        .map_err(|error| error.to_string())
+}
+
+fn toggle_quick_window(app: &AppHandle, tray_rect: tauri::Rect) {
+    let Some(window) = app.get_webview_window("quick") else {
+        return;
+    };
+    if window.is_visible().unwrap_or(false) {
+        let _ = window.hide();
+        return;
+    }
+
+    if let (Ok(size), Ok(scale_factor)) = (window.outer_size(), window.scale_factor()) {
+        let tray_position = tray_rect.position.to_physical::<i32>(scale_factor);
+        let tray_size = tray_rect.size.to_physical::<u32>(scale_factor);
+        let x = (tray_position.x + (tray_size.width as i32 - size.width as i32) / 2).max(8);
+        let y = tray_position.y + tray_size.height as i32 + 8;
+        let _ = window.set_position(PhysicalPosition::new(x, y));
+    }
+    let _ = window.show();
+    let _ = window.set_focus();
+}
+
 fn create_tray(app: &tauri::App) -> tauri::Result<()> {
     let open = MenuItem::with_id(app, "open", "打开 LinkAgent", true, None::<&str>)?;
     let sync = MenuItem::with_id(app, "sync", "立即同步 Codex", true, None::<&str>)?;
@@ -1023,6 +1208,19 @@ fn create_tray(app: &tauri::App) -> tauri::Result<()> {
     let menu = Menu::with_items(app, &[&open, &sync, &platform, &quit])?;
     let mut builder = TrayIconBuilder::new()
         .menu(&menu)
+        .show_menu_on_left_click(false)
+        .tooltip("LinkAgent")
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                rect,
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                toggle_quick_window(tray.app_handle(), rect);
+            }
+        })
         .on_menu_event(|app, event| match event.id().as_ref() {
             "open" => show_main_window(app),
             "sync" => {
@@ -1072,6 +1270,11 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
+            if window.label() == "quick" {
+                if let tauri::WindowEvent::Focused(false) = event {
+                    let _ = window.hide();
+                }
+            }
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
                 let _ = window.hide();
@@ -1084,7 +1287,9 @@ pub fn run() {
             heartbeat,
             sync_codex,
             get_recent_logs,
-            unpair_agent
+            unpair_agent,
+            show_dashboard,
+            open_link_platform
         ])
         .build(tauri::generate_context!())
         .expect("error while building LinkAgent")

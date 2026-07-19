@@ -23,15 +23,31 @@ services:
 
   link-app:
     build: .
+    init: true
     restart: unless-stopped
     depends_on:
       postgres:
         condition: service_healthy
     environment:
       DATABASE_URL: postgres://${POSTGRES_USER:-link}:${POSTGRES_PASSWORD:-link_local_dev_only}@postgres:5432/${POSTGRES_DB:-link}
-      LINK_DEPLOYMENT_MODE: local
+      CRAWLER_API_URL: http://crawler-api:8000/api
+      LINK_DEPLOYMENT_MODE: ${LINK_DEPLOYMENT_MODE:-local}
+      NODE_ENV: production
+      PORT: 41737
     ports:
       - "127.0.0.1:${LINK_PORT:-41737}:41737"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:41737/api/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
 
   crawler-api:
     image: ghcr.io/d4vinci/scrapling@sha256:b2bfd3a808bb4f1eb42d82c583a9e754f4016881b3aa25784a839cb7e28ae1ec

@@ -4,7 +4,7 @@
 
 ## 1. 运行模型
 
-正式客户端位于 `link-agent-client/`，使用 Tauri 2、Rust 与 React/TypeScript 构建。第一期发布 macOS 菜单栏应用和 DMG 安装包，Rust Core 负责设备配对、心跳、Connector 调度、队列、游标、Keychain 与网络传输，React 只负责本机授权和状态交互。
+正式客户端位于 `link-agent-client/`，使用 Tauri 2、Rust 与 React/TypeScript 构建。第一期发布 macOS 菜单栏应用和 DMG 安装包，Rust Core 负责设备配对、心跳、Connector 调度、队列、游标、Keychain 与网络传输，React 负责菜单栏快捷浮层与完整管理窗口的本机授权和状态交互。
 
 `agent/link-agent.mjs` 作为开发诊断 CLI 保留，用于协议联调与无界面排障，不再是普通用户的安装和配对入口。Windows Task Scheduler、Linux systemd 与 Docker 封装放在后续跨平台阶段。
 
@@ -136,4 +136,34 @@ Agent 升级采用“下载 - 校验签名 - 原子替换 - 健康检查 - 可�
 
 当前 Codex Connector 以记录发生时间作为本地游标，并依赖服务端幂等写入兜底；后续应替换为会话文件级游标和内容变更检测。产品页面通过 Agent 指令执行同步，平台直读端点已经移除。macOS 安装包通过独立 Release 附件发布，CLI 命令只保留在开发文档中。
 
-当前 `0.2.0` DMG 为 Apple Silicon 开发预览包，采用 ad-hoc 签名。开发阶段从临时构建路径迁移 Keychain 凭据到 `/Applications` 时需要重建访问控制；正式发布必须使用稳定 Developer ID 签名和公证，使覆盖安装前后的 Keychain 访问身份保持一致。
+当前 `0.2.1` DMG 为 Apple Silicon 开发预览包，采用 ad-hoc 签名。开发阶段从临时构建路径迁移 Keychain 凭据到 `/Applications` 时需要重建访问控制；正式发布必须使用稳定 Developer ID 签名和公证，使覆盖安装前后的 Keychain 访问身份保持一致。
+
+## 9. 桌面伴生交互架构
+
+桌面端共用一份 Rust 状态仓库，不允许菜单栏、快捷浮层和完整窗口各自启动心跳或同步任务：
+
+```mermaid
+flowchart LR
+  Core["Rust Agent Core"] --> Store["统一设备 / 连接器 / 队列状态"]
+  Store --> Tray["菜单栏状态入口"]
+  Store --> Popover["快捷浮层"]
+  Store --> Window["完整管理窗口"]
+  Popover --> Command["白名单本地动作"]
+  Window --> Command
+  Command --> Core
+```
+
+- 菜单栏只订阅聚合状态，使用 `online`、`syncing`、`attention_required` 和 `offline` 四种视觉状态，不能因记录数量持续创建系统通知。
+- 快捷浮层是无标题、固定尺寸的 Tauri Webview 窗口，点击菜单栏图标切换显示；失焦后关闭，不销毁 Agent Core。
+- 最近接入时间流由本地同步结果与队列确认事件生成，默认只保留必要元数据，不在浮层缓存完整原文。
+- 浮层动作通过 Tauri Command 调用固定枚举，例如 `sync_all`、`sync_connector`、`pause_all`、`resume_all`、`open_platform`；不接受动态脚本或任意 URL。
+- 完整管理窗口保留配对、授权、日志与连接器配置。浮层中的“查看详情”以明确路由打开管理窗口或平台，不在小窗口承载大列表。
+- `0.2.1` 当前已实现快捷浮层第一版：左键菜单栏图标切换浮层，右键显示系统菜单；浮层和管理窗口通过同一组 Tauri Command 调用 Rust Core。多连接器时间流、暂停全部连接器和图标动态仍属于下一阶段。
+
+## 10. Usage Connector
+
+Codex Usage Connector 复用用户已经确认的 `~/.codex` 只读权限，只读取 `event_msg.token_count.info.last_token_usage`。它不读取账号 Token、API Key 或登录凭据。聚合口径以本机自然日为界，字段为 `input_tokens`、`cached_input_tokens`、`output_tokens`、`reasoning_output_tokens` 和 `total_tokens`。
+
+第一版在 Codex 同步扫描期间完成本地聚合，写入 `AgentConfig.usage_today` 供快捷浮层读取，并生成稳定来源记录 `codex-usage:<YYYY-MM-DD>`。同一天重复同步更新同一条 `usage` 记录，不按每个 Token 事件制造大量记录。
+
+下一版将 Usage Connector 从原始对话同步中拆成轻量调度器，提供关闭、15/30/60 分钟间隔、立即上报、最近结果和失败重试。多工具接入通过独立 Adapter 统一输出用量指标，不把 Cursor、Claude Code、Gemini CLI 等工具路径和格式硬编码到 Core；上传默认只包含聚合指标、工具标识、设备标识和统计窗口，不包含对话原文。

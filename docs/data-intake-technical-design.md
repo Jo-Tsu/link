@@ -117,13 +117,15 @@ Link 平台是控制面和原始数据事实源。当前测试版由 Tauri LinkA
 
 本地版使用 Docker Compose：Link 应用、Postgres、独立 Crawler。三个端口默认都只绑定 `127.0.0.1`，平台容器不挂载用户的 `~/.codex`；Postgres 使用 `.env` 中的本地开发凭据。
 
-云端版使用 ECS 承载 Link API 与 Postgres/RDS；本机 Agent 通过 HTTPS 与云端交互。数据库和 Crawler 端口不开放公网。
+云端私有测试版使用 ECS 承载 Link API、Postgres 与独立 Crawler。构建链使用标准 TanStack Start、Vite、React、Tailwind CSS 与 Nitro，不依赖第三方低代码平台封装。Nitro 固定构建为 `node-server`，生产容器只复制 `.output` 并以非 root 用户运行。Crawler 浏览器请求通过 Link 服务端反向转发到独立容器，客户端不再依赖写死的本机 Crawler 端口。
 
-当前测试版没有公网用户认证、多租户隔离或平台运营权限，因此云端部署只作为后续架构方向，不属于当前支持范围。
+三个服务端口均不开放公网；Link 只绑定 ECS `127.0.0.1:41737`，本机浏览器与 LinkAgent 通过 SSH 将偏门本机端口 `127.0.0.1:42737` 转发到 ECS。Postgres 与 Crawler 保持容器网络访问，数据库宿主机端口也只绑定回环地址。
+
+当前测试版没有公网用户认证、多租户隔离或平台运营权限，因此不得直接公网部署。可重复执行的 ECS 初始化、更新、隧道和运维步骤见 [阿里云私有测试部署](./aliyun-private-deployment.md)。正式 SaaS 阶段改为公网 HTTPS、私网应用服务和 RDS，并补齐邮箱登录与租户鉴权。
 
 ## 9. 源代码发布边界
 
-- 源码仓库采用 BSL 1.1，许可证参数按发布版本固定；`0.2.0` 的 Change Date 为 2030-07-19，Change License 为 Apache-2.0。
+- 源码仓库采用 BSL 1.1，许可证参数按发布版本固定；`0.2.1` 的 Change Date 为 2030-07-19，Change License 为 Apache-2.0。
 - `.env`、数据库导出、Codex 数据、设备凭据、Agent 本地队列、DMG、Node 构建输出和 Rust `target` 必须由忽略规则排除。
 - DMG 通过 Release 附件发布，不进入 Git 历史；正式 Release 需要 Developer ID 签名、公证与校验和。
 - GitHub CI 分别验证平台 lint/build 与 macOS LinkAgent TypeScript/Rust 测试。
