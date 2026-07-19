@@ -1,0 +1,33 @@
+name: Bug report
+description: 报告可复现的问题，不要附带真实用户数据或凭据
+title: "[Bug] "
+labels: [bug]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: 问题描述
+      description: 说明预期行为和实际行为。
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: 复现步骤
+      description: 使用脱敏数据提供最小复现步骤。
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Link 版本
+      placeholder: 0.2.0
+    validations:
+      required: true
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: 隐私确认
+      options:
+        - label: 我已移除对话、令牌、本机路径和其他个人数据
+          required: true
