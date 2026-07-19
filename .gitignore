@@ -39,7 +39,6 @@ public/downloads/*.zip
 
 # Wrangler / Cloudflare
 .wrangler/
-.lovable/
 
 # Editor directories and files
 .vscode/*

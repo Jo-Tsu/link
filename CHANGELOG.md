@@ -21,7 +21,7 @@ This file records user-visible changes to Link. The project is currently in deve
 
 ### Removed
 
-- Removed Lovable-specific build configuration, runtime error hooks, and repository metadata.
+- Removed the hosted prototype build wrapper, runtime-specific error hooks, and obsolete repository metadata.
 
 ## [0.2.0] - 2026-07-18
 
