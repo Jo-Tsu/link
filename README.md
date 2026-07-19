@@ -55,7 +55,7 @@ cd src-tauri
 cargo test
 ```
 
-客户端产品边界见 [LinkAgent 客户端 PRD](docs/link-agent-client-prd.md)，同步协议见 [LinkAgent 技术设计](docs/link-agent-technical-design.md)。安装包不提交到源码仓库，正式构建应通过 Release 附件发布。
+客户端产品边界见 [LinkAgent 客户端 PRD](docs/link-agent-client-prd.md)，同步协议见 [LinkAgent 技术设计](docs/link-agent-technical-design.md)。安装包不提交到源码仓库，可从 [GitHub Releases](https://github.com/Jo-Tsu/link/releases) 下载。
 
 ## 开发验证
 

@@ -296,7 +296,7 @@ function LinkAgentDevices({
         </div>
         <div className="flex flex-wrap gap-2">
           <Button variant="outline" size="sm" asChild>
-            <a href="/downloads/LinkAgent_0.2.0_aarch64.dmg" download>
+            <a href="https://github.com/Jo-Tsu/link/releases/download/v0.2.0-developer-preview/LinkAgent_0.2.0_aarch64.dmg">
               <Download className="h-4 w-4" />
               下载 macOS 客户端
             </a>
