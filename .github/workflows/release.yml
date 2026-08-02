@@ -1,0 +1,147 @@
+# Desktop release builds — macOS Apple Silicon (.dmg).
+#
+# CI calls the SAME packaging/build_dmg.sh script developers run locally; this file only
+# provisions the toolchain (Node, Rust, a Python venv at .venv with PyInstaller) and
+# publishes the result.
+#
+# Triggers:
+#   - tag push `v*`  → builds all targets and attaches them to a DRAFT GitHub Release
+#                      (review, then publish by hand).
+#   - manual run     → builds and uploads workflow artifacts only (no release).
+#
+# Each installer is uploaded twice: once with its versioned name (archive) and once with a
+# stable name (Smallink-macos-arm64.dmg, …) so the website can link to
+#   github.com/<repo>/releases/latest/download/<stable-name>
+# and never need updating. Add Windows back only after packaging/build_windows.ps1 exists
+# in the repository and is covered by a local or CI smoke test.
+#
+# macOS signing + notarization: Tauri's bundler handles both during `tauri build` when the
+# APPLE_* env vars are present (import cert → sign app + sidecar with hardened runtime →
+# notarize via notarytool → staple). Driven by repo secrets:
+#   APPLE_CERTIFICATE            base64 .p12 (Developer ID Application cert + key)
+#   APPLE_CERTIFICATE_PASSWORD   the .p12 export password
+#   APPLE_SIGNING_IDENTITY       e.g. "Developer ID Application: Name (TEAMID)"
+#   APPLE_API_KEY_CONTENT        base64 App Store Connect API .p8 (notarytool)
+#   APPLE_API_KEY                the API key id
+#   APPLE_API_ISSUER             the API issuer id
+# When the secrets are absent (forks, scratch runs) the build degrades to unsigned —
+# installable via `xattr -cr`.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*", "app-v*"]
+  workflow_dispatch:
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest # Apple Silicon
+            slug: macos-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: surfaces/gui/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: surfaces/gui/src-tauri
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up the sidecar venv (.venv)
+        # The build scripts expect a venv at .venv with the package + PyInstaller.
+        # typer/tzdata are build-time-only (PyInstaller walks mcp.cli, which needs typer;
+        # tzdata ships zoneinfo for Windows). aisuite installs like any other dependency
+        # (git-pinned in pyproject.toml).
+        run: |
+          python -m venv .venv
+          VPY=.venv/bin/python
+          "$VPY" -m pip install --upgrade pip
+          "$VPY" -m pip install -e . pyinstaller typer tzdata
+          "$VPY" -c "import aisuite, link"  # fail fast if either import breaks
+
+      - name: npm ci
+        working-directory: surfaces/gui
+        run: npm ci
+
+      - name: Build .dmg
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY_CONTENT }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          # Unset empty APPLE_* vars so runs without secrets stay cleanly unsigned
+          # (Tauri treats a present-but-empty var as a config error).
+          for v in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_API_KEY APPLE_API_ISSUER; do
+            [ -n "$(eval echo "\${$v:-}")" ] || unset "$v"
+          done
+          if [ -n "${APPLE_API_KEY_CONTENT:-}" ]; then
+            echo "$APPLE_API_KEY_CONTENT" | base64 -d > "$RUNNER_TEMP/AuthKey.p8"
+            export APPLE_API_KEY_PATH="$RUNNER_TEMP/AuthKey.p8"
+          fi
+          unset APPLE_API_KEY_CONTENT
+          bash packaging/build_dmg.sh
+
+      - name: Stage artifacts (versioned + stable names)
+        run: |
+          mkdir -p out
+          BUNDLE=surfaces/gui/src-tauri/target/release/bundle
+          cp "$BUNDLE"/dmg/*.dmg out/
+          cp "$BUNDLE"/dmg/*.dmg out/Smallink-${{ matrix.slug }}.dmg
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.slug }}
+          path: out/*
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Validate release version
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          CONF_VERSION=$(python3 -c "import json; print(json.load(open('surfaces/gui/src-tauri/tauri.conf.json'))['version'])")
+          if [ "${TAG#v}" != "$CONF_VERSION" ]; then
+            echo "::error::tag $TAG != tauri.conf.json version $CONF_VERSION — bump the config before tagging"
+            exit 1
+          fi
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          files: dist/*
+          generate_release_notes: true
