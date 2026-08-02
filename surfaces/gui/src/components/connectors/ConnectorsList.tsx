@@ -17,12 +17,14 @@ export function ConnectorsList({
   slack,
   onOpen,
   onChanged,
+  onOpenMemory,
 }: {
   connectors: Connector[];
   cloud: CloudStatus | null;
   slack: SlackStatus | null;
   onOpen: (name: string) => void;
   onChanged: () => void;
+  onOpenMemory?: () => void;
 }) {
   const { tr } = useI18n();
   const [filter, setFilter] = useState("");
@@ -39,13 +41,16 @@ export function ConnectorsList({
   return (
     <div>
       <div className="flex items-center justify-end mb-4">
-        <input
-          placeholder={tr("Search")}
-          aria-label={tr("Search connectors")}
-          value={filter}
-          onChange={(e) => setFilter(e.target.value)}
-          className="w-44 px-3.5 py-1.5 rounded-full border border-line bg-panel text-[13px] outline-none focus:border-accent"
-        />
+        <label className="w-56 h-9 px-3 rounded-full border border-line bg-panel flex items-center gap-2 focus-within:border-accent focus-within:ring-2 focus-within:ring-accentSoft">
+          <span className="text-faint" aria-hidden="true">⌕</span>
+          <input
+            placeholder={tr("Search")}
+            aria-label={tr("Search connectors")}
+            value={filter}
+            onChange={(e) => setFilter(e.target.value)}
+            className="min-w-0 flex-1 bg-transparent text-[13px] outline-none"
+          />
+        </label>
       </div>
 
       {/* No cloud strip here anymore (§26): the sidebar's account row is the permanent
@@ -77,30 +82,29 @@ export function ConnectorsList({
       <div className={GRP_H}>{tr("Available")}</div>
       <div className={GRP}>
         {shown.map((c) => (
-          /* The row navigates to the pre-connect detail page (§38); the pill
-             stays the fast path straight into the modal. */
-          <button
-            key={c.name}
-            data-testid={`connector-${c.name}`}
-            className={ROW + " w-full text-left hover:bg-paper/60"}
-            onClick={() => onOpen(c.name)}
-          >
-            <ConnectorBadge connector={c} size={34} title={c.title} />
-            <span className="min-w-0 flex-1">
-              <span className="font-medium text-[13.5px]">{c.title}</span>
-              <span className="block text-[12px] text-muted truncate">{tr(c.blurb)}</span>
-            </span>
-            <span
-              className={PILL_QUIET + " cursor-pointer"}
-              role="button"
-              onClick={(e) => {
-                e.stopPropagation();
-                setConnecting(c.name);
-              }}
+          <div key={c.name} className={ROW + " !p-0"}>
+            <button
+              type="button"
+              data-testid={`connector-${c.name}`}
+              className="min-w-0 flex-1 flex items-center gap-3 px-4 py-2.5 text-left hover:bg-paper/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accentSoft"
+              onClick={() => onOpen(c.name)}
+            >
+              <ConnectorBadge connector={c} size={34} title={c.title} />
+              <span className="min-w-0 flex-1">
+                <span className="font-medium text-[13.5px]">{c.title}</span>
+                <span className="block text-[12px] text-muted truncate">{tr(c.blurb)}</span>
+              </span>
+              <span className="text-faint text-[15px] shrink-0">›</span>
+            </button>
+            <button
+              type="button"
+              className={PILL_QUIET + " mr-4"}
+              onClick={() => setConnecting(c.name)}
+              aria-label={tr("Connect {name}", { name: c.title })}
             >
               {tr("Connect")}
-            </span>
-          </button>
+            </button>
+          </div>
         ))}
         {shown.length === 0 && (
           <div className={ROW + " text-[12.5px] text-muted"}>{tr("Nothing matches.")}</div>
@@ -121,6 +125,7 @@ export function ConnectorsList({
           cloud={cloud}
           onClose={() => setConnecting(null)}
           onChanged={onChanged}
+          onOpenMemory={onOpenMemory}
         />
       )}
     </div>

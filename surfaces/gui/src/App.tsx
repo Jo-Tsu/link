@@ -1308,6 +1308,7 @@ export function App() {
       ) : surface === "integrations" ? (
         <IntegrationsView
           workspace={workspace || undefined}
+          onOpenMemory={() => setSurface("memory")}
           onCreateSkillWithAgent={() => {
             startNewSession("link");
             setTimeout(

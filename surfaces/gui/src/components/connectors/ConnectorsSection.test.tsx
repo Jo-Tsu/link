@@ -1,4 +1,4 @@
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   getCloudStatus,
@@ -86,5 +86,23 @@ describe("ConnectorsSection visibility", () => {
     expect(screen.getByText("TRAE CLI")).toBeTruthy();
     expect(screen.queryByText("Browser")).toBeNull();
     expect(screen.queryByText("Slack")).toBeNull();
+  });
+
+  it("shows a retry state instead of an empty catalog when loading fails", async () => {
+    vi.mocked(getConnectors)
+      .mockRejectedValueOnce(new Error("service offline"))
+      .mockResolvedValueOnce([connector("minem", "MineM")]);
+    vi.mocked(getCloudStatus).mockRejectedValue(new Error("offline"));
+    vi.mocked(getSlackStatus).mockRejectedValue(new Error("offline"));
+
+    render(
+      <LanguageProvider>
+        <ConnectorsSection />
+      </LanguageProvider>,
+    );
+
+    expect(await screen.findByText("Connectors are unavailable")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+    expect(await screen.findByText("MineM")).toBeTruthy();
   });
 });

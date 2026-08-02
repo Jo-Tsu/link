@@ -20,9 +20,11 @@ const INT_TABS: { key: IntTab; label: string; icon: "plug" | "wrench" }[] = [
 export function IntegrationsView({
   workspace,
   onCreateSkillWithAgent,
+  onOpenMemory,
 }: {
   workspace?: string;
   onCreateSkillWithAgent?: () => void;
+  onOpenMemory?: () => void;
 }) {
   const { tr } = useI18n();
   const [tab, setTab] = useState<IntTab>("connectors");
@@ -80,7 +82,7 @@ export function IntegrationsView({
                 title={tr("Connectors")}
                 sub={tr("Manage the data sources and tools Link can use. Connected items appear first.")}
               />
-              <ConnectorsSection />
+              <ConnectorsSection onOpenMemory={onOpenMemory} />
             </section>
           ) : (
             <SkillHub workspace={workspace} onCreateWithAgent={onCreateSkillWithAgent} />

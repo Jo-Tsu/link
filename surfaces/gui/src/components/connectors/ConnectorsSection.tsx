@@ -12,6 +12,7 @@ import {
 } from "../../api";
 import { ConnectorBadge } from "../../connectors/ConnectorIcon";
 import { AllowlistBlock, ConnectorTools, ListeningSessionsBlock, UnauthorizedBlock } from "../ManageTabs";
+import { InlineFeedback, PageState } from "../AsyncFeedback";
 import { AccountsDetail } from "./AccountsDetail";
 import { AvailableDetail } from "./AvailableDetail";
 import { CalendarDetail } from "./CalendarDetail";
@@ -53,17 +54,23 @@ const DETAIL_PAGES: Record<string, (p: DetailProps) => JSX.Element> = {
   hunter: (p) => <AccountsDetail {...p} />,
 };
 
-export function ConnectorsSection() {
+export function ConnectorsSection({ onOpenMemory }: { onOpenMemory?: () => void }) {
   const { tr } = useI18n();
   const [detail, setDetail] = useState<string | null>(null);
   const [connectors, setConnectors] = useState<Connector[]>([]);
   const [cloud, setCloud] = useState<CloudStatus | null>(null);
   const [slack, setSlack] = useState<SlackStatus | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
 
   const refresh = () => {
+    setError("");
     getConnectors()
       .then((rows) => setConnectors(visibleConnectors(rows)))
-      .catch(() => setConnectors([]));
+      .catch((reason) => {
+        setError(reason instanceof Error ? reason.message : tr("Could not load connectors"));
+      })
+      .finally(() => setLoading(false));
     getCloudStatus().then(setCloud).catch(() => setCloud(null));
     getSlackStatus().then(setSlack).catch(() => setSlack(null));
   };
@@ -74,6 +81,28 @@ export function ConnectorsSection() {
     const t = setInterval(refresh, 5000);
     return () => clearInterval(t);
   }, []);
+
+  if (loading) {
+    return (
+      <PageState
+        icon="plug"
+        title={tr("Loading connectors…")}
+        body={tr("Checking local, managed, and built-in connection status.")}
+      />
+    );
+  }
+
+  if (error && connectors.length === 0) {
+    return (
+      <PageState
+        icon="plug"
+        title={tr("Connectors are unavailable")}
+        body={error}
+        action={tr("Try again")}
+        onAction={refresh}
+      />
+    );
+  }
 
   if (detail) {
     const c = connectors.find((x) => x.name === detail);
@@ -102,6 +131,7 @@ export function ConnectorsSection() {
             slack={slack}
             onChanged={refresh}
             onGone={() => setDetail(null)}
+            onOpenMemory={onOpenMemory}
           />
         )}
       </div>
@@ -109,20 +139,40 @@ export function ConnectorsSection() {
   }
 
   return (
-    <ConnectorsList
-      connectors={connectors}
-      cloud={cloud}
-      slack={slack}
-      onOpen={setDetail}
-      onChanged={refresh}
-    />
+    <>
+      {error && (
+        <div className="mb-4">
+          <InlineFeedback
+            tone="warning"
+            title={tr("Connector status may be out of date")}
+            body={error}
+            action={tr("Retry")}
+            onAction={refresh}
+          />
+        </div>
+      )}
+      <ConnectorsList
+        connectors={connectors}
+        cloud={cloud}
+        slack={slack}
+        onOpen={setDetail}
+        onChanged={refresh}
+        onOpenMemory={onOpenMemory}
+      />
+    </>
   );
 }
 
 // Fallback detail page: status header + the connector's existing config blocks
 // (tools; allow-list/parked/listening for two-way) + Disconnect. Bespoke pages
 // (Slack/Gmail/HubSpot) replace this one connector at a time.
-function LocalConversationImportBlock({ source }: { source: "codex" | "traex" }) {
+function LocalConversationImportBlock({
+  source,
+  onOpenMemory,
+}: {
+  source: "codex" | "traex";
+  onOpenMemory?: () => void;
+}) {
   const { tr } = useI18n();
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<string | null>(null);
@@ -174,6 +224,17 @@ function LocalConversationImportBlock({ source }: { source: "codex" | "traex" })
       </div>
       {result && <div className="px-3.5 pb-3 text-[12px] text-ok">{result}</div>}
       {error && <div className="px-3.5 pb-3 text-[12px] text-danger">{error}</div>}
+      {result && onOpenMemory && (
+        <div className="px-3.5 pb-3">
+          <button
+            type="button"
+            onClick={onOpenMemory}
+            className="text-[12px] font-medium text-accent hover:underline underline-offset-2"
+          >
+            {tr("View memory data")} ›
+          </button>
+        </div>
+      )}
     </div>
   );
 }
@@ -184,8 +245,32 @@ function GenericDetail({
   slack: _slack,
   onChanged,
   onGone,
-}: DetailProps & { onGone: () => void }) {
+  onOpenMemory,
+}: DetailProps & { onGone: () => void; onOpenMemory?: () => void }) {
   const { tr } = useI18n();
+  const [disconnecting, setDisconnecting] = useState(false);
+  const [disconnectError, setDisconnectError] = useState("");
+  const disconnect = async () => {
+    const localSource = c.name === "codex" || c.name === "traex";
+    const message = localSource
+      ? tr("Disconnect {name}? Imported source data stays in Smallink until you remove it separately.", { name: c.title })
+      : tr("Disconnect {name}?", { name: c.title });
+    if (!window.confirm(message)) return;
+    setDisconnecting(true);
+    setDisconnectError("");
+    try {
+      const result = await disconnectConnector(c.name);
+      if (!result.ok) throw new Error(tr("Could not disconnect {name}.", { name: c.title }));
+      onChanged();
+      onGone();
+    } catch (reason) {
+      setDisconnectError(
+        reason instanceof Error ? reason.message : tr("Could not disconnect {name}.", { name: c.title }),
+      );
+    } finally {
+      setDisconnecting(false);
+    }
+  };
   return (
     <div>
       <div className="flex items-center gap-3.5 mb-5">
@@ -211,19 +296,22 @@ function GenericDetail({
         {c.auth !== "none" && (
           <button
             className="text-[12.5px] text-danger/80 hover:text-danger shrink-0"
-            onClick={async () => {
-              await disconnectConnector(c.name);
-              onChanged();
-              onGone();
-            }}
+            onClick={() => void disconnect()}
+            disabled={disconnecting}
           >
-            {tr("Disconnect")}
+            {tr(disconnecting ? "Disconnecting…" : "Disconnect")}
           </button>
         )}
       </div>
 
       {(c.name === "codex" || c.name === "traex") && (
-        <LocalConversationImportBlock source={c.name} />
+        <LocalConversationImportBlock source={c.name} onOpenMemory={onOpenMemory} />
+      )}
+
+      {disconnectError && (
+        <div className="mb-4">
+          <InlineFeedback tone="danger" title={tr("Disconnect failed")} body={disconnectError} />
+        </div>
       )}
 
       <div className={GRP}>

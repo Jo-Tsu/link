@@ -29,6 +29,7 @@ import {
 } from "../api";
 import { CloudSignInInline, CloudStatusPending } from "./connectors/CloudSignIn";
 import { ModelChecklist } from "./ModelChecklist";
+import { PageState } from "./AsyncFeedback";
 import { ProviderCards, ProviderForm, useProviderSetup } from "../providers/ProviderSetup";
 import { Toggle } from "./Toggle";
 import { useI18n } from "../i18n";
@@ -79,13 +80,30 @@ const EXAMPLE = `{
 export function ModelsTab() {
   const { tr } = useI18n();
   const [settings, setSettings] = useState<ModelSettings | null>(null);
-  const refreshSettings = () => getSettings().then(setSettings).catch(() => setSettings(null));
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const refreshSettings = () => {
+    setLoading(true);
+    setError("");
+    getSettings()
+      .then(setSettings)
+      .catch((reason) => {
+        setError(reason instanceof Error ? reason.message : tr("Could not load model settings."));
+      })
+      .finally(() => setLoading(false));
+  };
   const ps = useProviderSetup({ onSaved: refreshSettings });
   useEffect(() => {
     refreshSettings();
   }, []);
 
-  if (!settings) return <div className="text-[13px] text-muted">{tr("Loading…")}</div>;
+  if (loading && !settings) {
+    return <PageState icon="diamond" title={tr("Loading model settings…")} body={tr("Checking configured providers and available models.")} />;
+  }
+  if (error && !settings) {
+    return <PageState icon="diamond" title={tr("Model settings are unavailable")} body={error} action={tr("Try again")} onAction={refreshSettings} />;
+  }
+  if (!settings) return null;
 
   const info = ps.info;
   const knownNames = ps.providers.map((p) => p.name);
@@ -140,7 +158,12 @@ export function ModelsTab() {
             labels={settings.model_labels}
             purposes={settings.purposes}
             modelPurposes={settings.model_purposes}
-            onChanged={(next) => setSettings((s) => (s ? { ...s, models: next.models, model: next.model } : s))}
+            onChanged={(next) => {
+              setSettings((current) => (
+                current ? { ...current, models: next.models, model: next.model } : current
+              ));
+              void getSettings().then(setSettings).catch(() => {});
+            }}
           />
         </div>
       ) : (

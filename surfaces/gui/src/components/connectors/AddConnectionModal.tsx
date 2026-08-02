@@ -11,6 +11,7 @@ import {
 } from "../../api";
 import { ConnectorBadge } from "../../connectors/ConnectorIcon";
 import { ConnectSetup } from "../ManageTabs";
+import { InlineFeedback } from "../AsyncFeedback";
 import { Icon } from "../Icon";
 import { chooseFolder } from "../../tauri";
 import { CloudSignInInline, CloudStatusPending } from "./CloudSignIn";
@@ -31,14 +32,17 @@ export function AddConnectionModal({
   title,
   onClose,
   onChanged,
+  onOpenMemory,
 }: {
   c: Connector;
   cloud: CloudStatus | null;
   title?: string; // e.g. "Add a workspace" — defaults to "Connect {title}"
   onClose: () => void;
   onChanged: () => void;
+  onOpenMemory?: () => void;
 }) {
   const { tr } = useI18n();
+  const [locked, setLocked] = useState(false);
   const localApp = c.auth === "local_app";
   // MCP-backed one-click (§42): local OAuth against the vendor's hosted MCP server —
   // with manual fields alongside (jira, asana) it's a second mode; alone (monday)
@@ -58,14 +62,14 @@ export function AddConnectionModal({
   );
 
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && !locked && onClose();
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
+  }, [locked, onClose]);
 
   return (
     <div className="fixed inset-0 z-40" data-testid="add-connection-modal">
-      <div className="absolute inset-0 bg-black/30" onClick={onClose} />
+      <div className="absolute inset-0 bg-black/30" onClick={() => !locked && onClose()} />
       <div
         className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 w-[480px] max-w-[calc(100vw-2rem)] max-h-[calc(100vh-2rem)] overflow-y-auto hairline-scroll bg-panel rounded-lg border border-line shadow-2xl"
         role="dialog"
@@ -80,6 +84,7 @@ export function AddConnectionModal({
           <button
             className="grid h-8 w-8 place-items-center text-faint hover:text-ink"
             onClick={onClose}
+            disabled={locked}
             title={tr("Close")}
             aria-label={tr("Close")}
           >
@@ -88,7 +93,13 @@ export function AddConnectionModal({
         </div>
 
         {localApp ? (
-          <LocalAppConnect c={c} onConnected={() => { onChanged(); onClose(); }} />
+          <LocalAppConnect
+            c={c}
+            onChanged={onChanged}
+            onClose={onClose}
+            onBusyChange={setLocked}
+            onOpenMemory={onOpenMemory}
+          />
         ) : twoModes ? (
           <>
             <div className="px-5 pt-4">
@@ -149,14 +160,28 @@ export function AddConnectionModal({
 
 function LocalAppConnect({
   c,
-  onConnected,
+  onChanged,
+  onClose,
+  onBusyChange,
+  onOpenMemory,
 }: {
   c: Connector;
-  onConnected: () => void;
+  onChanged: () => void;
+  onClose: () => void;
+  onBusyChange: (busy: boolean) => void;
+  onOpenMemory?: () => void;
 }) {
   // Conversation sources aren't launchable apps — they are local folders the user grants.
   if (c.name === "codex" || c.name === "traex") {
-    return <LocalConversationConnect c={c} onConnected={onConnected} />;
+    return (
+      <LocalConversationConnect
+        c={c}
+        onChanged={onChanged}
+        onClose={onClose}
+        onBusyChange={onBusyChange}
+        onOpenMemory={onOpenMemory}
+      />
+    );
   }
 
   const { tr } = useI18n();
@@ -165,6 +190,7 @@ function LocalAppConnect({
 
   const go = async () => {
     setWaiting(true);
+    onBusyChange(true);
     setError(null);
     try {
       const result = await connectConnector(c.name, {});
@@ -172,11 +198,13 @@ function LocalAppConnect({
         setError(result.error || tr("Could not launch or connect {name}.", { name: c.title }));
         return;
       }
-      onConnected();
+      onChanged();
+      onClose();
     } catch {
       setError(tr("Could not launch or connect {name}.", { name: c.title }));
     } finally {
       setWaiting(false);
+      onBusyChange(false);
     }
   };
 
@@ -207,45 +235,91 @@ function LocalAppConnect({
 
 // Local conversation import: folder selection grants macOS access, then Smallink persists the
 // normalized session path and imports user-owned conversation turns.
-function LocalConversationConnect({ c, onConnected }: { c: Connector; onConnected: () => void }) {
+type LocalConversationPhase = "idle" | "choosing" | "authorizing" | "importing" | "complete" | "partial";
+
+function LocalConversationConnect({
+  c,
+  onChanged,
+  onClose,
+  onBusyChange,
+  onOpenMemory,
+}: {
+  c: Connector;
+  onChanged: () => void;
+  onClose: () => void;
+  onBusyChange: (busy: boolean) => void;
+  onOpenMemory?: () => void;
+}) {
   const { tr } = useI18n();
-  const [waiting, setWaiting] = useState(false);
+  const [phase, setPhase] = useState<LocalConversationPhase>("idle");
   const [error, setError] = useState<string | null>(null);
-  const [progress, setProgress] = useState("");
+  const [result, setResult] = useState<{ sessions: number; records: number } | null>(null);
   const isTraex = c.name === "traex";
 
-  const go = async () => {
+  const setBusy = (busy: boolean) => {
+    onBusyChange(busy);
+  };
+
+  const importConversations = async () => {
+    setPhase("importing");
+    setBusy(true);
     setError(null);
-    setProgress("");
-    const picked = await chooseFolder();
-    if (!picked) return; // user cancelled the dialog
-    setWaiting(true);
     try {
-      setProgress(
-        tr(isTraex ? "Authorizing TRAE folder…" : "Authorizing Codex folder…"),
+      const imported = isTraex ? await syncTraex() : await syncCodex();
+      setResult({ sessions: imported.sessions_read, records: imported.records_ingested });
+      setPhase("complete");
+      onChanged();
+    } catch {
+      setPhase("partial");
+      setError(
+        tr(isTraex ? "Could not import TRAE conversations." : "Could not import Codex conversations."),
       );
+      onChanged();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const go = async () => {
+    let authorized = false;
+    setError(null);
+    setResult(null);
+    setPhase("choosing");
+    setBusy(true);
+    try {
+      const picked = await chooseFolder();
+      if (!picked) {
+        setPhase("idle");
+        return;
+      }
+      setPhase("authorizing");
       const result = await connectConnector(c.name, { sessions_path: picked });
       if (!result.ok) {
         setError(result.error || tr("Could not connect {name}.", { name: c.title }));
+        setPhase("idle");
         return;
       }
-      setProgress(
-        tr(isTraex ? "Importing TRAE conversations…" : "Importing Codex conversations…"),
-      );
-      const imported = isTraex ? await syncTraex() : await syncCodex();
-      setProgress(
-        tr("Imported {records} conversation records from {sessions} sessions.", {
-          records: imported.records_ingested,
-          sessions: imported.sessions_read,
-        }),
-      );
-      onConnected();
+      authorized = true;
     } catch {
       setError(tr("Could not connect {name}.", { name: c.title }));
+      setPhase("idle");
     } finally {
-      setWaiting(false);
+      if (!authorized) setBusy(false);
+    }
+    if (authorized) {
+      await importConversations();
     }
   };
+
+  const waiting = phase === "choosing" || phase === "authorizing" || phase === "importing";
+  const progress =
+    phase === "choosing"
+      ? tr("Waiting for folder selection…")
+      : phase === "authorizing"
+        ? tr(isTraex ? "Authorizing TRAE folder…" : "Authorizing Codex folder…")
+        : phase === "importing"
+          ? tr(isTraex ? "Importing TRAE conversations…" : "Importing Codex conversations…")
+          : "";
 
   return (
     <div className="px-5 py-4 space-y-3">
@@ -260,19 +334,59 @@ function LocalConversationConnect({ c, onConnected }: { c: Connector; onConnecte
         className={PILL_ACCENT + " w-full !py-2"}
         data-testid={`modal-${c.name}-connect`}
         onClick={go}
-        disabled={waiting}
+        disabled={waiting || phase === "complete" || phase === "partial"}
       >
-        {waiting
-          ? tr("Connecting and importing…")
-          : tr(isTraex ? "Authorize and import TRAE" : "Authorize and import Codex")}
+        {waiting ? tr("Connecting and importing…") : tr(isTraex ? "Authorize and import TRAE" : "Authorize and import Codex")}
       </button>
-      {progress && <div className="text-[12.5px] text-ok">{progress}</div>}
-      {error && <div className="text-[12.5px] text-danger">{error}</div>}
+      {progress && (
+        <InlineFeedback tone="info" title={progress} body={tr("Keep this window open until the step finishes.")} />
+      )}
+      {phase === "complete" && result && (
+        <InlineFeedback
+          tone="success"
+          title={result.records > 0 ? tr("Import complete") : tr("Already up to date")}
+          body={tr("Imported {records} conversation records from {sessions} sessions.", {
+            records: result.records,
+            sessions: result.sessions,
+          })}
+        />
+      )}
+      {phase === "partial" && (
+        <InlineFeedback
+          tone="warning"
+          title={tr("{name} is connected, but import did not finish.", { name: c.title })}
+          body={error || tr("Could not import conversations")}
+          action={tr("Retry import")}
+          onAction={() => void importConversations()}
+        />
+      )}
+      {error && phase === "idle" && (
+        <InlineFeedback tone="danger" title={tr("Could not connect {name}.", { name: c.title })} body={error} />
+      )}
       <p className="text-[12px] text-faint text-center">
         {tr("One action grants folder access, connects {name}, and imports new conversations.", {
           name: c.title,
         })}
       </p>
+      {(phase === "complete" || phase === "partial") && (
+        <div className="flex items-center justify-end gap-2 pt-1">
+          {phase === "complete" && onOpenMemory && (
+            <button
+              type="button"
+              className={PILL_LINE}
+              onClick={() => {
+                onClose();
+                onOpenMemory();
+              }}
+            >
+              {tr("View memory data")}
+            </button>
+          )}
+          <button type="button" className={PILL_ACCENT} onClick={onClose}>
+            {tr("Done")}
+          </button>
+        </div>
+      )}
     </div>
   );
 }

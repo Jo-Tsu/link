@@ -289,6 +289,12 @@ export async function getSensoryRecords(params: {
   return res.json();
 }
 
+export async function getSensoryRecord(recordId: string): Promise<SensoryRecord> {
+  const res = await fetch(`${httpBase()}/v1/sensory-records/${encodeURIComponent(recordId)}`);
+  if (!res.ok) throw new Error("Could not load source record");
+  return res.json();
+}
+
 export async function getSensoryStats(): Promise<SensoryStats> {
   const res = await fetch(`${httpBase()}/v1/sensory-records/stats`);
   if (!res.ok) throw new Error("Could not load source statistics");
@@ -1573,7 +1579,7 @@ export async function addModel(model: string): Promise<ModelSettings & { ok: boo
   return res.json();
 }
 
-export async function removeModel(model: string): Promise<ModelSettings & { ok: boolean }> {
+export async function removeModel(model: string): Promise<ModelSettings & { ok: boolean; error?: string }> {
   const res = await fetch(`${httpBase()}/v1/settings/models/remove`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },

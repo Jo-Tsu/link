@@ -148,6 +148,9 @@ describe("Codex one-click connector", () => {
     });
     await waitFor(() => expect(syncCodex).toHaveBeenCalledOnce());
     expect(onChanged).toHaveBeenCalledOnce();
+    expect(onClose).not.toHaveBeenCalled();
+    expect(await screen.findByText("Import complete")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Done" }));
     expect(onClose).toHaveBeenCalledOnce();
   });
 
@@ -209,6 +212,41 @@ describe("TRAE CLI one-click connector", () => {
     await waitFor(() => expect(syncTraex).toHaveBeenCalledOnce());
     expect(syncCodex).not.toHaveBeenCalled();
     expect(onChanged).toHaveBeenCalledOnce();
+    expect(onClose).not.toHaveBeenCalled();
+    expect(await screen.findByText("Import complete")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Done" }));
     expect(onClose).toHaveBeenCalledOnce();
+  });
+
+  it("keeps the successful connection and offers an import retry", async () => {
+    vi.mocked(chooseFolder).mockResolvedValue("/Users/me/.trae");
+    vi.mocked(connectConnector).mockResolvedValue({ ok: true, account: "TRAE CLI local" });
+    vi.mocked(syncTraex)
+      .mockRejectedValueOnce(new Error("scan failed"))
+      .mockResolvedValueOnce({
+        sessions_read: 2,
+        turns_seen: 5,
+        records_ingested: 5,
+      });
+    const onChanged = vi.fn();
+
+    render(
+      <LanguageProvider>
+        <AddConnectionModal
+          c={traex}
+          cloud={null}
+          onChanged={onChanged}
+          onClose={vi.fn()}
+        />
+      </LanguageProvider>,
+    );
+
+    fireEvent.click(screen.getByTestId("modal-traex-connect"));
+    expect(await screen.findByText("TRAE CLI is connected, but import did not finish.")).toBeTruthy();
+    expect(onChanged).toHaveBeenCalledOnce();
+
+    fireEvent.click(screen.getByRole("button", { name: "Retry import" }));
+    expect(await screen.findByText("Import complete")).toBeTruthy();
+    expect(syncTraex).toHaveBeenCalledTimes(2);
   });
 });
