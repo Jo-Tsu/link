@@ -41,6 +41,24 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 GUI="$ROOT/surfaces/gui"
 APP="Smallink"
+export PATH="$ROOT/.venv/bin:$PATH"
+export PYINSTALLER_CONFIG_DIR="${PYINSTALLER_CONFIG_DIR:-/private/tmp/smallink-pyinstaller}"
+for dependency in node rustc cargo cmake hdiutil; do
+  if ! command -v "$dependency" >/dev/null 2>&1; then
+    echo "ERROR: required build dependency is missing: $dependency" >&2
+    exit 1
+  fi
+done
+for required in \
+  "$GUI/src-tauri/entitlements.plist" \
+  "$HERE/smallink-server.spec" \
+  "$HERE/entry_smallink_server.py"; do
+  if [[ ! -f "$required" ]]; then
+    echo "ERROR: required packaging file is missing: $required" >&2
+    exit 1
+  fi
+done
+python3 "$ROOT/scripts/check_versions.py"
 # Single source of truth for the version: tauri.conf.json (also stamps the bundle).
 VERSION="$(node -p "require('$GUI/src-tauri/tauri.conf.json').version")"
 TRIPLE="$(rustc -vV | sed -n 's/host: //p')"   # e.g. aarch64-apple-darwin

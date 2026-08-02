@@ -1,7 +1,7 @@
 {
   "name": "smallink-desktop",
   "private": true,
-  "version": "0.0.0",
+  "version": "0.2.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -18,9 +18,9 @@
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "react-markdown": "^10.1.0",
+    "read-excel-file": "^5.8.8",
     "remark-gfm": "^4.0.1",
-    "simple-icons": "^16.26.0",
-    "xlsx": "^0.18.5"
+    "simple-icons": "^16.26.0"
   },
   "devDependencies": {
     "@playwright/test": "^1.61.1",

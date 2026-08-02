@@ -56,6 +56,7 @@ from ..connectors import (
     slack_split,
     update_connector_tools,
 )
+from ..connectors.sync_store import ConnectorSyncStore
 from ..connectors.browser_automation import (
     browser_close_session,
     browser_state,
@@ -71,7 +72,13 @@ from ..mcp import (
     put_global_server,
     read_global,
 )
-from ..memory import MemoryPipeline, MemoryStore, Scope, SQLiteMemoryStore
+from ..memory import (
+    MemoryPipeline,
+    MemoryStore,
+    Scope,
+    SQLiteGovernanceStore,
+    SQLiteMemoryStore,
+)
 from ..permissions import Mode
 from ..agents import list_agents as _list_agents
 from ..providers import (
@@ -158,11 +165,13 @@ class SessionManager:
         base.mkdir(parents=True, exist_ok=True)
 
         self.memory_store: MemoryStore = SQLiteMemoryStore(base / "link.db")
+        self.governance_store = SQLiteGovernanceStore(base / "link.db")
         self.audit_store = AuditStore(base / "link.db")
         self.session_store = ConversationStore(base)
         self.runtime_store = SQLiteTaskRuntimeStore(base / "link.db")
         self.runtime_store.recover_incomplete_runs()
         self.sensory_store = SQLiteSensoryStore(base / "link.db")
+        self.connector_sync_store = ConnectorSyncStore(base / "link.db")
         self.session_store.canonicalize_workspaces()  # collapse /tmp vs /private/tmp etc.
         if self.default_workspace:
             self.session_store.touch_workspace(self.default_workspace)
@@ -209,7 +218,13 @@ class SessionManager:
         # Automation: scheduled tasks store + the tick scheduler (started in the lifespan).
         # The scheduler also resumes self-wake'd sessions each tick (extra_tick).
         self.task_store = TaskStore(base / "automation.db")
-        self.task_store.recover_incomplete_runs()
+        self.task_store.recover_incomplete_runs(
+            runtime_status=lambda session_id: (
+                self.runtime_store.get_task_by_session(session_id).status
+                if self.runtime_store.get_task_by_session(session_id) is not None
+                else None
+            )
+        )
         self.scheduler = Scheduler(
             self.task_store, self._run_scheduled_task, extra_tick=self.resume_due_wakes
         )
@@ -453,6 +468,7 @@ class SessionManager:
             mode=mode,
             provider=self.provider,
             memory_store=self.memory_store,
+            governance_store=self.governance_store,
             messages=messages,
             extra_tools=extra_tools,
             secrets=self.secrets,
@@ -2562,6 +2578,13 @@ class SessionManager:
         await self.scheduler.stop()
         await self.stop_gateway()
         await self.mcp.aclose()
+        self.governance_store.close()
+        self.connector_sync_store.close()
+        self.sensory_store.close()
+        self.runtime_store.close()
+        self.session_store.close()
+        self.memory_store.close()
+        self.task_store.close()
         self.audit_store.close()
 
     # -- automation (scheduled tasks) -------------------------------------------
@@ -2701,6 +2724,7 @@ class SessionManager:
             approver=self._scheduled_approver(task, session_id),
             provider=self.provider,
             memory_store=self.memory_store,
+            governance_store=self.governance_store,
             secrets=self.secrets,
             # No scheduling tools inside a scheduled run: the executing agent's job is to DO the
             # task, and instructions that mention timing ("every day at 5:32pm…") otherwise tempt
@@ -2870,6 +2894,7 @@ class SessionManager:
         trigger: str = "user",
         retry: bool = False,
         resume: bool = False,
+        client_message_id: Optional[str] = None,
     ) -> AsyncIterator[Any]:
         """Run one engine turn while durably recording its task, agent and event lifecycle."""
         record = self.session_store.load(session_id)
@@ -2882,28 +2907,41 @@ class SessionManager:
             input_value = {"action": "retry"}
         elif resume:
             input_value = {"action": "resume"}
-        _task_run, agent_run = self.runtime_store.start_root_run(
-            session_id=session_id,
-            title=title,
-            trigger=trigger,
-            agent_role=getattr(engine, "agent_name", "code"),
-            model=getattr(engine, "model", None),
-            mode=getattr(mode, "value", str(mode) if mode is not None else None),
-            input_value=input_value,
-            project_id=(
-                str(getattr(getattr(engine, "executor", None), "cwd", "")) or None
-            ),
+        agent_run = (
+            await asyncio.to_thread(self.runtime_store.resume_waiting_root, session_id)
+            if resume
+            else None
         )
+        if agent_run is None:
+            _task_run, agent_run = await asyncio.to_thread(
+                self.runtime_store.start_root_run,
+                session_id=session_id,
+                title=title,
+                trigger=trigger,
+                agent_role=getattr(engine, "agent_name", "code"),
+                model=getattr(engine, "model", None),
+                mode=getattr(mode, "value", str(mode) if mode is not None else None),
+                input_value=input_value,
+                project_id=(
+                    str(getattr(getattr(engine, "executor", None), "cwd", ""))
+                    or None
+                ),
+            )
         source_name = str((source or {}).get("connector") or "smallink")
         try:
-            self.sensory_store.add(
+            await asyncio.to_thread(
+                self.sensory_store.add,
                 source_type=source_name,
                 connector_id=(source or {}).get("connector"),
-                account_id=(source or {}).get("account_id") or (source or {}).get("team_id"),
+                account_id=(source or {}).get("account_id")
+                or (source or {}).get("team_id"),
                 external_id=f"{agent_run.agent_run_id}:input",
                 content_type="connector_input" if source else "user_input",
                 raw_content=_sensory_safe(input_value),
-                project_path=str(getattr(getattr(engine, "executor", None), "cwd", "")) or None,
+                project_path=str(
+                    getattr(getattr(engine, "executor", None), "cwd", "")
+                )
+                or None,
                 conversation_id=session_id,
                 metadata={
                     "agent_run_id": agent_run.agent_run_id,
@@ -2926,7 +2964,14 @@ class SessionManager:
             elif retry:
                 events = engine.retry()
             else:
-                events = engine.run(content, source=source)
+                if client_message_id:
+                    events = engine.run(
+                        content,
+                        source=source,
+                        client_message_id=client_message_id,
+                    )
+                else:
+                    events = engine.run(content, source=source)
             async for event in events:
                 event_count += 1
                 event_type = event.type.value
@@ -2934,8 +2979,11 @@ class SessionManager:
                 # semantic lifecycle events instead; one short answer can contain hundreds of
                 # deltas and made both the database and Runs UI grow without useful information.
                 if event_type not in {"assistant_delta", "reasoning_delta"}:
-                    self.runtime_store.append_event(
-                        agent_run.agent_run_id, event_type, event.data
+                    await asyncio.to_thread(
+                        self.runtime_store.append_event,
+                        agent_run.agent_run_id,
+                        event_type,
+                        event.data,
                     )
                 sensory_type = {
                     "assistant_message": "assistant_output",
@@ -2946,12 +2994,20 @@ class SessionManager:
                 }.get(event_type)
                 if sensory_type:
                     try:
-                        self.sensory_store.add(
+                        await asyncio.to_thread(
+                            self.sensory_store.add,
                             source_type="smallink",
-                            external_id=f"{agent_run.agent_run_id}:{event_count}:{event_type}",
+                            external_id=(
+                                f"{agent_run.agent_run_id}:{event_count}:{event_type}"
+                            ),
                             content_type=sensory_type,
                             raw_content=_sensory_safe(event.data),
-                            project_path=str(getattr(getattr(engine, "executor", None), "cwd", "")) or None,
+                            project_path=str(
+                                getattr(
+                                    getattr(engine, "executor", None), "cwd", ""
+                                )
+                            )
+                            or None,
                             conversation_id=session_id,
                             metadata={
                                 "agent_run_id": agent_run.agent_run_id,
@@ -2960,7 +3016,9 @@ class SessionManager:
                                 "agent_role": getattr(engine, "agent_name", "code"),
                                 "model": getattr(engine, "model", None),
                             },
-                            source_locator=f"/v1/agent-runs/{agent_run.agent_run_id}/events",
+                            source_locator=(
+                                f"/v1/agent-runs/{agent_run.agent_run_id}/events"
+                            ),
                         )
                     except Exception:
                         logger.exception(
@@ -3001,7 +3059,8 @@ class SessionManager:
             terminal_error = str(exc)
             raise
         finally:
-            self.runtime_store.finish_agent_run(
+            await asyncio.to_thread(
+                self.runtime_store.finish_agent_run,
                 agent_run.agent_run_id,
                 status=terminal_status or "failed",
                 output=output or None,
@@ -3909,11 +3968,13 @@ class SessionManager:
         source_type: Optional[str] = None,
         governance_status: Optional[str] = None,
         conversation_id: Optional[str] = None,
+        query: Optional[str] = None,
     ) -> dict[str, Any]:
         filters = {
             "source_type": source_type,
             "governance_status": governance_status,
             "conversation_id": conversation_id,
+            "query": query,
         }
         records = self.sensory_store.list(limit=limit, offset=offset, **filters)
         return {
@@ -3926,6 +3987,63 @@ class SessionManager:
     def sensory_record(self, record_id: str) -> Optional[dict[str, Any]]:
         record = self.sensory_store.get(record_id)
         return record.to_dict() if record else None
+
+    def delete_sensory_records(
+        self,
+        *,
+        record_ids: Optional[list[str]] = None,
+        source_type: Optional[str] = None,
+        before: Optional[str] = None,
+    ) -> dict[str, Any]:
+        ids = list(dict.fromkeys(record_ids or []))
+        affected_candidates: set[str] = set()
+        affected_memories: set[int] = set()
+        connection = self.governance_store._conn
+        clauses: list[str] = []
+        params: list[Any] = []
+        if ids:
+            clauses.append("record_id IN (" + ",".join("?" for _ in ids) + ")")
+            params.extend(ids)
+        if source_type:
+            clauses.append("source_type=?")
+            params.append(source_type)
+        if before:
+            clauses.append("occurred_at<?")
+            params.append(before)
+        if not clauses:
+            raise ValueError("a record, source, or time boundary is required")
+        rows = connection.execute(
+            "SELECT record_id FROM sensory_records WHERE " + " AND ".join(clauses),
+            params,
+        ).fetchall()
+        selected_ids = [str(row["record_id"]) for row in rows]
+        if selected_ids:
+            placeholders = ",".join("?" for _ in selected_ids)
+            affected_candidates = {
+                str(row["candidate_id"])
+                for row in connection.execute(
+                    f"SELECT candidate_id FROM candidate_sources WHERE record_id IN ({placeholders})",
+                    selected_ids,
+                ).fetchall()
+            }
+            affected_memories = {
+                int(row["memory_id"])
+                for row in connection.execute(
+                    f"SELECT memory_id FROM memory_sources WHERE record_id IN ({placeholders})",
+                    selected_ids,
+                ).fetchall()
+            }
+        deleted = self.sensory_store.delete(
+            record_ids=selected_ids,
+            source_type=None,
+            before=None,
+        ) if selected_ids else 0
+        return {
+            "ok": True,
+            "deleted_records": deleted,
+            "affected_candidates": sorted(affected_candidates),
+            "affected_memories": sorted(affected_memories),
+        }
 
     # Fields an external caller may set, mapped 1:1 onto SQLiteSensoryStore.add's kwargs.
     _INGEST_OPTIONAL = (
@@ -3971,19 +4089,59 @@ class SessionManager:
         }
 
     def run_memory_pipeline(
-        self, record_ids: Optional[list[str]] = None, limit: int = 50
+        self,
+        record_ids: Optional[list[str]] = None,
+        limit: int = 50,
+        retry_failed: bool = False,
+        allow_sensitive_cloud: bool = False,
     ) -> dict[str, Any]:
-        """Run clean→tag→layer over pending raw records, producing status='pending' memories.
-        Blocking (LLM calls); the route wraps it in asyncio.to_thread. Manual trigger only —
-        there is no automatic/scheduled invocation this phase. Uses the model tagged for the
-        'memory' purpose (falls back to the global default when none is tagged)."""
+        """Run the durable governance pipeline and produce reviewable candidates."""
         pipeline = MemoryPipeline(
             self.sensory_store,
             self.memory_store,
             self.provider,
             model=self.model_for_purpose("memory"),
+            governance_store=self.governance_store,
+            allow_sensitive_cloud=allow_sensitive_cloud,
         )
-        return pipeline.process(record_ids=record_ids, limit=limit)
+        return pipeline.process(
+            record_ids=record_ids,
+            limit=limit,
+            retry_failed=retry_failed,
+        )
+
+    def memory_candidates(self, status: Optional[str] = "pending") -> list[dict[str, Any]]:
+        return [
+            candidate.to_dict()
+            for candidate in self.governance_store.list_candidates(status=status)
+        ]
+
+    def memory_candidate(self, candidate_id: str) -> Optional[dict[str, Any]]:
+        candidate = self.governance_store.get_candidate(candidate_id)
+        if candidate is None:
+            return None
+        data = candidate.to_dict()
+        data["source_records"] = [
+            record.to_dict()
+            for source_id in candidate.sources
+            if (record := self.sensory_store.get(source_id)) is not None
+        ]
+        return data
+
+    def decide_memory_candidate(
+        self, candidate_id: str, body: dict[str, Any]
+    ) -> dict[str, Any]:
+        return self.governance_store.decide(
+            candidate_id,
+            str(body.get("action", "")),
+            self.memory_store,
+            content=body.get("content"),
+            merge_memory_id=(
+                int(body["merge_memory_id"])
+                if body.get("merge_memory_id") is not None
+                else None
+            ),
+        )
 
     def sync_codex(self, limit_sessions: Optional[int] = None) -> dict[str, Any]:
         """Read local Codex rollout sessions and ingest each conversation TURN (one user
@@ -3992,7 +4150,11 @@ class SessionManager:
         via ingest's content-hash dedupe, so re-syncing the same sessions creates no duplicates.
         `limit_sessions` caps how many session FILES are read (newest first) — pass a small N to
         validate before a full import. Does NOT run the memory pipeline; that stays separate."""
-        from ..connectors.codex_client import read_sessions, resolve_sessions_root
+        from ..connectors.codex_client import (
+            iter_session_files,
+            read_sessions,
+            resolve_sessions_root,
+        )
 
         # Prefer the user-granted folder saved at connect time (macOS TCC needs the user to
         # pick ~/.codex in a native dialog before the app can read it); fall back to the default
@@ -4000,10 +4162,12 @@ class SessionManager:
         profile = self.secrets.get("codex:default") or {}
         root = resolve_sessions_root(profile.get("sessions_path")) if profile.get("sessions_path") else None
 
-        return self._sync_rollout_sessions(
-            read_sessions(limit=limit_sessions, root=root),
+        return self._run_rollout_sync(
             source_type="codex",
             content_type="codex_turn",
+            root=root,
+            files=iter_session_files(root),
+            sessions_iter=read_sessions(limit=limit_sessions, root=root),
         )
 
     def sync_traex(self, limit_sessions: Optional[int] = None) -> dict[str, Any]:
@@ -4013,6 +4177,7 @@ class SessionManager:
         sessions. The TraeX reader excludes those internal threads before they reach the sensory
         pool. A packaged macOS app reads the explicitly granted folder saved by the connector.
         """
+        from ..connectors.codex_client import iter_session_files
         from ..connectors.traex_client import read_sessions, resolve_sessions_root
 
         profile = self.secrets.get("traex:default") or {}
@@ -4021,11 +4186,52 @@ class SessionManager:
             if profile.get("sessions_path")
             else None
         )
-        return self._sync_rollout_sessions(
-            read_sessions(limit=limit_sessions, root=root),
+        return self._run_rollout_sync(
             source_type="traex",
             content_type="traex_turn",
+            root=root,
+            files=iter_session_files(root),
+            sessions_iter=read_sessions(limit=limit_sessions, root=root),
         )
+
+    def _run_rollout_sync(
+        self,
+        *,
+        source_type: str,
+        content_type: str,
+        root: Optional[Path],
+        files: list[Path],
+        sessions_iter,
+    ) -> dict[str, Any]:
+        job_id = self.connector_sync_store.start(
+            source_type, str(root) if root is not None else None
+        )
+        try:
+            result = self._sync_rollout_sessions(
+                sessions_iter,
+                source_type=source_type,
+                content_type=content_type,
+            )
+            last_file = str(files[0]) if files else None
+            last_mtime = files[0].stat().st_mtime if files else None
+            job = self.connector_sync_store.finish(
+                job_id,
+                status="completed",
+                files_scanned=len(files),
+                sessions_read=result["sessions_read"],
+                records_seen=result["turns_seen"],
+                records_ingested=result["records_ingested"],
+                last_file=last_file,
+                last_file_mtime=last_mtime,
+                details={"source_type": source_type},
+            )
+            return {**result, "job_id": job_id, "sync": job}
+        except Exception as exc:
+            self.connector_sync_store.fail(job_id, exc)
+            raise
+
+    def connector_sync_status(self, name: str) -> Optional[dict[str, Any]]:
+        return self.connector_sync_store.latest(name)
 
     def _sync_rollout_sessions(
         self,

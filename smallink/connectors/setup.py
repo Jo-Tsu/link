@@ -343,12 +343,19 @@ def connect_connector(
             # Local conversation sources need an explicit folder grant on packaged macOS builds.
             # Persist the normalized sessions path; there is no app launch or health check.
             if name == "codex":
-                from .codex_client import resolve_sessions_root
+                from .codex_client import probe_sessions_root, resolve_sessions_root
             else:
-                from .traex_client import resolve_sessions_root
+                from .traex_client import probe_sessions_root, resolve_sessions_root
 
             picked = fields.get("sessions_path") or fields.get("path") or ""
             resolved = resolve_sessions_root(str(picked)) if picked else None
+            probe = probe_sessions_root(resolved)
+            if not probe.get("ok"):
+                return {
+                    "ok": False,
+                    "error": "The selected folder does not contain readable conversation sessions.",
+                    "probe": probe,
+                }
             account = "Codex local" if name == "codex" else "TRAE CLI local"
             profile = {
                 "type": "local_app",
@@ -357,7 +364,12 @@ def connect_connector(
                 "sessions_path": str(resolved) if resolved else "",
             }
             secrets.put(f"{name}:default", profile)
-            return {"ok": True, "account": profile["account"], "sessions_path": profile["sessions_path"]}
+            return {
+                "ok": True,
+                "account": profile["account"],
+                "sessions_path": profile["sessions_path"],
+                "probe": probe,
+            }
         if name != "minem":
             return {"ok": False, "error": "unsupported local application connector"}
         from .minem_client import get_minem_client

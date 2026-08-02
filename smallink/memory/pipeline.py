@@ -19,9 +19,11 @@ or touches a live conversation. It is driven only by an explicit manager call / 
 from __future__ import annotations
 
 import json
+import re
 from typing import TYPE_CHECKING, Any, Optional
 
 from .base import MemoryStore, Scope
+from .governance import SQLiteGovernanceStore
 
 if TYPE_CHECKING:  # avoid a runtime import cycle with the sensory package
     from ..sensory import SQLiteSensoryStore
@@ -43,6 +45,11 @@ MEMORY_TYPES = (
 )
 
 _SCOPE_VALUES = {s.value for s in Scope}
+PROMPT_VERSION = "memory-extraction-v2"
+_SECRET_PATTERN = re.compile(
+    r"(?i)(password|passwd|secret|api[_ -]?key|access[_ -]?token|refresh[_ -]?token)"
+    r"\s*[:=]\s*[^\s,;]+"
+)
 
 # Adapted from mem0's FACT_RETRIEVAL_PROMPT, but the output contract is typed + scoped so the
 # clean/tag/layer steps happen in one structured call.
@@ -100,69 +107,121 @@ class MemoryPipeline:
         provider: Any,
         *,
         model: str,
+        governance_store: Optional[SQLiteGovernanceStore] = None,
+        allow_sensitive_cloud: bool = False,
     ) -> None:
         self.sensory_store = sensory_store
         self.memory_store = memory_store
         self.provider = provider
         self.model = model
-
-    def _processed_record_ids(self) -> set[str]:
-        """record_ids already turned into memories — status=None to include pending output."""
-        return {
-            m.source_record_id
-            for m in self.memory_store.list(status=None)
-            if m.source_record_id
-        }
+        self.governance_store = governance_store or SQLiteGovernanceStore(
+            getattr(memory_store, "path", ":memory:")
+        )
+        self.allow_sensitive_cloud = allow_sensitive_cloud
 
     def select_unprocessed(
-        self, record_ids: Optional[list[str]] = None, limit: int = 50
+        self,
+        task_id: str,
+        record_ids: Optional[list[str]] = None,
+        limit: int = 50,
+        *,
+        retry_failed: bool = False,
     ) -> list["SensoryRecord"]:
-        done = self._processed_record_ids()
-        if record_ids:
-            records = [self.sensory_store.get(rid) for rid in record_ids]
-            candidates = [r for r in records if r is not None]
-        else:
-            candidates = self.sensory_store.list(
-                governance_status="pending", limit=max(1, min(int(limit), 500))
-            )
-        return [r for r in candidates if r.record_id not in done]
+        return self.sensory_store.claim_for_governance(
+            task_id,
+            record_ids=record_ids,
+            limit=limit,
+            retry_failed=retry_failed,
+        )
 
     def process(
-        self, record_ids: Optional[list[str]] = None, limit: int = 50
+        self,
+        record_ids: Optional[list[str]] = None,
+        limit: int = 50,
+        *,
+        retry_failed: bool = False,
     ) -> dict[str, Any]:
-        records = self.select_unprocessed(record_ids, limit)
-        memories_created = 0
-        fallbacks = 0
-        for record in records:
-            try:
-                facts = self._extract(record)
-            except Exception:
-                # LLM/parse failure must never lose the capture: store the raw text as one
-                # untyped pending memory so a human can still see and later confirm it.
-                self._write_fallback(record)
-                fallbacks += 1
-                continue
-            if not facts:
-                # Nothing worth remembering. We create no memory; the record is cheap to
-                # re-scan later and simply yields nothing again.
-                continue
-            memories_created += self._write_facts(record, facts)
+        task_id = self.governance_store.create_task(
+            [], model=self.model, prompt_version=PROMPT_VERSION
+        )
+        records = self.select_unprocessed(
+            task_id,
+            record_ids,
+            limit,
+            retry_failed=retry_failed,
+        )
+        self.governance_store.attach_records(
+            task_id, [record.record_id for record in records]
+        )
+        candidates_created = 0
+        try:
+            for record in records:
+                try:
+                    self._ensure_allowed(record)
+                    facts = self._extract(record)
+                    if not facts:
+                        self.sensory_store.finish_governance(
+                            record.record_id, task_id, "skipped"
+                        )
+                        self.governance_store.mark_record(
+                            task_id, record.record_id, "skipped"
+                        )
+                        continue
+                    candidates_created += self._write_facts(task_id, record, facts)
+                    self.sensory_store.finish_governance(
+                        record.record_id, task_id, "processed"
+                    )
+                    self.governance_store.mark_record(
+                        task_id, record.record_id, "processed"
+                    )
+                except Exception as exc:
+                    error = f"{type(exc).__name__}: {exc}"[:1000]
+                    self.sensory_store.finish_governance(
+                        record.record_id, task_id, "failed", error=error
+                    )
+                    self.governance_store.mark_record(
+                        task_id, record.record_id, "failed", error=error
+                    )
+        finally:
+            self.sensory_store.release_governance_task(task_id)
+        task = self.governance_store.finish_task(task_id)
         return {
-            "processed_records": len(records),
-            "memories_created": memories_created,
-            "fallbacks": fallbacks,
+            "task_id": task_id,
+            "status": task["status"],
+            "processed_records": task["processed_records"],
+            "candidates_created": candidates_created,
+            "skipped_records": task["skipped_records"],
+            "failed_records": task["failed_records"],
         }
 
+    def _ensure_allowed(self, record: "SensoryRecord") -> None:
+        sensitivity = str(record.sensitivity or "unknown").lower()
+        if sensitivity == "secret":
+            raise PermissionError("secret records are excluded from AI governance")
+        if sensitivity == "sensitive" and not (
+            self.allow_sensitive_cloud or self._is_local_model()
+        ):
+            raise PermissionError(
+                "sensitive records require a local model or explicit cloud permission"
+            )
+
+    def _is_local_model(self) -> bool:
+        return self.model.startswith("ollama:")
+
     def _extract(self, record: "SensoryRecord") -> list[dict[str, Any]]:
+        content = _SECRET_PATTERN.sub(r"\1=[REDACTED]", record.normalized_content)
         messages = [
             {"role": "system", "content": EXTRACTION_PROMPT},
-            {"role": "user", "content": record.normalized_content},
+            {"role": "user", "content": content},
         ]
         turn = self.provider.complete(model=self.model, messages=messages, tools=None)
         return _parse_facts(getattr(turn, "text", None))
 
     def _write_facts(
-        self, record: "SensoryRecord", facts: list[dict[str, Any]]
+        self,
+        task_id: str,
+        record: "SensoryRecord",
+        facts: list[dict[str, Any]],
     ) -> int:
         written = 0
         for fact in facts:
@@ -173,33 +232,34 @@ class MemoryPipeline:
                 continue
             raw_type = fact.get("memory_type")
             memory_type = raw_type if raw_type in MEMORY_TYPES else None
-            scope, workspace = self._resolve_scope(fact.get("scope"), record)
-            self.memory_store.add(
-                content,
+            scope, workspace, session_id = self._resolve_scope(
+                fact.get("scope"), record
+            )
+            confidence: Optional[float] = None
+            try:
+                if fact.get("confidence") is not None:
+                    confidence = max(0.0, min(float(fact["confidence"]), 1.0))
+            except (TypeError, ValueError):
+                confidence = None
+            self.governance_store.add_candidate(
+                task_id=task_id,
+                content=content,
+                memory_type=memory_type,
                 scope=scope,
-                key=memory_type,
                 workspace=workspace,
-                status="pending",
-                source_record_id=record.record_id,
+                session_id=session_id,
+                model=self.model,
+                prompt_version=PROMPT_VERSION,
+                source_ids=[record.record_id],
+                confidence=confidence,
             )
             written += 1
         return written
 
-    def _write_fallback(self, record: "SensoryRecord") -> None:
-        scope, workspace = self._resolve_scope(None, record)
-        self.memory_store.add(
-            record.normalized_content,
-            scope=scope,
-            key=None,
-            workspace=workspace,
-            status="pending",
-            source_record_id=record.record_id,
-        )
-
     @staticmethod
     def _resolve_scope(
         raw_scope: Any, record: "SensoryRecord"
-    ) -> tuple[Scope, Optional[str]]:
+    ) -> tuple[Scope, Optional[str], Optional[str]]:
         """Map the model's scope hint to a Scope. Fallback: workspace when the record carries a
         project_path, else global. workspace is only set for WORKSPACE scope."""
         value = raw_scope if raw_scope in _SCOPE_VALUES else None
@@ -207,5 +267,7 @@ class MemoryPipeline:
             value = Scope.WORKSPACE.value if record.project_path else Scope.GLOBAL.value
         scope = Scope(value)
         if scope is Scope.WORKSPACE:
-            return scope, record.project_path
-        return scope, None
+            return scope, record.project_path, None
+        if scope is Scope.SESSION:
+            return scope, None, record.conversation_id
+        return scope, None, None

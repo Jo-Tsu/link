@@ -1,4 +1,4 @@
-Link 0.2.1 Developer Preview
+Smallink 0.2.0
 Copyright (c) 2026 Jo-Tsu
 
 Unless a file or directory contains a different license notice, the source code
@@ -7,5 +7,5 @@ in this repository is licensed under the Business Source License 1.1 in LICENSE.
 Third-party packages and container images remain subject to their respective
 licenses. Their inclusion does not change the license of those components.
 
-The names Link and LinkAgent and the project logos are not licensed for use as
+The names Smallink, Link, and LinkAgent and the project logos are not licensed for use as
 the name or branding of a derived product. See TRADEMARKS.md.

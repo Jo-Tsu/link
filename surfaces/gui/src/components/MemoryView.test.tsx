@@ -1,6 +1,15 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { getMemory, getSensoryRecord, getSensoryRecords, getSensoryStats } from "../api";
+import {
+  decideMemoryCandidate,
+  getMemory,
+  getMemoryCandidate,
+  getMemoryCandidates,
+  getSensoryRecord,
+  getSensoryRecords,
+  getSensoryStats,
+  runMemoryPipeline,
+} from "../api";
 import { LanguageProvider } from "../i18n";
 import { MemoryView } from "./MemoryView";
 
@@ -8,30 +17,39 @@ vi.mock("../api", async () => {
   const actual = await vi.importActual<typeof import("../api")>("../api");
   return {
     ...actual,
+    decideMemoryCandidate: vi.fn(),
     getMemory: vi.fn(),
+    getMemoryCandidate: vi.fn(),
+    getMemoryCandidates: vi.fn(),
     getSensoryRecord: vi.fn(),
     getSensoryRecords: vi.fn(),
     getSensoryStats: vi.fn(),
+    runMemoryPipeline: vi.fn(),
   };
 });
 
 beforeEach(() => {
   localStorage.setItem("link:language:v1", "en");
-  // MemoryView loads active memories with getMemory() and the pending queue with
-  // getMemory("pending"). Default: one active preference, empty pending.
-  vi.mocked(getMemory).mockImplementation(async (status?: string) => {
-    if (status === "pending") return [];
-    return [
-      {
-        id: 7,
-        scope: "global",
-        content: "Prefers concise product interfaces.",
-        key: "user_preference",
-        workspace: null,
-        session_id: null,
-        created_at: "2026-07-29T09:00:00Z",
-      },
-    ];
+  vi.mocked(getMemory).mockResolvedValue([
+    {
+      id: 7,
+      scope: "global",
+      content: "Prefers concise product interfaces.",
+      key: "user_preference",
+      workspace: null,
+      session_id: null,
+      created_at: "2026-07-29T09:00:00Z",
+    },
+  ]);
+  vi.mocked(getMemoryCandidates).mockResolvedValue([]);
+  vi.mocked(decideMemoryCandidate).mockResolvedValue({ ok: true, memory_id: 8 });
+  vi.mocked(runMemoryPipeline).mockResolvedValue({
+    task_id: "governance-1",
+    status: "completed",
+    processed_records: 1,
+    candidates_created: 1,
+    skipped_records: 0,
+    failed_records: 0,
   });
   vi.mocked(getSensoryStats).mockResolvedValue({
     total: 12,
@@ -68,23 +86,29 @@ describe("MemoryView", () => {
   });
 
   it("surfaces the pending queue and opens the review view", async () => {
-    vi.mocked(getMemory).mockImplementation(async (status?: string) => {
-      if (status === "pending") {
-        return [
-          {
-            id: 42,
-            scope: "workspace",
-            content: "Deploys with pnpm, never npm.",
-            key: "user_preference",
-            workspace: "/proj",
-            session_id: null,
-            created_at: "2026-07-31T09:00:00Z",
-            status: "pending",
-            source_record_id: "sensory-abc",
-          },
-        ];
-      }
-      return [];
+    const candidate = {
+      candidate_id: "candidate-42",
+      task_id: "governance-1",
+      scope: "workspace" as const,
+      content: "Deploys with pnpm, never npm.",
+      memory_type: "user_preference",
+      workspace: "/proj",
+      session_id: null,
+      created_at: "2026-07-31T09:00:00Z",
+      updated_at: "2026-07-31T09:00:00Z",
+      status: "pending" as const,
+      confidence: 0.9,
+      model: "test",
+      prompt_version: "v2",
+      sources: ["sensory-abc"],
+    };
+    vi.mocked(getMemory).mockResolvedValue([]);
+    vi.mocked(getMemoryCandidates)
+      .mockResolvedValueOnce([candidate])
+      .mockResolvedValue([]);
+    vi.mocked(getMemoryCandidate).mockResolvedValue({
+      ...candidate,
+      source_records: [],
     });
 
     render(<LanguageProvider><MemoryView /></LanguageProvider>);
@@ -94,9 +118,15 @@ describe("MemoryView", () => {
     fireEvent.click(banner);
 
     await screen.findByText("Candidate memory drafts");
-    expect(screen.getByText("Review-only in this preview")).toBeTruthy();
+    expect(screen.getByText("Review before Smallink uses it")).toBeTruthy();
     fireEvent.click(screen.getByText("Deploys with pnpm, never npm."));
-    expect(screen.getByText("Memory details")).toBeTruthy();
+    expect(await screen.findByText("Candidate details")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Accept" }));
+    await waitFor(() =>
+      expect(decideMemoryCandidate).toHaveBeenCalledWith("candidate-42", {
+        action: "accept",
+      }),
+    );
   });
 
   it("hides the pending banner when the queue is empty", async () => {
@@ -150,5 +180,15 @@ describe("MemoryView", () => {
     expect(await screen.findByText("Memory is unavailable")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Try again" }));
     expect(await screen.findByText("Personal memory")).toBeTruthy();
+  });
+
+  it("generates candidates when source data exists without candidates", async () => {
+    vi.mocked(getMemory).mockResolvedValue([]);
+    vi.mocked(getMemoryCandidates).mockResolvedValue([]);
+
+    render(<LanguageProvider><MemoryView /></LanguageProvider>);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Generate candidates" }));
+    await waitFor(() => expect(runMemoryPipeline).toHaveBeenCalledWith({ retry_failed: false }));
   });
 });

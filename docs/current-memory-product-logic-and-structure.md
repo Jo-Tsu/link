@@ -1,122 +1,82 @@
 # Smallink 当前记忆产品逻辑与代码结构
 
-本文只描述当前仓库中的真实实现，不把 PRD 目标、未来 Postgres 架构或尚未接线的能力写成已上线功能。
+本文只描述 `0.2.0` 当前代码，不把 Postgres、向量检索、知识库或项目空间等目标能力写成已上线功能。
 
-## 1. 当前产品定位
+## 1. 当前闭环
 
-Smallink 当前把记忆拆成三个不同层次：
+Smallink 将数据分为四层：
 
-1. **工作上下文**
-   - 当前会话中的消息、计划、工具调用和任务过程。
-   - 由会话与运行时模块维护。
-   - 不等同于长期个人记忆。
-2. **原始记忆源数据**
-   - 用户输入、Assistant 输出、工具记录和连接器同步数据。
-   - 存在 `sensory_records`。
-   - 保留来源、会话、项目路径、时间和内容哈希。
-3. **长期记忆**
-   - 从原始数据提炼出的长期事实、偏好、项目背景和决策。
-   - 当前以 `memories` 表保存。
-   - 分为 `pending` 与 `active`。
+1. **工作上下文**：当前会话、计划、工具和运行过程。
+2. **原始事实**：不可变的 `sensory_records`。
+3. **候选记忆**：AI 提炼后、等待用户决定的 `memory_candidates`。
+4. **正式记忆**：用户接受后写入 `memories`，并保存版本、来源和决策。
 
-当前产品真正打通的是：
+当前已经打通：
 
 ```text
-本地会话 / Smallink 运行时
-→ 原始数据采集
+Smallink / Codex / TRAE
 → sensory_records
-→ 手动触发 MemoryPipeline
-→ pending memories
+→ GovernanceTask 原子领取
+→ AI 提炼
+→ MemoryCandidate + CandidateSource
+→ 接受 / 编辑后接受 / 合并 / 忽略
+→ Memory + MemoryVersion + MemorySource + GovernanceDecision
+→ 作用域过滤 + 关键词相关性 + 字符预算
+→ active global/workspace memory 注入智能体上下文
+→ memory_usage 记录使用版本
 ```
 
-当前尚未打通：
+当前仍未完成：
 
 ```text
-pending memories
-→ 查看完整来源
-→ 人工确认 / 编辑 / 忽略 / 合并
-→ active memories
-→ 按任务检索
-→ 智能体引用并记录使用版本
+向量 / 混合检索
+→ Token 级预算与 ContextBundle
+→ 效果反馈
 ```
 
-## 2. 当前真实数据状态
+## 2. 数据位置
 
-当前默认数据目录为：
+默认状态目录仍为兼容路径：
 
 ```text
 ~/.config/link/
 ```
 
-主要 SQLite 数据库为：
+主要业务库：
 
 ```text
 ~/.config/link/link.db
 ```
 
-当前本机数据状态：
-
-| 来源 | 原始记录 | 会话数 | 状态 |
-|---|---:|---:|---|
-| TRAE CLI | 72 | 12 | 全部 pending |
-| Smallink runtime | 5 | 1 | 全部 pending |
-| 合计 | 77 | 13 | 尚未生成 memory |
-
-数据库完整性检查为 `ok`。
-
-这些数据已经进入原始层，但尚未运行可靠的治理与确认闭环，因此不能视为可供智能体使用的正式记忆。
-
-## 3. 数据采集逻辑
-
-## 3.1 Smallink 自身运行时采集
-
-入口：
+文档不再记录某一台机器的实时行数。当前数量以客户端记忆页和以下 API 为准：
 
 ```text
-SessionManager.tracked_engine_events()
+GET /v1/sensory-records/stats
+GET /v1/memory
+GET /v1/memory/candidates
 ```
 
-实现位置：
+## 3. 原始事实采集
 
-```text
-smallink/server/manager.py
-```
+Smallink 运行时从 `SessionManager.tracked_engine_events()` 采集：
 
-采集内容包括：
-
-- 用户输入。
-- 连接器输入。
-- Assistant 完整输出。
-- 工具提议。
-- 工具结果。
+- 用户和连接器输入；
+- Assistant 最终输出；
+- 工具提议和结果；
 - 运行错误。
 
-采集时会写入：
+运行时数据库写入通过线程池执行，不阻塞 FastAPI 事件循环。所有 SQLite Store 使用统一连接策略：
 
 ```text
-SQLiteSensoryStore
-→ sensory_records
+WAL
+busy_timeout=15000
+synchronous=NORMAL
+foreign_keys=ON
 ```
 
-每条记录保留：
+每条 `sensory_records` 保留来源、内容、项目、会话、哈希、敏感级别、治理状态和来源位置。
 
-- `source_type`
-- `connector_id`
-- `account_id`
-- `external_id`
-- `content_type`
-- `raw_content`
-- `normalized_content`
-- `occurred_at`
-- `project_path`
-- `conversation_id`
-- `content_hash`
-- `sensitivity`
-- `governance_status`
-- `metadata`
-- `source_locator`
-
-## 3.2 通用外部采集入口
+### 通用采集入口
 
 REST API：
 
@@ -232,15 +192,11 @@ SQLiteSensoryStore
 当前状态字段：
 
 ```text
-governance_status = pending
+governance_status =
+  pending | processing | processed | skipped | failed
 ```
 
-当前实现没有完整的状态推进逻辑，因此记录不会自动进入：
-
-- `processing`
-- `processed`
-- `skipped`
-- `failed`
+管道通过 `BEGIN IMMEDIATE` 在数据库内原子领取，避免两个 worker 同时处理同一条记录。失败项保留错误、次数和时间，可显式重试；空结果进入 `skipped`，不会反复调用模型。
 
 ## 5. 记忆提炼管道
 
@@ -295,13 +251,14 @@ model_for_purpose("memory")
 }
 ```
 
-管道产物统一写入：
+管道产物写入独立的 `memory_candidates`，不会直接写正式记忆。
 
-```text
-status = pending
-```
+敏感策略：
 
-因此不会被普通对话当作正式记忆使用。
+- `secret`：禁止发送模型；
+- `sensitive`：默认只允许本地模型，云模型需显式许可；
+- 常见密码、Token 和 API key 模式在发送前脱敏；
+- Provider/解析失败只记录 failed，不把原文固化成候选。
 
 ## 6. 记忆类型
 
@@ -361,7 +318,7 @@ MemoryStore
 SQLiteMemoryStore
 ```
 
-`memories` 当前保存：
+正式 `memories` 保存：
 
 - `id`
 - `scope`
@@ -374,15 +331,18 @@ SQLiteMemoryStore
 - `updated_at`
 - `source_record_id`
 
-状态语义：
+候选与正式记忆分离。接受候选时，在同一 SQLite 事务中创建正式记忆、版本、来源和决策；编辑后接受保存编辑结果；合并会更新目标记忆并追加版本；忽略只保存决策。
 
-| 状态 | 当前含义 |
-|---|---|
-| `pending` | AI 管道产物，等待未来人工治理 |
-| `active` | 可以被读取并注入到智能体上下文 |
-| `archived` | 类型中有定义意图，但当前没有完整产品操作 |
+当前表包括：
 
-`memory_history` 保存 add、update、delete 的内容变化记录。
+- `governance_tasks`
+- `governance_task_records`
+- `memory_candidates`
+- `candidate_sources`
+- `governance_decisions`
+- `memory_versions`
+- `memory_sources`
+- `memory_usage`
 
 ## 9. 智能体如何读取记忆
 
@@ -392,12 +352,14 @@ SQLiteMemoryStore
 smallink/agent.py
 ```
 
-构建引擎时：
+每个回合组装上下文时：
 
 1. 读取 global active memories。
 2. 如果存在 workspace，再读取当前 workspace 的 active memories。
-3. 格式化为只读上下文。
-4. 追加到 system instructions。
+3. 从最新用户消息提取关键词并排序相关记忆。
+4. 在条数和字符预算内选择记忆。
+5. 作为临时只读 context 注入，不写回会话历史。
+6. 将 memory_id、version_id、session 和 workspace 写入 `memory_usage`。
 
 读取逻辑：
 
@@ -426,40 +388,39 @@ surfaces/gui/src/components/MemoryView.tsx
 - 原始源数据总数，并可进入源数据列表。
 - 十种记忆类型卡片。
 
-页面同时请求：
+页面主要请求：
 
 ```text
 GET /v1/memory
-GET /v1/memory?status=pending
+GET /v1/memory/candidates
 GET /v1/sensory-records/stats
 ```
 
-当前 pending 区域只支持：
+候选区域支持：
 
-- 查看列表。
-- 查看内容。
-- 查看类型。
-- 查看 scope。
-- 查看创建时间。
-- 明确提示当前版本为只读候选草稿，不把未实现的确认动作伪装成可用能力。
+- 生成候选和重试失败项；
+- 查看类型、范围、模型和完整来源；
+- 接受；
+- 编辑后接受；
+- 合并到已有正式记忆；
+- 忽略。
 
 当前源数据区域支持：
 
 - 按来源筛选。
 - 按治理状态筛选。
-- 搜索内容、项目和会话。
+- 服务端搜索内容、项目和会话；
+- 分页；
 - 查看来源、会话、项目、时间、原始内容和来源位置。
 - 加载失败时显示可重试错误。
+- 删除单条源记录。
 
 当前不支持：
 
-- 生成候选。
-- 确认。
-- 编辑后确认。
-- 忽略。
-- 合并。
-- 查看完整来源。
 - 归档与恢复。
+- 候选批量操作。
+- 正式记忆冲突视图。
+- 向量检索和关系视图。
 
 连接器导入交互当前区分：
 
@@ -543,6 +504,7 @@ GET  /v1/sensory-records
 GET  /v1/sensory-records/stats
 GET  /v1/sensory-records/{record_id}
 POST /v1/sensory-records
+DELETE /v1/sensory-records
 ```
 
 ### 连接器同步
@@ -550,14 +512,16 @@ POST /v1/sensory-records
 ```text
 POST /v1/connectors/codex/sync
 POST /v1/connectors/traex/sync
+GET  /v1/connectors/{name}/sync-status
 ```
 
 ### 记忆
 
 ```text
 GET  /v1/memory
-GET  /v1/memory?status=pending
-GET  /v1/memory?status=all
+GET  /v1/memory/candidates
+GET  /v1/memory/candidates/{candidate_id}
+POST /v1/memory/candidates/{candidate_id}/decision
 POST /v1/memory/pipeline/run
 POST /v1/memory
 ```
@@ -574,29 +538,29 @@ POST /v1/memory
 - TRAE 主会话导入。
 - TRAE 子智能体排除。
 - TRAE 完成轮次截断。
-- 原始记录持久化与来源统计。
-- LLM 提炼到 pending memory。
-- pending 与 active 默认隔离。
+- 连接前目录探测；
+- SyncJob、水位和最后同步状态；
+- 原始记录服务端搜索、分页与删除；
+- 原子治理状态机和失败重试；
+- 敏感数据发送策略与脱敏；
+- 独立候选模型；
+- 接受、编辑、合并和忽略；
+- 正式记忆版本、来源和决策；
 - active global/workspace memory 只读注入。
 
-尚未达到可交付闭环：
+后续缺口：
 
-- 敏感数据发送策略。
-- 稳定的 source processing 状态机。
-- 并发幂等。
-- 空结果和失败重试。
-- 候选独立领域模型。
-- 人工治理。
-- 正式记忆事务。
-- 来源查看。
-- 检索与引用记录。
-- 完整 E2E。
+- 向量 / 混合检索和 Token 级 ContextBundle；
+- 正式记忆冲突处理；
+- 归档恢复和批量治理；
+- Postgres / pgvector；
+- 记忆使用效果反馈。
 
 ## 15. 当前产品状态定义
 
 当前最准确的产品状态是：
 
-> Smallink 已经实现本地会话与运行时数据的原始采集层，并具备实验性的记忆提炼管道；正式个人记忆的治理、确认、检索和使用闭环尚未完成。
+> Smallink 已完成从原始数据到人工确认正式记忆的本地闭环，并具备首版相关性检索、上下文预算和使用版本记录；当前主要缺口是向量/混合检索、冲突治理和使用效果反馈。
 
 因此在后续迭代中，应把下面两件事严格区分：
 

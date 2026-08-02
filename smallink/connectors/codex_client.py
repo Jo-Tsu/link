@@ -17,6 +17,7 @@ manager) turns each normalized message into one sensory_record via the existing 
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator, Optional
@@ -36,8 +37,6 @@ _MAX_ROLLOUT_BYTES = 64 * 1024 * 1024
 
 def default_sessions_root() -> Path:
     """The Codex sessions directory, honoring $CODEX_HOME (Codex's own override)."""
-    import os
-
     base = os.environ.get("CODEX_HOME")
     root = Path(base).expanduser() if base else Path.home() / ".codex"
     return root / "sessions"
@@ -284,6 +283,30 @@ def iter_session_files(root: Optional[Path] = None) -> list[Path]:
     # Filenames are `rollout-<ISO-ish timestamp>-<uuid>.jsonl`, so lexical sort == chronological.
     files.sort(key=lambda p: p.name, reverse=True)
     return files
+
+
+def probe_sessions_root(root: Optional[Path]) -> dict[str, Any]:
+    resolved = Path(root).expanduser() if root is not None else default_sessions_root()
+    exists = resolved.exists()
+    readable = exists and resolved.is_dir() and os.access(resolved, os.R_OK)
+    files = iter_session_files(resolved) if readable else []
+    valid = 0
+    source_kinds: set[str] = set()
+    for path in files[:20]:
+        session = parse_session(path)
+        if session is not None:
+            valid += 1
+            if session.thread_source:
+                source_kinds.add(str(session.thread_source))
+    return {
+        "root_path": str(resolved),
+        "path_exists": exists,
+        "path_readable": readable,
+        "rollout_files_found": len(files),
+        "valid_sessions_found": valid,
+        "source_kinds": sorted(source_kinds),
+        "ok": bool(readable and files and valid),
+    }
 
 
 def read_sessions(

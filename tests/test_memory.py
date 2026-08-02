@@ -5,6 +5,7 @@ from __future__ import annotations
 import aisuite as ai
 from smallink.conversations import ConversationStore
 from smallink.memory import Scope, SQLiteMemoryStore, format_memories, memory_tools
+from smallink.memory import SQLiteGovernanceStore
 from smallink.sessions import SessionRecord
 from smallink.tools import ToolRegistry
 
@@ -123,6 +124,92 @@ def test_history_records_add_update_delete(tmp_path):
     ]
 
 
+def test_candidate_accept_creates_version_sources_and_decision(tmp_path):
+    path = tmp_path / "memory.db"
+    memory = SQLiteMemoryStore(path)
+    governance = SQLiteGovernanceStore(path)
+    task_id = governance.create_task(
+        ["source-1"], model="test", prompt_version="v1"
+    )
+    governance.attach_records(task_id, ["source-1"])
+    candidate = governance.add_candidate(
+        task_id=task_id,
+        content="Uses pnpm",
+        memory_type="user_preference",
+        scope=Scope.GLOBAL,
+        workspace=None,
+        session_id=None,
+        model="test",
+        prompt_version="v1",
+        source_ids=["source-1"],
+    )
+
+    result = governance.decide(candidate.candidate_id, "accept", memory)
+
+    item = memory.get(result["memory_id"])
+    assert item is not None
+    assert item.status == "active"
+    assert item.key == "user_preference"
+    assert governance.get_candidate(candidate.candidate_id).status == "accepted"
+    conn = governance._conn
+    assert conn.execute(
+        "SELECT COUNT(*) FROM memory_versions WHERE memory_id=?", (item.id,)
+    ).fetchone()[0] == 1
+    assert conn.execute(
+        "SELECT record_id FROM memory_sources WHERE memory_id=?", (item.id,)
+    ).fetchone()[0] == "source-1"
+
+
+def test_candidate_edit_accept_and_ignore_are_idempotent(tmp_path):
+    path = tmp_path / "memory.db"
+    memory = SQLiteMemoryStore(path)
+    governance = SQLiteGovernanceStore(path)
+    task_id = governance.create_task(
+        ["source-1", "source-2"], model="test", prompt_version="v1"
+    )
+    edited = governance.add_candidate(
+        task_id=task_id,
+        content="Uses npm",
+        memory_type="user_preference",
+        scope=Scope.GLOBAL,
+        workspace=None,
+        session_id=None,
+        model="test",
+        prompt_version="v1",
+        source_ids=["source-1"],
+    )
+    ignored = governance.add_candidate(
+        task_id=task_id,
+        content="Temporary greeting",
+        memory_type=None,
+        scope=Scope.GLOBAL,
+        workspace=None,
+        session_id=None,
+        model="test",
+        prompt_version="v1",
+        source_ids=["source-2"],
+    )
+
+    accepted = governance.decide(
+        edited.candidate_id,
+        "edit_accept",
+        memory,
+        content="Uses pnpm, not npm",
+    )
+    repeated = governance.decide(
+        edited.candidate_id,
+        "edit_accept",
+        memory,
+        content="Must not create another memory",
+    )
+    governance.decide(ignored.candidate_id, "ignore", memory)
+
+    assert memory.get(accepted["memory_id"]).content == "Uses pnpm, not npm"
+    assert repeated["idempotent"] is True
+    assert len(memory.list()) == 1
+    assert governance.get_candidate(ignored.candidate_id).status == "ignored"
+
+
 # -- remember tool --------------------------------------------------------------
 
 
@@ -221,11 +308,34 @@ def test_build_code_engine_injects_memory(tmp_path):
             engine.registry.names()
         )
         assert engine.messages[0]["role"] == "system"
-        assert "always run black" in engine.messages[0]["content"]
         assert "read-only context" in engine.messages[0]["content"]
         assert "confirmed by the user" in engine.messages[0]["content"]
+        context = engine.context_provider(
+            [
+                *engine.messages,
+                {"role": "user", "content": "Should I run black before committing?"},
+            ]
+        )
+        assert "always run black" in context
     finally:
         engine.executor.close()
+
+
+def test_memory_retrieval_is_relevant_and_budgeted(tmp_path):
+    from smallink.memory import select_memories
+
+    store = SQLiteMemoryStore(tmp_path / "mem.db")
+    relevant = store.add("Use pnpm for JavaScript dependencies", scope=Scope.GLOBAL)
+    store.add("The product color is green", scope=Scope.GLOBAL)
+    store.add("Long irrelevant " + "x" * 5000, scope=Scope.GLOBAL)
+
+    selected = select_memories(
+        store.list(),
+        "install JavaScript dependencies with pnpm",
+        char_budget=300,
+    )
+
+    assert [item.id for item in selected] == [relevant.id]
 
 
 def test_session_append_only_and_list(tmp_path):

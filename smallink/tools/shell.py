@@ -263,7 +263,7 @@ class LocalExecutor(Executor):
                     interrupted = True
                     timed_out = True
                     self._interrupt()
-                    deadline = time.monotonic() + 3.0  # grace to resync on the marker
+                    deadline = time.monotonic() + 2.5  # bounded grace to resync on the marker
                     continue
                 # Grace expired and still no marker: the shell is wedged. Hard-kill
                 # so future commands don't desync (session state is lost).
@@ -411,9 +411,20 @@ class LocalExecutor(Executor):
                 pass
             return
         try:
-            self._proc.terminate()
+            os.killpg(os.getpgid(self._proc.pid), signal.SIGTERM)
         except (ProcessLookupError, OSError):
             pass
+        try:
+            self._proc.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(self._proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                pass
+            try:
+                self._proc.wait(timeout=1)
+            except (subprocess.TimeoutExpired, OSError):
+                pass
 
     def _result(
         self, command, exit_code, output, *, timed_out, truncated=False, error=None

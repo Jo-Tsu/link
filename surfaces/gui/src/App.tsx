@@ -1,4 +1,12 @@
-import { useCallback, useEffect, useRef, useState, type PointerEvent } from "react";
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type PointerEvent,
+} from "react";
 import {
   announceInboxUnlock,
   getArtifacts,
@@ -43,23 +51,45 @@ import { Markdown } from "./components/Markdown";
 import { SearchModal } from "./components/SearchModal";
 import { SessionIntro } from "./components/SessionIntro";
 import { FolderGate } from "./components/FolderGate";
-import { Onboarding } from "./components/Onboarding";
-import { ScheduledView } from "./components/ScheduledView";
-import { RunsView } from "./components/RunsView";
 import { RightRail } from "./components/RightRail";
-import { IntegrationsView } from "./components/IntegrationsView";
-import { MemoryView } from "./components/MemoryView";
-import { AgentsView } from "./components/AgentsView";
-import { SettingsView } from "./components/SettingsView";
-import { PersonaView } from "./components/PersonaView";
-import { AuditView } from "./components/AuditView";
-import { InboxView } from "./components/InboxView";
 import { ApprovalCard } from "./components/ApprovalCard";
 import { DirectoryRequestCard } from "./components/DirectoryRequestCard";
 import { PlanCard } from "./components/PlanCard";
 import { WorkspaceTrustPrompt } from "./components/WorkspaceTrustPrompt";
+import { PageState } from "./components/AsyncFeedback";
 import { useI18n } from "./i18n";
 import { shouldStartWindowDrag } from "./windowDrag";
+
+const ScheduledView = lazy(() =>
+  import("./components/ScheduledView").then((module) => ({ default: module.ScheduledView })),
+);
+const RunsView = lazy(() =>
+  import("./components/RunsView").then((module) => ({ default: module.RunsView })),
+);
+const IntegrationsView = lazy(() =>
+  import("./components/IntegrationsView").then((module) => ({ default: module.IntegrationsView })),
+);
+const MemoryView = lazy(() =>
+  import("./components/MemoryView").then((module) => ({ default: module.MemoryView })),
+);
+const AgentsView = lazy(() =>
+  import("./components/AgentsView").then((module) => ({ default: module.AgentsView })),
+);
+const SettingsView = lazy(() =>
+  import("./components/SettingsView").then((module) => ({ default: module.SettingsView })),
+);
+const PersonaView = lazy(() =>
+  import("./components/PersonaView").then((module) => ({ default: module.PersonaView })),
+);
+const AuditView = lazy(() =>
+  import("./components/AuditView").then((module) => ({ default: module.AuditView })),
+);
+const InboxView = lazy(() =>
+  import("./components/InboxView").then((module) => ({ default: module.InboxView })),
+);
+const Onboarding = lazy(() =>
+  import("./components/Onboarding").then((module) => ({ default: module.Onboarding })),
+);
 
 const newId = () =>
   (crypto as any).randomUUID ? crypto.randomUUID().slice(0, 12) : Math.random().toString(36).slice(2, 14);
@@ -733,6 +763,16 @@ export function App() {
           sessionRef.current?.userMessage(p);
         }
       },
+      onReconnect: () => {
+        setConnected(true);
+        window.setTimeout(() => {
+          getSessionMessages(sessionId)
+            .then((messages) => {
+              if (messages.length > 0) setItems(itemsFromMessages(messages));
+            })
+            .catch(() => undefined);
+        }, 250);
+      },
       onClose: () => setConnected(false),
     });
     sessionRef.current = session;
@@ -1209,25 +1249,27 @@ export function App() {
         </div>
       )}
       {onboarding && (
-        <Onboarding
-          onDone={(next) => {
-            setOnboarding(false);
-            getHealth().then((h) => setModel(h.model)).catch(() => {});
-            loadSettings(); // pick up a model connected during setup (clears the composer chip)
-            if (next === "gallery") {
-              // The specialists tip: land on Settings ▸ Personas, where the Gallery link lives.
-              openSettings("personas");
-            } else if (next === "automations") {
-              // "Create your first automation" (§29) lands on the Automations quickstart.
-              setSurface("scheduled");
-            } else if (next === "work") {
-              // "Start working" teaches by landing (§24, §32): a fresh session with the rail's
-              // Access section expanded. Bump after the session switch settles.
-              startNewSession();
-              setTimeout(openAccess, 80);
-            }
-          }}
-        />
+        <Suspense fallback={null}>
+          <Onboarding
+            onDone={(next) => {
+              setOnboarding(false);
+              getHealth().then((h) => setModel(h.model)).catch(() => {});
+              loadSettings(); // pick up a model connected during setup (clears the composer chip)
+              if (next === "gallery") {
+                // The specialists tip: land on Settings ▸ Personas, where the Gallery link lives.
+                openSettings("personas");
+              } else if (next === "automations") {
+                // "Create your first automation" (§29) lands on the Automations quickstart.
+                setSurface("scheduled");
+              } else if (next === "work") {
+                // "Start working" teaches by landing (§24, §32): a fresh session with the rail's
+                // Access section expanded. Bump after the session switch settles.
+                startNewSession();
+                setTimeout(openAccess, 80);
+              }
+            }}
+          />
+        </Suspense>
       )}
       {navCollapsed ? (
         <CompactSidebar
@@ -1284,6 +1326,17 @@ export function App() {
         onCollapse={toggleNav}
       />
       )}
+      <Suspense
+        fallback={
+          <main className="flex-1 min-w-0 bg-paper p-6">
+            <PageState
+              icon="diamond"
+              title={tr("Loading page…")}
+              body={tr("Preparing this Smallink workspace.")}
+            />
+          </main>
+        }
+      >
       {surface === "runs" ? (
         <RunsView
           onOpenSession={(id) => {
@@ -1589,6 +1642,7 @@ export function App() {
         </div>
       </div>
       )}
+      </Suspense>
 
       {/* Search from the compact navigation rail. */}
       {searchOpen && (

@@ -265,7 +265,7 @@ function ProgressSummary({ running, toolNames, todo }: { running: boolean; toolN
   }
   return (
     <div className="rail-muted">
-      {tr("For longer tasks, progress appears here while Link plans, uses tools, waits for approval, and produces artifacts.")}
+      {tr("For longer tasks, progress appears here while Smallink plans, uses tools, waits for approval, and produces artifacts.")}
     </div>
   );
 }
@@ -483,7 +483,7 @@ function CsvTable({ text }: { text: string }) {
   return <GridTable rows={rows} />;
 }
 
-// xlsx/xls preview via SheetJS (loaded on demand — it's a heavy module): sheet tabs + a capped
+// xlsx preview via a small read-only parser (loaded on demand): sheet tabs + a capped
 // grid. Real spreadsheet work belongs in Numbers/Excel via "Open in default app".
 // WKWebView has no inline PDF plugin (<embed> shows a gray pane in the Tauri shell), so we
 // rasterize pages with pdf.js onto stacked canvases — same lazy-chunk pattern as SheetViewer.
@@ -549,16 +549,21 @@ function SheetViewer({ dataUrl }: { dataUrl: string }) {
     setError("");
     setActive(0);
     const base64 = dataUrl.split(",")[1] || "";
-    import("xlsx")
-      .then((XLSX) => {
+    import("read-excel-file")
+      .then(async ({ default: readXlsxFile, readSheetNames }) => {
         if (cancelled) return;
-        const wb = XLSX.read(base64, { type: "base64" });
-        setSheets(
-          wb.SheetNames.map((name) => ({
-            name,
-            rows: XLSX.utils.sheet_to_json(wb.Sheets[name], { header: 1, defval: "" }) as unknown[][],
-          })),
-        );
+        const bytes = Uint8Array.from(atob(base64), (character) => character.charCodeAt(0));
+        const blob = new Blob([bytes], {
+          type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        });
+        const names = await readSheetNames(blob);
+        const parsed: { name: string; rows: unknown[][] }[] = [];
+        for (const name of names) {
+          const rows = await readXlsxFile(blob, { sheet: name });
+          parsed.push({ name, rows });
+        }
+        if (cancelled) return;
+        setSheets(parsed);
       })
       .catch((e) => !cancelled && setError(String(e?.message || e)));
     return () => {

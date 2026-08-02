@@ -19,6 +19,8 @@ jobs:
           pip install -e ".[messaging,dev]"
       - name: Test
         run: pytest tests -q
+      - name: Version consistency
+        run: python scripts/check_versions.py
 
   gui-unit:
     runs-on: ubuntu-latest
@@ -35,6 +37,9 @@ jobs:
       - name: Unit tests
         working-directory: surfaces/gui
         run: npm test
+      - name: Production dependency audit
+        working-directory: surfaces/gui
+        run: npm audit --omit=dev
 
   gui-e2e:
     runs-on: ubuntu-latest

@@ -159,7 +159,11 @@ def test_connect_and_sync_traex_is_idempotent(tmp_path):
 
     assert connected["ok"] is True
     assert connected["sessions_path"].endswith("cli/sessions")
-    assert first == {"sessions_read": 1, "turns_seen": 1, "records_ingested": 1}
+    assert first["sessions_read"] == 1
+    assert first["turns_seen"] == 1
+    assert first["records_ingested"] == 1
+    assert first["sync"]["status"] == "completed"
+    assert first["sync"]["files_scanned"] == 2
     assert second["records_ingested"] == 0
     record = manager.sensory_store.list(source_type="traex")[0]
     assert record.connector_id == "traex"
@@ -167,6 +171,45 @@ def test_connect_and_sync_traex_is_idempotent(tmp_path):
     assert record.conversation_id == "main"
     assert "Audit this project" in record.raw_content
     assert record.metadata["originator"] == "codex-tui"
+
+
+def test_traex_connect_rejects_invalid_folder(tmp_path):
+    manager = SessionManager(data_dir=tmp_path / "data", provider=_Provider())
+
+    missing = connect_connector(
+        manager.secrets,
+        "traex",
+        {"sessions_path": str(tmp_path / "missing")},
+    )
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    no_sessions = connect_connector(
+        manager.secrets,
+        "traex",
+        {"sessions_path": str(empty)},
+    )
+
+    assert missing["ok"] is False
+    assert missing["probe"]["path_exists"] is False
+    assert no_sessions["ok"] is False
+    assert manager.secrets.get("traex:default") is None
+
+
+def test_traex_sync_status_endpoint(tmp_path):
+    root = tmp_path / "trae"
+    _write_session(root, "main")
+    manager = SessionManager(data_dir=tmp_path / "data", provider=_Provider())
+    connect_connector(manager.secrets, "traex", {"sessions_path": str(root)})
+    manager.sync_traex()
+    client = TestClient(create_app(manager))
+
+    response = client.get("/v1/connectors/traex/sync-status")
+
+    assert response.status_code == 200
+    sync = response.json()["sync"]
+    assert sync["status"] == "completed"
+    assert sync["sessions_read"] == 1
+    assert sync["watermark"]["last_success_at"]
 
 
 def test_traex_sync_endpoint(tmp_path):

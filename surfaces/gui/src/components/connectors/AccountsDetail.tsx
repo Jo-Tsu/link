@@ -60,7 +60,7 @@ export function AccountsDetail({ c, cloud, slack: _slack, onChanged }: DetailPro
           disabled={busy}
           title={
             c.managed && !cloud?.signed_in
-              ? tr("Sign in to Link Cloud for one-click, or add a token below.")
+              ? tr("Sign in to Smallink Cloud for one-click, or add a token below.")
               : ""
           }
         >

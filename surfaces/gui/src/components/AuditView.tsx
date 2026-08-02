@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { getAudit, type AuditEvent } from "../api";
 import { PanelHead } from "./IntegrationsView";
 import { useI18n } from "../i18n";
+import { InlineFeedback, PageState } from "./AsyncFeedback";
 
 // Activity — connector/browser tool history, restructured onto the IntegrationsView page shell
 // (centered panel + PanelHead + cards), replacing the legacy `page-view` layout. Read-only:
@@ -16,20 +17,57 @@ export function AuditView() {
   const [sessionFilter, setSessionFilter] = useState("");
   const [connectorFilter, setConnectorFilter] = useState("");
   const [toolFilter, setToolFilter] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
 
-  const refresh = () =>
-    getAudit({
+  const refresh = () => {
+    setError("");
+    return getAudit({
       limit: 150,
       session_id: sessionFilter.trim() || undefined,
       connector: connectorFilter.trim() || undefined,
       tool: toolFilter.trim() || undefined,
     })
       .then(setEvents)
-      .catch(() => setEvents([]));
+      .catch((reason) => {
+        setError(reason instanceof Error ? reason.message : tr("Could not load activity"));
+      })
+      .finally(() => setLoading(false));
+  };
 
   useEffect(() => {
-    refresh();
+    void refresh();
   }, []);
+
+  if (loading) {
+    return (
+      <main className="flex-1 min-w-0 flex bg-paper">
+        <div className="max-w-4xl mx-auto w-full px-7 py-6">
+          <PageState
+            icon="branch"
+            title={tr("Loading activity…")}
+            body={tr("Reading recent tool and connector events.")}
+          />
+        </div>
+      </main>
+    );
+  }
+
+  if (error && events.length === 0) {
+    return (
+      <main className="flex-1 min-w-0 flex bg-paper">
+        <div className="max-w-4xl mx-auto w-full px-7 py-6">
+          <PageState
+            icon="branch"
+            title={tr("Activity is unavailable")}
+            body={error}
+            action={tr("Try again")}
+            onAction={() => void refresh()}
+          />
+        </div>
+      </main>
+    );
+  }
 
   return (
     <main className="flex-1 min-w-0 flex bg-paper">
@@ -48,6 +86,17 @@ export function AuditView() {
               {tr("Filter")}
             </button>
           </div>
+          {error && (
+            <div className="mb-4">
+              <InlineFeedback
+                tone="warning"
+                title={tr("Activity may be out of date")}
+                body={error}
+                action={tr("Retry")}
+                onAction={() => void refresh()}
+              />
+            </div>
+          )}
 
           {events.length === 0 ? (
             <div className={CARD + " p-4 text-[13px] text-muted"}>{tr("No activity recorded yet.")}</div>

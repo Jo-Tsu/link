@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Optional
 
 from .sessions import SessionRecord
+from .sqlite import connect_sqlite
 
 
 def _load_roots(raw: Optional[str]) -> list[dict]:
@@ -68,8 +69,7 @@ class ConversationStore:
         self.db_path = self.base / "link.db"
 
         self._lock = threading.RLock()
-        self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
+        self._conn = connect_sqlite(self.db_path)
         self._conn.executescript("""
             CREATE TABLE IF NOT EXISTS sessions (
                 session_id TEXT PRIMARY KEY, workspace TEXT, model TEXT, mode TEXT,

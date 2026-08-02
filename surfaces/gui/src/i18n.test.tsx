@@ -9,7 +9,7 @@ function LanguageProbe() {
       <span>{language}</span>
       <strong>{t("nav.runs")}</strong>
       <span>{t("app.starting")}</span>
-      <span>{tr("Welcome to Link")}</span>
+      <span>{tr("Welcome to Smallink")}</span>
       <button onClick={() => setLanguage("zh-CN")}>中文</button>
       <button onClick={() => setLanguage("en")}>English</button>
     </div>

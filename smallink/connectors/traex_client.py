@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import Any, Iterator, Optional
 
 from .codex_client import CodexSession, iter_session_files, parse_session
 
@@ -48,6 +48,35 @@ def completed_session(session: CodexSession) -> Optional[CodexSession]:
         return session
     session.messages = session.messages[:count]
     return session if session.messages else None
+
+
+def probe_sessions_root(root: Optional[Path]) -> dict[str, Any]:
+    resolved = Path(root).expanduser() if root is not None else default_sessions_root()
+    exists = resolved.exists()
+    readable = exists and resolved.is_dir() and os.access(resolved, os.R_OK)
+    files = iter_session_files(resolved) if readable else []
+    valid = 0
+    user_sessions = 0
+    subagent_sessions = 0
+    for path in files[:50]:
+        session = parse_session(path)
+        if session is None:
+            continue
+        valid += 1
+        if is_user_session(session):
+            user_sessions += 1
+        else:
+            subagent_sessions += 1
+    return {
+        "root_path": str(resolved),
+        "path_exists": exists,
+        "path_readable": readable,
+        "rollout_files_found": len(files),
+        "valid_sessions_found": valid,
+        "user_sessions_found": user_sessions,
+        "subagent_sessions_excluded": subagent_sessions,
+        "ok": bool(readable and files and user_sessions),
+    }
 
 
 def read_sessions(

@@ -232,6 +232,29 @@ def test_connect_codex_stores_path_and_sync_reads_it(tmp_path):
     assert manager.sensory_store.list(source_type="codex")[0].conversation_id == "g1"
 
 
+def test_connect_codex_rejects_missing_or_empty_folder(tmp_path):
+    from smallink.connectors.setup import connect_connector
+
+    manager = SessionManager(data_dir=tmp_path / "data", provider=_Provider())
+    missing = connect_connector(
+        manager.secrets,
+        "codex",
+        {"sessions_path": str(tmp_path / "missing")},
+    )
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    no_sessions = connect_connector(
+        manager.secrets,
+        "codex",
+        {"sessions_path": str(empty)},
+    )
+
+    assert missing["ok"] is False
+    assert missing["probe"]["path_exists"] is False
+    assert no_sessions["ok"] is False
+    assert manager.secrets.get("codex:default") is None
+
+
 def test_oversized_rollout_is_skipped(tmp_path, monkeypatch):
     from smallink.connectors import codex_client
 

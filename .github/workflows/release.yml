@@ -58,6 +58,9 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - name: Install native build dependencies
+        run: brew install cmake
+
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: surfaces/gui/src-tauri
@@ -81,6 +84,9 @@ jobs:
       - name: npm ci
         working-directory: surfaces/gui
         run: npm ci
+
+      - name: Validate release version
+        run: python scripts/check_versions.py
 
       - name: Build .dmg
         env:

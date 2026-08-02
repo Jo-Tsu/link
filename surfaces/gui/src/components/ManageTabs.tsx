@@ -30,6 +30,7 @@ import {
 import { CloudSignInInline, CloudStatusPending } from "./connectors/CloudSignIn";
 import { ModelChecklist } from "./ModelChecklist";
 import { PageState } from "./AsyncFeedback";
+import { ConfirmDialog } from "./ConfirmDialog";
 import { ProviderCards, ProviderForm, useProviderSetup } from "../providers/ProviderSetup";
 import { Toggle } from "./Toggle";
 import { useI18n } from "../i18n";
@@ -82,6 +83,7 @@ export function ModelsTab() {
   const [settings, setSettings] = useState<ModelSettings | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [confirmRemoveKey, setConfirmRemoveKey] = useState(false);
   const refreshSettings = () => {
     setLoading(true);
     setError("");
@@ -127,9 +129,7 @@ export function ModelsTab() {
             <button
               className="text-[12.5px] text-danger/80 hover:text-danger hover:underline underline-offset-2"
               data-testid="set-remove-key"
-              onClick={() => {
-                if (window.confirm(tr("Remove the {name} key from this computer?", { name: info?.title || "" }))) ps.removeKey();
-              }}
+              onClick={() => setConfirmRemoveKey(true)}
             >
               {tr("Remove key…")}
             </button>
@@ -141,6 +141,21 @@ export function ModelsTab() {
         <p className="text-[12px] text-muted mt-3 leading-relaxed">
           {tr("A key is set through OPENAI_API_KEY in the server environment. You can override it above; the stored key is used only when the environment variable is absent.")}
         </p>
+      )}
+      {confirmRemoveKey && (
+        <ConfirmDialog
+          title={tr("Remove the {name} key from this computer?", {
+            name: info?.title || "",
+          })}
+          body={tr("Sessions using this provider will stop until you add a key again.")}
+          confirmLabel={tr("Remove key")}
+          danger
+          onCancel={() => setConfirmRemoveKey(false)}
+          onConfirm={() => {
+            setConfirmRemoveKey(false);
+            void ps.removeKey();
+          }}
+        />
       )}
 
       {info?.configured ? (
@@ -773,7 +788,7 @@ export function ConnectorTools({ c, onChanged }: { c: Connector; onChanged: () =
     );
   return (
     <div className="border-t border-line px-3.5 py-3">
-      <div className={SEC_H + " mb-2"}>{tr("Tools exposed to Link")}</div>
+      <div className={SEC_H + " mb-2"}>{tr("Tools exposed to Smallink")}</div>
       <div className="space-y-1.5">
         {c.tools.map((tool) => (
           <label

@@ -170,5 +170,4 @@ npm run tauri dev
 
 ## License
 
-仓库自身使用 [Business Source License 1.1](LICENSE)。第三方派生代码及其许可证说明见
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) 与 `THIRD_PARTY_LICENSES/`。
+Smallink 第一方代码使用 [Business Source License 1.1](LICENSE)。继承代码与第三方许可证见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。

@@ -160,6 +160,7 @@ from ..inbox import VIS_INBOX, VIS_INLINE, args_preview
 from ..permissions import Mode
 from ..providers import AssistantTurn
 from ..skills import SkillStoreError
+from .routers.memory import memory_router
 from .manager import SessionManager
 
 
@@ -231,13 +232,21 @@ def create_app(manager: SessionManager) -> FastAPI:
         allow_headers=["*"],
     )
     app.state.manager = manager
+    app.include_router(memory_router(manager))
 
     @app.get("/v1/health")
     def health(request: Request) -> dict[str, Any]:
         if api_token and not _request_authenticated(request):
             return {"status": "ok"}
+        from .. import __version__
+
         return {
             "status": "ok",
+            "app_version": __version__,
+            "core_version": __version__,
+            "schema_version": 2,
+            "git_sha": os.environ.get("SMALLINK_GIT_SHA", ""),
+            "build_time": os.environ.get("SMALLINK_BUILD_TIME", ""),
             "default_workspace": manager.default_workspace,
             "model": manager.model,
         }
@@ -629,55 +638,6 @@ def create_app(manager: SessionManager) -> FastAPI:
     def agent_collaborations(limit: int = 100) -> dict[str, Any]:
         return {"collaborations": manager.list_agent_collaborations(limit=limit)}
 
-    @app.get("/v1/sensory-records")
-    def sensory_records(
-        limit: int = 100,
-        offset: int = 0,
-        source_type: str | None = None,
-        governance_status: str | None = None,
-        conversation_id: str | None = None,
-    ) -> dict[str, Any]:
-        return manager.sensory_records(
-            limit=limit,
-            offset=offset,
-            source_type=source_type,
-            governance_status=governance_status,
-            conversation_id=conversation_id,
-        )
-
-    @app.get("/v1/sensory-records/stats")
-    def sensory_record_stats() -> dict[str, Any]:
-        return manager.sensory_store.stats()
-
-    @app.get("/v1/sensory-records/{record_id}")
-    def sensory_record(record_id: str) -> Any:
-        record = manager.sensory_record(record_id)
-        return (
-            record
-            if record is not None
-            else JSONResponse(status_code=404, content={"error": "sensory record not found"})
-        )
-
-    @app.post("/v1/sensory-records")
-    def ingest_sensory_record(body: dict) -> Any:
-        # Generic ingest for external collectors. Auth is enforced by the global
-        # require_sidecar_token middleware, so callers send X-Link-Token like any other write.
-        try:
-            return manager.ingest_sensory_record(body or {})
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    @app.post("/v1/memory/pipeline/run")
-    async def run_memory_pipeline(body: dict | None = None) -> dict[str, Any]:
-        # Clean→tag→layer over pending raw records into status='pending' memories. Blocking LLM
-        # work is offloaded so it never stalls the event loop. Manual trigger; not scheduled.
-        body = body or {}
-        return await asyncio.to_thread(
-            manager.run_memory_pipeline,
-            body.get("record_ids"),
-            int(body.get("limit", 50)),
-        )
-
     @app.post("/v1/connectors/codex/sync")
     async def sync_codex(body: dict | None = None) -> dict[str, Any]:
         # Read local Codex rollout sessions → ingest each message into sensory_records. File I/O
@@ -696,6 +656,10 @@ def create_app(manager: SessionManager) -> FastAPI:
         raw = body.get("limit_sessions")
         limit = int(raw) if raw is not None else None
         return await asyncio.to_thread(manager.sync_traex, limit)
+
+    @app.get("/v1/connectors/{name}/sync-status")
+    def connector_sync_status(name: str) -> dict[str, Any]:
+        return {"sync": manager.connector_sync_status(name)}
 
     @app.get("/v1/tasks/{task_id}")
     def runtime_task(task_id: str) -> Any:
@@ -791,24 +755,6 @@ def create_app(manager: SessionManager) -> FastAPI:
         body = body or {}
         return manager.reveal_artifact(
             session_id, str(body.get("path", "")), str(body.get("mode", "reveal"))
-        )
-
-    @app.get("/v1/memory")
-    def memory(status: str | None = "active") -> dict[str, Any]:
-        # status defaults to "active" (confirmed only). Pass ?status=all to include pending
-        # pipeline output, or ?status=pending to inspect just the awaiting-confirmation queue.
-        wanted = None if status in (None, "", "all") else status
-        return {"memory": manager.list_memory(status=wanted)}
-
-    @app.post("/v1/memory")
-    def add_memory(body: dict) -> Any:
-        return JSONResponse(
-            status_code=409,
-            content={
-                "ok": False,
-                "error": "governance_required",
-                "message": "Formal memories can only be created from a confirmed governance candidate.",
-            },
         )
 
     @app.post("/v1/chat/completions")
@@ -1641,6 +1587,11 @@ def create_app(manager: SessionManager) -> FastAPI:
             return
         await ws.accept(subprotocol="link" if api_token else None)
         agent = ws.query_params.get("agent") or "code"
+        early_resolutions: deque[str] = deque()
+
+        def _consume_early_resolution(item) -> None:
+            if item.state == "pending" and early_resolutions:
+                manager.inbox.resolve(item.id, early_resolutions.popleft())
 
         # All four interactive prompts (approval / question / directory / plan) are parked as Inbox
         # items and awaited via inbox.wait — so they survive a dropped socket (redelivered on
@@ -1682,6 +1633,7 @@ def create_app(manager: SessionManager) -> FastAPI:
                 data=manager.approval_prompt_data(session_id, _request),
                 tool_call_id=getattr(_request, "tool_call_id", None),
             )
+            _consume_early_resolution(item)
             if (
                 item.state == "pending"
             ):  # freshly raised (not a durable-resume re-raise)
@@ -1707,6 +1659,7 @@ def create_app(manager: SessionManager) -> FastAPI:
                 multi=bool(args.get("multi", False)),
                 tool_call_id=tool_call_id,
             )
+            _consume_early_resolution(item)
             if item.state == "pending":
                 manager.persist_session(session_id)
                 if item.visibility == VIS_INBOX:
@@ -1740,6 +1693,7 @@ def create_app(manager: SessionManager) -> FastAPI:
                 },
                 tool_call_id=tool_call_id,
             )
+            _consume_early_resolution(item)
             if item.state == "pending":
                 manager.persist_session(session_id)
                 if item.visibility == VIS_INBOX:
@@ -1785,6 +1739,7 @@ def create_app(manager: SessionManager) -> FastAPI:
                 visibility=_visibility(),
                 tool_call_id=tool_call_id,
             )
+            _consume_early_resolution(item)
             if item.state == "pending":
                 manager.persist_session(session_id)
                 if item.visibility == VIS_INBOX:
@@ -1823,6 +1778,8 @@ def create_app(manager: SessionManager) -> FastAPI:
             pend = manager.inbox.pending(session_id)
             if pend:
                 manager.inbox.resolve(pend[0].id, resolution)
+            else:
+                early_resolutions.append(resolution)
 
         workspace = ws.query_params.get("workspace")
         mcp_tools = await manager.prepare_mcp_tools(
@@ -1882,7 +1839,12 @@ def create_app(manager: SessionManager) -> FastAPI:
             "iteration_end",
         }
 
-        async def run_turn(content, *, retry: bool = False) -> None:
+        async def run_turn(
+            content,
+            *,
+            retry: bool = False,
+            client_message_id: str | None = None,
+        ) -> None:
             # The receive loop atomically claims this session before scheduling the task.
             # Keeping the claim outside prevents two back-to-back frames from both starting.
             try:
@@ -1892,21 +1854,22 @@ def create_app(manager: SessionManager) -> FastAPI:
                     content=content,
                     trigger="retry" if retry else "user",
                     retry=retry,
+                    client_message_id=client_message_id,
                 )
                 async for event in events:
+                    if event.type.value in _CHECKPOINTS:
+                        await asyncio.to_thread(manager.save, session_id, engine)
                     # Broadcast to every socket viewing this session (this socket included — it's a
                     # registered client), so a second view of the same session stays in sync too.
                     await manager.broadcast_session(
                         session_id, {"type": event.type.value, "data": event.data}
                     )
-                    if event.type.value in _CHECKPOINTS:
-                        manager.save(session_id, engine)
             finally:
                 # The backend owns automation completion. The GUI may disconnect or the model may
                 # fail, but the durable runtime outcome above is still sufficient to finalize it.
                 manager.finalize_manual_run_session(session_id)
                 manager.mark_idle(session_id)
-                manager.save(session_id, engine)
+                await asyncio.to_thread(manager.save, session_id, engine)
                 await manager.broadcast_session(
                     session_id, {"type": "turn_done", "data": {}}
                 )
@@ -1921,13 +1884,31 @@ def create_app(manager: SessionManager) -> FastAPI:
             # or flush an in-progress assistant stream in the GUI.
             await ws.send_json({"type": "input_rejected", "data": {"error": reason}})
 
-        async def claim_turn(*, retry: bool = False, content=None) -> None:
+        async def claim_turn(
+            *,
+            retry: bool = False,
+            content=None,
+            client_message_id: str | None = None,
+        ) -> None:
             if not manager.try_mark_running(session_id):
                 await reject_input(
                     "This session is already running a turn. Wait for it to finish or stop it."
                 )
                 return
-            asyncio.create_task(run_turn(content, retry=retry))
+            if client_message_id:
+                await ws.send_json(
+                    {
+                        "type": "message_accepted",
+                        "data": {"client_message_id": client_message_id},
+                    }
+                )
+            asyncio.create_task(
+                run_turn(
+                    content,
+                    retry=retry,
+                    client_message_id=client_message_id,
+                )
+            )
 
         try:
             while True:
@@ -1998,6 +1979,29 @@ def create_app(manager: SessionManager) -> FastAPI:
                     else:
                         await _apply_model(model)
                 elif kind == "user_message":
+                    client_message_id = message.get("client_message_id")
+                    if client_message_id is not None and (
+                        not isinstance(client_message_id, str)
+                        or not client_message_id
+                        or len(client_message_id) > 128
+                    ):
+                        await reject_input("Invalid client message id.")
+                        continue
+                    if client_message_id and any(
+                        existing.get("role") == "user"
+                        and existing.get("client_message_id") == client_message_id
+                        for existing in engine.messages
+                    ):
+                        await ws.send_json(
+                            {
+                                "type": "message_accepted",
+                                "data": {
+                                    "client_message_id": client_message_id,
+                                    "duplicate": True,
+                                },
+                            }
+                        )
+                        continue
                     raw_text = message.get("text")
                     if raw_text is None:
                         raw_text = ""
@@ -2083,7 +2087,10 @@ def create_app(manager: SessionManager) -> FastAPI:
                     await _apply_model(model)
                     if text or attachments:
                         content = build_user_content(text, attachments)
-                        await claim_turn(content=content)
+                        await claim_turn(
+                            content=content,
+                            client_message_id=client_message_id,
+                        )
                 else:
                     await reject_input(f"Unknown WebSocket message type: {kind}.")
         except WebSocketDisconnect:

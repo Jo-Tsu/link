@@ -39,6 +39,11 @@ const openWebSocket = (url: string): WebSocket => {
 
 export interface Health {
   status: string;
+  app_version?: string;
+  core_version?: string;
+  schema_version?: number;
+  git_sha?: string;
+  build_time?: string;
   default_workspace: string | null;
   model: string;
 }
@@ -252,13 +257,91 @@ export interface MemoryRecord {
   source_record_id?: string | null;
 }
 
-// status: "active" (default, confirmed only) | "pending" (pipeline output awaiting
-// confirmation) | "all". The backend hides pending from the default call.
 export async function getMemory(status?: "active" | "pending" | "all"): Promise<MemoryRecord[]> {
   const query = status ? `?status=${status}` : "";
   const res = await fetch(`${httpBase()}/v1/memory${query}`);
   if (!res.ok) throw new Error("Could not load memories");
   return (await res.json()).memory ?? [];
+}
+
+export interface MemoryCandidate {
+  candidate_id: string;
+  task_id: string;
+  content: string;
+  memory_type: string | null;
+  scope: "global" | "workspace" | "session";
+  workspace: string | null;
+  session_id: string | null;
+  status: "pending" | "accepted" | "ignored";
+  confidence: number | null;
+  model: string;
+  prompt_version: string;
+  created_at: string;
+  updated_at: string;
+  sources: string[];
+  source_records?: SensoryRecord[];
+  error?: string | null;
+}
+
+export async function getMemoryCandidates(
+  status: "pending" | "accepted" | "ignored" | "all" = "pending",
+): Promise<MemoryCandidate[]> {
+  const res = await fetch(
+    `${httpBase()}/v1/memory/candidates?status=${encodeURIComponent(status)}`,
+  );
+  if (!res.ok) throw new Error("Could not load memory candidates");
+  return (await res.json()).candidates ?? [];
+}
+
+export async function getMemoryCandidate(candidateId: string): Promise<MemoryCandidate> {
+  const res = await fetch(
+    `${httpBase()}/v1/memory/candidates/${encodeURIComponent(candidateId)}`,
+  );
+  if (!res.ok) throw new Error("Could not load memory candidate");
+  return res.json();
+}
+
+export async function runMemoryPipeline(payload: {
+  record_ids?: string[];
+  limit?: number;
+  retry_failed?: boolean;
+  allow_sensitive_cloud?: boolean;
+} = {}): Promise<{
+  task_id: string;
+  status: string;
+  processed_records: number;
+  candidates_created: number;
+  skipped_records: number;
+  failed_records: number;
+}> {
+  const res = await fetch(`${httpBase()}/v1/memory/pipeline/run`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) throw new Error("Could not generate memory candidates");
+  return res.json();
+}
+
+export async function decideMemoryCandidate(
+  candidateId: string,
+  payload: {
+    action: "accept" | "edit_accept" | "ignore" | "merge";
+    content?: string;
+    merge_memory_id?: number;
+  },
+): Promise<{ ok: boolean; memory_id?: number; error?: string }> {
+  const res = await fetch(
+    `${httpBase()}/v1/memory/candidates/${encodeURIComponent(candidateId)}/decision`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    },
+  );
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.detail || data.error || "Could not save memory decision");
+  return data;
 }
 
 export async function getRuntimeTasks(limit = 100): Promise<RuntimeTask[]> {
@@ -279,6 +362,7 @@ export async function getSensoryRecords(params: {
   source_type?: string;
   governance_status?: string;
   conversation_id?: string;
+  query?: string;
 } = {}): Promise<{ records: SensoryRecord[]; total: number; limit: number; offset: number }> {
   const query = new URLSearchParams();
   for (const [key, value] of Object.entries(params)) {
@@ -287,6 +371,26 @@ export async function getSensoryRecords(params: {
   const res = await fetch(`${httpBase()}/v1/sensory-records?${query}`);
   if (!res.ok) throw new Error("Could not load source records");
   return res.json();
+}
+
+export async function deleteSensoryRecords(payload: {
+  record_ids?: string[];
+  source_type?: string;
+  before?: string;
+}): Promise<{
+  ok: boolean;
+  deleted_records: number;
+  affected_candidates: string[];
+  affected_memories: number[];
+}> {
+  const res = await fetch(`${httpBase()}/v1/sensory-records`, {
+    method: "DELETE",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.detail || data.error || "Could not delete source records");
+  return data;
 }
 
 export async function getSensoryRecord(recordId: string): Promise<SensoryRecord> {
@@ -799,20 +903,20 @@ export async function connectConnector(
 // connect time. Returns counts; records then flow through the memory pipeline separately.
 export async function syncCodex(
   limitSessions?: number,
-): Promise<{ sessions_read: number; turns_seen: number; records_ingested: number }> {
+): Promise<LocalConversationSyncResult> {
   return syncLocalConversations("codex", limitSessions);
 }
 
 export async function syncTraex(
   limitSessions?: number,
-): Promise<{ sessions_read: number; turns_seen: number; records_ingested: number }> {
+): Promise<LocalConversationSyncResult> {
   return syncLocalConversations("traex", limitSessions);
 }
 
 async function syncLocalConversations(
   source: "codex" | "traex",
   limitSessions?: number,
-): Promise<{ sessions_read: number; turns_seen: number; records_ingested: number }> {
+): Promise<LocalConversationSyncResult> {
   const body = limitSessions != null ? { limit_sessions: limitSessions } : {};
   const res = await fetch(`${httpBase()}/v1/connectors/${source}/sync`, {
     method: "POST",
@@ -821,6 +925,43 @@ async function syncLocalConversations(
   });
   if (!res.ok) throw new Error("Could not import conversations");
   return res.json();
+}
+
+export interface ConnectorSyncStatus {
+  job_id: string;
+  connector: string;
+  status: "running" | "completed" | "failed";
+  root_path: string | null;
+  files_scanned: number;
+  sessions_read: number;
+  records_seen: number;
+  records_ingested: number;
+  files_failed: number;
+  started_at: string;
+  finished_at: string | null;
+  error: string | null;
+  watermark?: {
+    last_success_at: string | null;
+    last_file: string | null;
+  } | null;
+}
+
+export interface LocalConversationSyncResult {
+  sessions_read: number;
+  turns_seen: number;
+  records_ingested: number;
+  job_id?: string;
+  sync?: ConnectorSyncStatus;
+}
+
+export async function getConnectorSyncStatus(
+  name: string,
+): Promise<ConnectorSyncStatus | null> {
+  const res = await fetch(
+    `${httpBase()}/v1/connectors/${encodeURIComponent(name)}/sync-status`,
+  );
+  if (!res.ok) throw new Error("Could not load sync status");
+  return (await res.json()).sync ?? null;
 }
 
 export async function disconnectConnector(name: string): Promise<{ ok: boolean }> {
@@ -2115,36 +2256,86 @@ export type Handlers = {
   onEvent: (event: WsEvent) => void;
   onOpen?: () => void;
   onClose?: () => void;
+  onReconnect?: () => void;
 };
 
 export class Session {
-  private ws: WebSocket;
-  // Payloads sent before the socket finished opening, replayed on `onopen`. Belt-and-suspenders
-  // against the first message being dropped if the user sends in the connect window.
-  private outbox: object[] = [];
+  private ws: WebSocket | null = null;
+  private reconnectTimer: number | null = null;
+  private reconnectAttempts = 0;
+  private closed = false;
+  private openedOnce = false;
+  private readonly url: string;
+  private outbox: {
+    payload: Record<string, unknown>;
+    clientMessageId?: string;
+  }[] = [];
 
   constructor(sessionId: string, workspace: string, agent: string, handlers: Handlers) {
     const q = `?workspace=${encodeURIComponent(workspace)}&agent=${encodeURIComponent(agent)}`;
-    this.ws = openWebSocket(`${wsBase()}/ws/session/${sessionId}${q}`);
-    this.ws.onmessage = (e) => handlers.onEvent(JSON.parse(e.data));
-    this.ws.onopen = () => {
-      this.flush();
-      handlers.onOpen?.();
+    this.url = `${wsBase()}/ws/session/${sessionId}${q}`;
+    this.open(handlers);
+  }
+
+  private open(handlers: Handlers) {
+    if (this.closed) return;
+    const ws = openWebSocket(this.url);
+    this.ws = ws;
+    ws.onmessage = (event) => {
+      const message = JSON.parse(event.data);
+      if (message?.type === "message_accepted") {
+        const clientMessageId = message?.data?.client_message_id;
+        if (typeof clientMessageId === "string") {
+          this.outbox = this.outbox.filter(
+            (entry) => entry.clientMessageId !== clientMessageId,
+          );
+        }
+      }
+      handlers.onEvent(message);
     };
-    this.ws.onclose = () => handlers.onClose?.();
+    ws.onopen = () => {
+      const reconnect = this.openedOnce;
+      this.openedOnce = true;
+      this.reconnectAttempts = 0;
+      this.flush();
+      if (reconnect) handlers.onReconnect?.();
+      else handlers.onOpen?.();
+    };
+    ws.onerror = () => ws.close();
+    ws.onclose = () => {
+      if (this.ws === ws) this.ws = null;
+      handlers.onClose?.();
+      this.scheduleReconnect(handlers);
+    };
+  }
+
+  private scheduleReconnect(handlers: Handlers) {
+    if (this.closed || this.reconnectTimer !== null) return;
+    const delay = Math.min(500 * 2 ** this.reconnectAttempts, 10_000);
+    this.reconnectAttempts += 1;
+    this.reconnectTimer = window.setTimeout(() => {
+      this.reconnectTimer = null;
+      this.open(handlers);
+    }, delay);
   }
 
   private flush() {
-    if (this.ws.readyState !== WebSocket.OPEN) return;
+    if (this.ws?.readyState !== WebSocket.OPEN) return;
     const pending = this.outbox;
-    this.outbox = [];
-    for (const p of pending) this.ws.send(JSON.stringify(p));
+    this.outbox = pending.filter((entry) => !!entry.clientMessageId);
+    for (const entry of pending) {
+      this.ws.send(JSON.stringify(entry.payload));
+    }
   }
 
-  private send(payload: object) {
-    if (this.ws.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(payload));
-    // Still connecting: queue and flush on open rather than silently dropping.
-    else if (this.ws.readyState === WebSocket.CONNECTING) this.outbox.push(payload);
+  private send(payload: Record<string, unknown>, clientMessageId?: string) {
+    const entry = { payload, clientMessageId };
+    if (clientMessageId || this.ws?.readyState !== WebSocket.OPEN) {
+      this.outbox.push(entry);
+    }
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify(payload));
+    }
   }
 
   /** `model` = the composer's CURRENT selection, carried on every message so the turn uses
@@ -2152,12 +2343,17 @@ export class Session {
    * session always reconnects once to adopt its scratch dir, which could drop a queued
    * set_model and leave the engine on a stale/resumed model; found 2026-07-04). */
   userMessage(text: string, attachments?: unknown[], model?: string) {
+    const clientMessageId =
+      typeof crypto?.randomUUID === "function"
+        ? crypto.randomUUID()
+        : `message-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     this.send({
       type: "user_message",
+      client_message_id: clientMessageId,
       text,
       ...(model ? { model } : {}),
       ...(attachments?.length ? { attachments } : {}),
-    });
+    }, clientMessageId);
   }
 
   approve(decision: string) {
@@ -2203,12 +2399,21 @@ export class Session {
   }
 
   close() {
+    this.closed = true;
+    if (this.reconnectTimer !== null) {
+      window.clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
     // Detach before closing: this socket's async `close` event may land AFTER the
     // successor session's `open` (observed when switching into an automation-run
     // session), and a torn-down socket must not clobber the new one's connected state.
-    this.ws.onopen = null;
-    this.ws.onmessage = null;
-    this.ws.onclose = null;
-    this.ws.close();
+    if (this.ws) {
+      this.ws.onopen = null;
+      this.ws.onmessage = null;
+      this.ws.onclose = null;
+      this.ws.onerror = null;
+      this.ws.close();
+      this.ws = null;
+    }
   }
 }

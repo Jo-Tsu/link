@@ -7,13 +7,13 @@ slice lightweight; a Postgres adapter can replace it without changing TurnEngine
 from __future__ import annotations
 
 import json
-import sqlite3
 import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+from ..sqlite import connect_sqlite
 from .models import AgentRunRecord, RunEventRecord, TaskRecord, TaskRunRecord
 
 _ACTIVE_STATUSES = {"running", "waiting_approval"}
@@ -48,9 +48,7 @@ class SQLiteTaskRuntimeStore:
         self.db_path = Path(db_path).expanduser()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
-        self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA foreign_keys = ON")
+        self._conn = connect_sqlite(self.db_path)
         self._conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS runtime_tasks (
@@ -254,16 +252,48 @@ class SQLiteTaskRuntimeStore:
             ).fetchone()
         return self._agent_run(row) if row else None
 
+    def resume_waiting_root(self, session_id: str) -> Optional[AgentRunRecord]:
+        root = self.active_root_for_session(session_id)
+        if root is None or root.status != "waiting_approval":
+            return None
+        now = _now()
+        with self._lock:
+            self._conn.execute(
+                """
+                UPDATE runtime_agent_runs SET status='running', error=NULL
+                WHERE agent_run_id=? AND status='waiting_approval'
+                """,
+                (root.agent_run_id,),
+            )
+            self._conn.execute(
+                """
+                UPDATE runtime_task_runs SET status='running', error=NULL
+                WHERE task_run_id=? AND status='waiting_approval'
+                """,
+                (root.task_run_id,),
+            )
+            self._conn.execute(
+                """
+                UPDATE runtime_tasks SET status='running', updated_at=?
+                WHERE task_id=(
+                    SELECT task_id FROM runtime_task_runs WHERE task_run_id=?
+                )
+                """,
+                (now, root.task_run_id),
+            )
+            self._conn.commit()
+        return self.get_agent_run(root.agent_run_id)
+
     def recover_incomplete_runs(
         self, *, reason: str = "Smallink restarted before the run completed"
     ) -> int:
-        """Close runs left active by a previous process so the task tree never stays stuck."""
+        """Cancel active execution while preserving resumable approval suspensions."""
         now = _now()
         with self._lock:
             rows = self._conn.execute(
                 """
                 SELECT agent_run_id FROM runtime_agent_runs
-                WHERE status IN ('running', 'waiting_approval')
+                WHERE status = 'running'
                 """
             ).fetchall()
             if not rows:
@@ -271,23 +301,38 @@ class SQLiteTaskRuntimeStore:
             self._conn.execute(
                 """
                 UPDATE runtime_agent_runs
-                SET status = 'failed', finished_at = ?, error = COALESCE(error, ?)
-                WHERE status IN ('running', 'waiting_approval')
+                SET status = 'cancelled', finished_at = ?, error = COALESCE(error, ?)
+                WHERE status = 'running'
                 """,
                 (now, reason),
             )
             self._conn.execute(
                 """
                 UPDATE runtime_task_runs
-                SET status = 'failed', finished_at = ?, error = COALESCE(error, ?)
-                WHERE status IN ('running', 'waiting_approval')
+                SET status = 'cancelled', finished_at = ?, error = COALESCE(error, ?)
+                WHERE status = 'running'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM runtime_agent_runs ar
+                      WHERE ar.task_run_id = runtime_task_runs.task_run_id
+                        AND ar.status = 'waiting_approval'
+                  )
                 """,
                 (now, reason),
             )
             self._conn.execute(
                 """
                 UPDATE runtime_tasks
-                SET status = 'failed', updated_at = ?
+                SET status = CASE
+                    WHEN EXISTS (
+                        SELECT 1
+                        FROM runtime_task_runs tr
+                        JOIN runtime_agent_runs ar ON ar.task_run_id = tr.task_run_id
+                        WHERE tr.task_id = runtime_tasks.task_id
+                          AND ar.status = 'waiting_approval'
+                    ) THEN 'waiting_approval'
+                    ELSE 'cancelled'
+                END,
+                updated_at = ?
                 WHERE status IN ('running', 'waiting_approval')
                 """,
                 (now,),
@@ -539,6 +584,10 @@ class SQLiteTaskRuntimeStore:
         if row is None:
             raise KeyError(agent_run_id)
         return row
+
+    def close(self) -> None:
+        with self._lock:
+            self._conn.close()
 
     @staticmethod
     def _task(row: sqlite3.Row) -> TaskRecord:

@@ -40,6 +40,7 @@ for pkg in (
     "fake_useragent",   # ships a data/ json payload loaded at runtime
     "certifi",
     "croniter",
+    "keyring",
     "pypdfium2",        # bundles the native libpdfium binary
     "pypdf",
     "docstring_parser",

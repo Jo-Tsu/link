@@ -38,6 +38,7 @@ import { GalleryModal } from "./GalleryModal";
 import { PersonasTab } from "./PersonasTab";
 import { showPersonas } from "../flags";
 import { useI18n } from "../i18n";
+import { ConfirmDialog } from "./ConfirmDialog";
 
 // Settings, restructured (Option 2) into a full-page surface that mirrors IntegrationsView's shell:
 // a left sub-nav (Appearance · Files · Models · Personas) + centered panel, replacing the old
@@ -118,7 +119,7 @@ export function SettingsView({
             <section>
               <PanelHead
                 title={tr("Models")}
-                sub={tr("Configure the AI providers and models available to Link. API keys stay on this computer.")}
+                sub={tr("Configure the AI providers and models available to Smallink. API keys stay on this computer.")}
               />
               <ModelsTab />
               {/* Token savings is model-spend behavior, so it lives here (UX-021),
@@ -154,6 +155,7 @@ function VoiceInputSection() {
   const [phase, setPhase] = useState<"idle" | "downloading" | "verifying" | "testing" | "transcribing">("idle");
   const [error, setError] = useState<string | null>(null);
   const [testTranscript, setTestTranscript] = useState("");
+  const [confirmRemove, setConfirmRemove] = useState(false);
   const desktop = isTauri();
 
   const publish = (next: DictationStatus) => {
@@ -223,7 +225,6 @@ function VoiceInputSection() {
   };
 
   const remove = async () => {
-    if (!window.confirm(tr("Delete the local Whisper model and disable voice input?"))) return;
     setError(null);
     try {
       publish(await deleteDictationModel());
@@ -231,6 +232,8 @@ function VoiceInputSection() {
       setProgress(null);
     } catch (deleteError) {
       setError(voiceError(deleteError));
+    } finally {
+      setConfirmRemove(false);
     }
   };
 
@@ -316,7 +319,7 @@ function VoiceInputSection() {
                 <>
                   <span className="text-[11.5px] px-2 py-1 rounded-full bg-okSoft text-ok">{tr("Verified")}</span>
                   <button className={BTN_BORDERED} onClick={() => void repair()}>{tr("Repair")}</button>
-                  <button className="text-[12px] text-danger px-2 py-2" onClick={() => void remove()}>{tr("Delete")}</button>
+                  <button className="text-[12px] text-danger px-2 py-2" onClick={() => setConfirmRemove(true)}>{tr("Delete")}</button>
                 </>
               ) : downloading ? (
                 <button className={BTN_BORDERED} onClick={() => void cancelDownload()}>{tr("Cancel")}</button>
@@ -361,6 +364,17 @@ function VoiceInputSection() {
           </div>
 
           {error && <div role="alert" className="rounded-lg border border-danger/30 bg-dangerSoft px-3 py-2.5 text-[12px] text-danger">{error}</div>}
+          {confirmRemove && (
+            <ConfirmDialog
+              title={tr("Delete the local Whisper model and disable voice input?")}
+              body={tr("You can download and verify the model again later.")}
+              confirmLabel={tr("Delete")}
+              danger
+              busy={phase !== "idle"}
+              onCancel={() => setConfirmRemove(false)}
+              onConfirm={() => void remove()}
+            />
+          )}
         </div>
       )}
     </section>
@@ -391,7 +405,7 @@ function PersonasSection({ onOpenPersona }: { onOpenPersona?: (id: string) => vo
         <span className="min-w-0 flex-1">
           <span className="block text-[13.5px] font-medium">{tr("Browse the Agent Gallery")}</span>
           <span className="block text-[12px] text-muted">
-            {tr("Curated agents from the Link team — see what each can do before installing.")}
+            {tr("Curated agents from the Smallink team — see what each can do before installing.")}
           </span>
         </span>
         <span className="text-[12.5px] text-accent shrink-0">{tr("Open")} →</span>
@@ -510,6 +524,8 @@ function AppearanceSection() {
 function TrustedWorkspacesCard() {
   const { tr } = useI18n();
   const [workspaces, setWorkspaces] = useState<WorkspaceCommandTrust[] | null>(null);
+  const [revokePath, setRevokePath] = useState<string | null>(null);
+  const [revoking, setRevoking] = useState(false);
 
   const refresh = () =>
     getTrustedWorkspaces()
@@ -521,9 +537,14 @@ function TrustedWorkspacesCard() {
   }, []);
 
   const revoke = async (path: string) => {
-    if (!window.confirm(tr("Revoke command trust for {path}?", { path }))) return;
-    await setWorkspaceTrusted(path, false);
-    refresh();
+    setRevoking(true);
+    try {
+      await setWorkspaceTrusted(path, false);
+      refresh();
+    } finally {
+      setRevoking(false);
+      setRevokePath(null);
+    }
   };
 
   return (
@@ -556,13 +577,24 @@ function TrustedWorkspacesCard() {
               </div>
               <button
                 className="text-[12px] text-danger px-2 py-1"
-                onClick={() => void revoke(workspace.workspace)}
+                onClick={() => setRevokePath(workspace.workspace)}
               >
                 {tr("Revoke")}
               </button>
             </div>
           ))}
         </div>
+      )}
+      {revokePath && (
+        <ConfirmDialog
+          title={tr("Revoke command trust for {path}?", { path: revokePath })}
+          body={tr("Project command allowances will require confirmation again.")}
+          confirmLabel={tr("Revoke")}
+          danger
+          busy={revoking}
+          onCancel={() => setRevokePath(null)}
+          onConfirm={() => void revoke(revokePath)}
+        />
       )}
     </div>
   );
@@ -653,7 +685,7 @@ function TokenSavingsCard() {
         </label>
       </div>
       <div className={FIELD_HELP}>
-        {tr("PDFs over these limits are not attached. Link will show a notice in the composer instead.")}
+        {tr("PDFs over these limits are not attached. Smallink will show a notice in the composer instead.")}
       </div>
     </div>
   );

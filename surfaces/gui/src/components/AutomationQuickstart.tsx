@@ -455,7 +455,7 @@ export function AutomationQuickstart({
               <span className="block text-[13px] text-ink font-medium">
                 {tr("Configure this connector in Settings")}
               </span>
-              {tr("This Link build runs locally. Add the connector with its local or token-based setup, then return here.")}
+              {tr("This Smallink build runs locally. Add the connector with its local or token-based setup, then return here.")}
               <div className="mt-2">
                 <button
                   className="inline-flex items-center gap-1.5 text-accent font-medium"
@@ -475,7 +475,7 @@ export function AutomationQuickstart({
               <span className="block text-[13px] text-ink font-medium">
                 {tr("One sign-in unlocks every one-click connection")}
               </span>
-              {tr("Connections are brokered by Link Cloud — your tokens stay on this Mac.")}
+              {tr("Connections are brokered by Smallink Cloud — your tokens stay on this Mac.")}
               <div className="flex items-center gap-3 mt-2">
                 {signinPhase ? (
                   <>
@@ -502,7 +502,7 @@ export function AutomationQuickstart({
                     onClick={signInThenConnect}
                     data-testid="ob-cloud-signin"
                   >
-                    {tr("Sign in to Link Cloud")}
+                    {tr("Sign in to Smallink Cloud")}
                   </button>
                 )}
               </div>

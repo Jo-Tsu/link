@@ -80,7 +80,7 @@ export function IntegrationsView({
             <section>
               <PanelHead
                 title={tr("Connectors")}
-                sub={tr("Manage the data sources and tools Link can use. Connected items appear first.")}
+                sub={tr("Manage the data sources and tools Smallink can use. Connected items appear first.")}
               />
               <ConnectorsSection onOpenMemory={onOpenMemory} />
             </section>

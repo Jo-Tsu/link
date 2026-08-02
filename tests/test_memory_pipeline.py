@@ -1,5 +1,4 @@
-"""The memory pipeline cleans, tags, and layers raw records into PENDING memories,
-never loses a capture on LLM failure, and is idempotent across re-runs."""
+"""The governance pipeline creates reviewable candidates without unsafe fallbacks."""
 
 from __future__ import annotations
 
@@ -24,7 +23,11 @@ class _TypedProvider(ProviderClient):
 
 
 class _RaisingProvider(ProviderClient):
+    def __init__(self):
+        self.calls = 0
+
     def complete(self, *, model, messages, tools=None, **settings):
+        self.calls += 1
         raise RuntimeError("model exploded")
 
     def capabilities(self, model):
@@ -48,7 +51,7 @@ def _ingest(sensory, *, text="I always deploy with pnpm, never npm.", project="/
     )
 
 
-def test_pipeline_extracts_typed_scoped_pending_linked_memory(tmp_path):
+def test_pipeline_extracts_typed_scoped_pending_linked_candidate(tmp_path):
     sensory, memory = _stores(tmp_path)
     record = _ingest(sensory)
     provider = _TypedProvider(
@@ -59,19 +62,22 @@ def test_pipeline_extracts_typed_scoped_pending_linked_memory(tmp_path):
 
     result = pipeline.process()
 
-    assert result == {"processed_records": 1, "memories_created": 1, "fallbacks": 0}
-    # Pending output is invisible to the default (active-only) list...
+    assert result["processed_records"] == 1
+    assert result["candidates_created"] == 1
+    assert result["failed_records"] == 0
+    # Candidates remain isolated from the formal memory store.
     assert memory.list() == []
-    # ...but present when we ask for everything.
-    pending = memory.list(status=None)
+    assert memory.list(status=None) == []
+    pending = pipeline.governance_store.list_candidates()
     assert len(pending) == 1
     item = pending[0]
     assert item.status == "pending"
-    assert item.key == "user_preference"
-    assert item.scope is Scope.WORKSPACE
+    assert item.memory_type == "user_preference"
+    assert item.scope == Scope.WORKSPACE.value
     assert item.workspace == "/proj"
-    assert item.source_record_id == record.record_id
+    assert item.sources == [record.record_id]
     assert "pnpm" in item.content
+    assert sensory.get(record.record_id).governance_status == "processed"
 
 
 def test_pipeline_multiple_facts_and_global_scope(tmp_path):
@@ -87,37 +93,50 @@ def test_pipeline_multiple_facts_and_global_scope(tmp_path):
 
     result = pipeline.process()
 
-    assert result["memories_created"] == 2
-    items = memory.list(status=None)
-    assert {i.scope for i in items} == {Scope.GLOBAL}
-    assert all(i.workspace is None for i in items)  # global never carries a workspace
+    assert result["candidates_created"] == 2
+    items = pipeline.governance_store.list_candidates()
+    assert {item.scope for item in items} == {Scope.GLOBAL.value}
+    assert all(item.workspace is None for item in items)
 
 
-def test_pipeline_falls_back_on_bad_json(tmp_path):
+def test_pipeline_marks_bad_json_failed_without_raw_candidate(tmp_path):
     sensory, memory = _stores(tmp_path)
     record = _ingest(sensory, text="raw text that matters")
     pipeline = MemoryPipeline(sensory, memory, _TypedProvider("not json at all"), model="test")
 
     result = pipeline.process()
 
-    assert result == {"processed_records": 1, "memories_created": 0, "fallbacks": 1}
-    items = memory.list(status=None)
-    assert len(items) == 1
-    assert items[0].status == "pending"
-    assert items[0].key is None  # untyped fallback
-    assert items[0].source_record_id == record.record_id
-    assert items[0].content == "raw text that matters"
+    assert result["processed_records"] == 0
+    assert result["failed_records"] == 1
+    assert pipeline.governance_store.list_candidates() == []
+    assert memory.list(status=None) == []
+    assert sensory.get(record.record_id).governance_status == "failed"
 
 
-def test_pipeline_falls_back_on_provider_exception(tmp_path):
+def test_pipeline_provider_exception_is_retryable(tmp_path):
     sensory, memory = _stores(tmp_path)
-    _ingest(sensory)
-    pipeline = MemoryPipeline(sensory, memory, _RaisingProvider(), model="test")
+    record = _ingest(sensory)
+    provider = _RaisingProvider()
+    pipeline = MemoryPipeline(sensory, memory, provider, model="test")
 
     result = pipeline.process()
 
-    assert result["fallbacks"] == 1
-    assert len(memory.list(status=None)) == 1  # capture never lost
+    assert result["failed_records"] == 1
+    assert memory.list(status=None) == []
+    assert sensory.get(record.record_id).governance_status == "failed"
+
+    retry = MemoryPipeline(
+        sensory,
+        memory,
+        _TypedProvider(
+            '{"facts": [{"content": "Uses pnpm", "memory_type": "user_preference",'
+            ' "scope": "workspace"}]}'
+        ),
+        model="test",
+        governance_store=pipeline.governance_store,
+    ).process(retry_failed=True)
+    assert retry["candidates_created"] == 1
+    assert sensory.get(record.record_id).governance_status == "processed"
 
 
 def test_pipeline_is_idempotent(tmp_path):
@@ -132,10 +151,11 @@ def test_pipeline_is_idempotent(tmp_path):
     first = pipeline.process()
     second = pipeline.process()
 
-    assert first["memories_created"] == 1
-    assert second == {"processed_records": 0, "memories_created": 0, "fallbacks": 0}
+    assert first["candidates_created"] == 1
+    assert second["processed_records"] == 0
+    assert second["candidates_created"] == 0
     assert provider.calls == 1  # the already-processed record is not re-sent to the model
-    assert len(memory.list(status=None)) == 1
+    assert len(pipeline.governance_store.list_candidates()) == 1
 
 
 def test_pipeline_empty_facts_creates_nothing(tmp_path):
@@ -145,5 +165,70 @@ def test_pipeline_empty_facts_creates_nothing(tmp_path):
 
     result = pipeline.process()
 
-    assert result == {"processed_records": 1, "memories_created": 0, "fallbacks": 0}
+    assert result["skipped_records"] == 1
+    assert result["candidates_created"] == 0
     assert memory.list(status=None) == []
+
+    second = pipeline.process()
+    assert second["processed_records"] == 0
+
+
+def test_pipeline_secret_record_never_reaches_provider(tmp_path):
+    sensory, memory = _stores(tmp_path)
+    record = sensory.add(
+        source_type="notes",
+        content_type="document",
+        raw_content="password=top-secret",
+        external_id="secret-1",
+        sensitivity="secret",
+    )
+    provider = _TypedProvider('{"facts": []}')
+    pipeline = MemoryPipeline(sensory, memory, provider, model="test")
+
+    result = pipeline.process()
+
+    assert result["failed_records"] == 1
+    assert provider.calls == 0
+    assert sensory.get(record.record_id).governance_status == "failed"
+
+
+def test_pipeline_redacts_secret_patterns_before_model_call(tmp_path):
+    sensory, memory = _stores(tmp_path)
+    _ingest(sensory, text="Use api_key=abc123 for the sample.")
+
+    class _CapturingProvider(_TypedProvider):
+        def complete(self, *, model, messages, tools=None, **settings):
+            self.messages = messages
+            return super().complete(model=model, messages=messages, tools=tools, **settings)
+
+    provider = _CapturingProvider('{"facts": []}')
+    MemoryPipeline(sensory, memory, provider, model="ollama:test").process()
+
+    assert "abc123" not in provider.messages[-1]["content"]
+    assert "[REDACTED]" in provider.messages[-1]["content"]
+
+
+def test_pipeline_session_scope_keeps_conversation_id(tmp_path):
+    sensory, memory = _stores(tmp_path)
+    sensory.add(
+        source_type="smallink",
+        content_type="user_input",
+        raw_content="Remember this only here",
+        external_id="session-fact",
+        conversation_id="session-123",
+    )
+    pipeline = MemoryPipeline(
+        sensory,
+        memory,
+        _TypedProvider(
+            '{"facts": [{"content": "Session-only fact", "memory_type": "open_question",'
+            ' "scope": "session"}]}'
+        ),
+        model="test",
+    )
+
+    pipeline.process()
+
+    candidate = pipeline.governance_store.list_candidates()[0]
+    assert candidate.scope == "session"
+    assert candidate.session_id == "session-123"

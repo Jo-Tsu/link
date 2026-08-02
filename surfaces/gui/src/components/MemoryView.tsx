@@ -1,9 +1,15 @@
 import { useEffect, useMemo, useState } from "react";
 import {
+  decideMemoryCandidate,
+  deleteSensoryRecords,
   getMemory,
+  getMemoryCandidate,
+  getMemoryCandidates,
   getSensoryRecord,
   getSensoryRecords,
   getSensoryStats,
+  runMemoryPipeline,
+  type MemoryCandidate,
   type MemoryRecord,
   type SensoryRecord,
   type SensoryStats,
@@ -33,20 +39,26 @@ type MemorySurface = "home" | "pending" | "sources" | "type";
 export function MemoryView() {
   const { tr } = useI18n();
   const [memories, setMemories] = useState<MemoryRecord[]>([]);
-  const [pending, setPending] = useState<MemoryRecord[]>([]);
+  const [pending, setPending] = useState<MemoryCandidate[]>([]);
   const [surface, setSurface] = useState<MemorySurface>("home");
   const [selectedType, setSelectedType] = useState<MemoryType | null>(null);
   const [selectedMemory, setSelectedMemory] = useState<MemoryRecord | null>(null);
+  const [selectedCandidate, setSelectedCandidate] = useState<MemoryCandidate | null>(null);
   const [sourceStats, setSourceStats] = useState<SensoryStats | null>(null);
   const [statsError, setStatsError] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [generating, setGenerating] = useState(false);
+  const [generateResult, setGenerateResult] = useState<{
+    tone: "success" | "warning";
+    body: string;
+  } | null>(null);
 
   const load = async () => {
     setLoading(true);
     setError("");
     try {
-      const [active, awaiting] = await Promise.all([getMemory(), getMemory("pending")]);
+      const [active, awaiting] = await Promise.all([getMemory(), getMemoryCandidates()]);
       setMemories(active);
       setPending(awaiting);
       try {
@@ -56,8 +68,10 @@ export function MemoryView() {
         setSourceStats(null);
         setStatsError(true);
       }
+      return awaiting;
     } catch (err) {
       setError(err instanceof Error ? err.message : tr("Could not load memories"));
+      return null;
     } finally {
       setLoading(false);
     }
@@ -75,6 +89,34 @@ export function MemoryView() {
     setSurface("home");
     setSelectedType(null);
     setSelectedMemory(null);
+    setSelectedCandidate(null);
+  };
+
+  const generateCandidates = async (retryFailed = false) => {
+    setGenerating(true);
+    setGenerateResult(null);
+    try {
+      const result = await runMemoryPipeline({ retry_failed: retryFailed });
+      setGenerateResult({
+        tone: result.failed_records > 0 ? "warning" : "success",
+        body: tr("Created {created} candidates, skipped {skipped}, failed {failed}.", {
+          created: result.candidates_created,
+          skipped: result.skipped_records,
+          failed: result.failed_records,
+        }),
+      });
+      await load();
+      if (result.candidates_created > 0) setSurface("pending");
+    } catch (reason) {
+      setGenerateResult({
+        tone: "warning",
+        body: reason instanceof Error
+          ? reason.message
+          : tr("Could not generate memory candidates"),
+      });
+    } finally {
+      setGenerating(false);
+    }
   };
 
   if (loading && surface === "home") {
@@ -120,9 +162,9 @@ export function MemoryView() {
           </div>
           <div className="mb-4">
             <InlineFeedback
-              tone="warning"
-              title={tr("Review-only in this preview")}
-              body={tr("Accept, edit, merge, and ignore actions are not available yet. Drafts remain isolated from agent memory.")}
+              tone="info"
+              title={tr("Review before Smallink uses it")}
+              body={tr("Accept, edit, merge, or ignore each candidate. Only accepted memories are available to agents.")}
             />
           </div>
           <div className="grid grid-cols-1 min-[1080px]:grid-cols-[minmax(0,1fr)_360px] gap-4 items-start">
@@ -133,14 +175,37 @@ export function MemoryView() {
                   <div className="text-[12px] text-muted mt-1">{tr("Extracted candidate memories will appear here.")}</div>
                 </div>
               ) : pending.map((item) => (
-                <button key={item.id} className={`w-full text-left px-4 py-3 border-b border-line last:border-b-0 hover:bg-paper/70 ${selectedMemory?.id === item.id ? "bg-accentSoft/35" : ""}`} onClick={() => setSelectedMemory(item)}>
+                <button
+                  key={item.candidate_id}
+                  className={`w-full text-left px-4 py-3 border-b border-line last:border-b-0 hover:bg-paper/70 ${
+                    selectedCandidate?.candidate_id === item.candidate_id ? "bg-accentSoft/35" : ""
+                  }`}
+                  onClick={() => {
+                    setSelectedCandidate(item);
+                    void getMemoryCandidate(item.candidate_id)
+                      .then(setSelectedCandidate)
+                      .catch(() => undefined);
+                  }}
+                >
                   <div className="text-[13px] text-ink line-clamp-2">{item.content}</div>
-                  <div className="text-[11px] text-muted mt-1.5">{typeLabel(item, tr)} · {scopeLabel(item, tr)} · {formatTime(item.created_at, tr)}</div>
+                  <div className="text-[11px] text-muted mt-1.5">
+                    {candidateTypeLabel(item, tr)} · {candidateScopeLabel(item, tr)} · {formatTime(item.created_at, tr)}
+                  </div>
                 </button>
               ))}
             </section>
             <section className="border border-line rounded-lg bg-panel min-w-0 min-[1080px]:sticky min-[1080px]:top-6">
-              {selectedMemory ? <MemoryDetail memory={selectedMemory} /> : <div className="px-4 py-8 text-[12.5px] text-muted">{tr("Select a memory to view its details.")}</div>}
+              {selectedCandidate ? (
+                <CandidateDetail
+                  candidate={selectedCandidate}
+                  memories={memories}
+                  onChanged={async () => {
+                    setSelectedCandidate(null);
+                    const remaining = await load();
+                    if (remaining?.length === 0) openHome();
+                  }}
+                />
+              ) : <div className="px-4 py-8 text-[12.5px] text-muted">{tr("Select a candidate to review its details.")}</div>}
             </section>
           </div>
         </div>
@@ -225,9 +290,21 @@ export function MemoryView() {
             <InlineFeedback
               tone="info"
               title={tr("{count} source records collected", { count: sourceStats.total })}
-              body={tr("Source data has been imported, but candidate generation and confirmation are separate steps.")}
-              action={tr("Browse sources")}
-              onAction={() => setSurface("sources")}
+              body={tr("Generate candidates from source data, then review them before they become memory.")}
+              action={tr(generating ? "Generating…" : "Generate candidates")}
+              onAction={generating ? undefined : () => void generateCandidates(false)}
+            />
+          </div>
+        )}
+
+        {generateResult && (
+          <div className="mb-4">
+            <InlineFeedback
+              tone={generateResult.tone}
+              title={tr("Memory governance result")}
+              body={generateResult.body}
+              action={tr("Retry failed")}
+              onAction={generating ? undefined : () => void generateCandidates(true)}
             />
           </div>
         )}
@@ -235,7 +312,7 @@ export function MemoryView() {
         {pending.length > 0 && (
           <button
             className="w-full mb-5 flex items-center justify-between gap-3 rounded-lg border border-accent/40 bg-accentSoft/20 px-3.5 py-3 text-left hover:bg-accentSoft/30"
-            onClick={() => { setSurface("pending"); setSelectedMemory(null); }}
+            onClick={() => { setSurface("pending"); setSelectedCandidate(null); }}
             data-testid="memory-pending-banner"
           >
             <span className="flex items-center gap-2 text-[12.5px] text-ink">
@@ -324,16 +401,22 @@ function SourceRecordsView({ onBack }: { onBack: () => void }) {
   const [source, setSource] = useState("all");
   const [governance, setGovernance] = useState("all");
   const [selected, setSelected] = useState<SensoryRecord | null>(null);
+  const [offset, setOffset] = useState(0);
+  const [deleteArmed, setDeleteArmed] = useState(false);
+  const [deleteError, setDeleteError] = useState("");
   const [detailLoading, setDetailLoading] = useState(false);
   const [detailError, setDetailError] = useState("");
+  const pageSize = 50;
 
   const load = () => {
     setLoading(true);
     setError("");
     getSensoryRecords({
-      limit: 100,
+      limit: pageSize,
+      offset,
       source_type: source === "all" ? undefined : source,
       governance_status: governance === "all" ? undefined : governance,
+      query: query.trim() || undefined,
     })
       .then((next) => {
         setRecords(next.records);
@@ -348,25 +431,10 @@ function SourceRecordsView({ onBack }: { onBack: () => void }) {
       .finally(() => setLoading(false));
   };
 
-  useEffect(load, [source, governance]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  const filtered = useMemo(() => {
-    const needle = query.trim().toLocaleLowerCase();
-    if (!needle) return records;
-    return records.filter((record) =>
-      [
-        record.raw_content,
-        record.project_path,
-        record.conversation_id,
-        record.external_id,
-        record.source_type,
-      ]
-        .filter(Boolean)
-        .join(" ")
-        .toLocaleLowerCase()
-        .includes(needle),
-    );
-  }, [query, records]);
+  useEffect(() => {
+    const timer = window.setTimeout(load, query ? 250 : 0);
+    return () => window.clearTimeout(timer);
+  }, [source, governance, offset, query]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const sources = [...new Set(records.map((record) => record.source_type))].sort();
 
@@ -380,6 +448,21 @@ function SourceRecordsView({ onBack }: { onBack: () => void }) {
         setDetailError(reason instanceof Error ? reason.message : tr("Could not load source record"));
       })
       .finally(() => setDetailLoading(false));
+  };
+
+  const removeSelected = async () => {
+    if (!selected) return;
+    setDeleteError("");
+    try {
+      await deleteSensoryRecords({ record_ids: [selected.record_id] });
+      setSelected(null);
+      setDeleteArmed(false);
+      load();
+    } catch (reason) {
+      setDeleteError(
+        reason instanceof Error ? reason.message : tr("Could not delete source record"),
+      );
+    }
   };
 
   return (
@@ -407,14 +490,14 @@ function SourceRecordsView({ onBack }: { onBack: () => void }) {
           <Icon name="search" size={15} className="text-muted" />
           <input
             value={query}
-            onChange={(event) => setQuery(event.target.value)}
+            onChange={(event) => { setQuery(event.target.value); setOffset(0); }}
             placeholder={tr("Search content, project or conversation")}
             className="min-w-0 flex-1 bg-transparent outline-none text-[13px] placeholder:text-faint"
           />
         </label>
         <select
           value={source}
-          onChange={(event) => setSource(event.target.value)}
+          onChange={(event) => { setSource(event.target.value); setOffset(0); }}
           aria-label={tr("Data sources")}
           className="h-10 min-w-[140px] rounded-lg border border-line bg-paper px-3 text-[12.5px] outline-none focus:border-accent"
         >
@@ -423,7 +506,7 @@ function SourceRecordsView({ onBack }: { onBack: () => void }) {
         </select>
         <select
           value={governance}
-          onChange={(event) => setGovernance(event.target.value)}
+          onChange={(event) => { setGovernance(event.target.value); setOffset(0); }}
           aria-label={tr("Governance status")}
           className="h-10 min-w-[160px] rounded-lg border border-line bg-paper px-3 text-[12.5px] outline-none focus:border-accent"
         >
@@ -433,7 +516,7 @@ function SourceRecordsView({ onBack }: { onBack: () => void }) {
       </div>
 
       <div className="mb-3 text-[11.5px] text-muted">
-        {tr("Showing {shown} of {total} source records", { shown: filtered.length, total })}
+        {tr("Showing {shown} of {total} source records", { shown: records.length, total })}
       </div>
 
       {loading ? (
@@ -442,12 +525,12 @@ function SourceRecordsView({ onBack }: { onBack: () => void }) {
         <PageState icon="diamond" title={tr("Source records are unavailable")} body={error} action={tr("Try again")} onAction={load} />
       ) : records.length === 0 ? (
         <PageState icon="diamond" title={tr("No source records yet")} body={tr("Connect Codex or TRAE CLI, or start a Smallink conversation to collect source data.")} />
-      ) : filtered.length === 0 ? (
+      ) : records.length === 0 ? (
         <PageState icon="search" title={tr("No source records match these filters.")} body={tr("Change the search or filters to see more records.")} />
       ) : (
         <div className="grid grid-cols-1 min-[1080px]:grid-cols-[minmax(0,1fr)_380px] gap-4 items-start">
           <section className="rounded-xl border border-line bg-panel overflow-hidden min-w-0">
-            {filtered.map((record) => (
+            {records.map((record) => (
               <button
                 key={record.record_id}
                 type="button"
@@ -476,11 +559,62 @@ function SourceRecordsView({ onBack }: { onBack: () => void }) {
             ) : detailError ? (
               <div className="p-4"><InlineFeedback tone="danger" title={tr("Could not load source record")} body={detailError} /></div>
             ) : selected ? (
-              <SourceRecordDetail record={selected} />
+              <>
+                <SourceRecordDetail record={selected} />
+                <div className="border-t border-line px-4 py-3">
+                  {!deleteArmed ? (
+                    <button
+                      className="text-[12px] text-danger"
+                      onClick={() => setDeleteArmed(true)}
+                    >
+                      {tr("Delete this source record")}
+                    </button>
+                  ) : (
+                    <div className="flex items-center gap-2">
+                      <button
+                        className="text-[12px] text-danger font-medium"
+                        onClick={() => void removeSelected()}
+                      >
+                        {tr("Confirm delete")}
+                      </button>
+                      <button
+                        className="text-[12px] text-muted"
+                        onClick={() => setDeleteArmed(false)}
+                      >
+                        {tr("Cancel")}
+                      </button>
+                    </div>
+                  )}
+                  {deleteError && (
+                    <div className="text-[11.5px] text-danger mt-2">{deleteError}</div>
+                  )}
+                </div>
+              </>
             ) : (
               <div className="px-4 py-8 text-[12.5px] text-muted">{tr("Select a record to inspect its source and raw content.")}</div>
             )}
           </section>
+        </div>
+      )}
+      {total > pageSize && (
+        <div className="mt-4 flex items-center justify-between text-[12px]">
+          <button
+            className="text-accent disabled:text-faint"
+            disabled={offset === 0}
+            onClick={() => setOffset(Math.max(0, offset - pageSize))}
+          >
+            {tr("Previous")}
+          </button>
+          <span className="text-muted">
+            {offset + 1}–{Math.min(offset + records.length, total)} / {total}
+          </span>
+          <button
+            className="text-accent disabled:text-faint"
+            disabled={offset + records.length >= total}
+            onClick={() => setOffset(offset + pageSize)}
+          >
+            {tr("Next")}
+          </button>
         </div>
       )}
     </MemoryShell>
@@ -514,6 +648,148 @@ function SourceRecordDetail({ record }: { record: SensoryRecord }) {
   );
 }
 
+function CandidateDetail({
+  candidate,
+  memories,
+  onChanged,
+}: {
+  candidate: MemoryCandidate;
+  memories: MemoryRecord[];
+  onChanged: () => Promise<void>;
+}) {
+  const { tr } = useI18n();
+  const [content, setContent] = useState(candidate.content);
+  const [mergeId, setMergeId] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    setContent(candidate.content);
+    setMergeId("");
+    setError("");
+  }, [candidate.candidate_id, candidate.content]);
+
+  const decide = async (
+    action: "accept" | "edit_accept" | "ignore" | "merge",
+  ) => {
+    setBusy(true);
+    setError("");
+    try {
+      await decideMemoryCandidate(candidate.candidate_id, {
+        action,
+        ...(action === "edit_accept" || action === "merge" ? { content: content.trim() } : {}),
+        ...(action === "merge" ? { merge_memory_id: Number(mergeId) } : {}),
+      });
+      await onChanged();
+    } catch (reason) {
+      setError(
+        reason instanceof Error ? reason.message : tr("Could not save memory decision"),
+      );
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const changed = content.trim() !== candidate.content;
+  return (
+    <div>
+      <div className="px-4 py-3 border-b border-line">
+        <div className="text-[13px] font-semibold text-ink">{tr("Candidate details")}</div>
+        <div className="text-[10.5px] text-faint mt-0.5">#{shortId(candidate.candidate_id)}</div>
+      </div>
+      <div className="px-4 py-3">
+        <label className="block text-[11px] font-medium text-muted mb-1.5">
+          {tr("Memory content")}
+        </label>
+        <textarea
+          value={content}
+          onChange={(event) => setContent(event.target.value)}
+          rows={6}
+          disabled={busy}
+          className="w-full resize-y rounded-lg border border-line bg-paper px-3 py-2 text-[12.5px] leading-relaxed outline-none focus:border-accent"
+        />
+      </div>
+      <dl className="grid grid-cols-[92px_minmax(0,1fr)] gap-x-3 gap-y-2 px-4 py-3 border-t border-line text-[11.5px]">
+        <dt className="text-faint">{tr("Type")}</dt>
+        <dd className="text-ink">{candidateTypeLabel(candidate, tr)}</dd>
+        <dt className="text-faint">{tr("Scope")}</dt>
+        <dd className="text-ink">{candidateScopeLabel(candidate, tr)}</dd>
+        <dt className="text-faint">{tr("Model")}</dt>
+        <dd className="text-ink break-all">{candidate.model}</dd>
+        <dt className="text-faint">{tr("Sources")}</dt>
+        <dd className="text-ink">{candidate.sources.length}</dd>
+      </dl>
+      {(candidate.source_records?.length ?? 0) > 0 && (
+        <div className="border-t border-line px-4 py-3">
+          <div className="text-[11px] font-medium text-muted mb-2">{tr("Source evidence")}</div>
+          <div className="space-y-2 max-h-44 overflow-y-auto hairline-scroll">
+            {candidate.source_records!.map((source) => (
+              <div key={source.record_id} className="rounded-lg bg-paper px-2.5 py-2">
+                <div className="text-[10.5px] text-faint">
+                  {sourceLabel(source.source_type)} · {formatTime(source.occurred_at, tr)}
+                </div>
+                <div className="text-[11.5px] text-ink line-clamp-3 mt-1">
+                  {source.raw_content}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+      {memories.length > 0 && (
+        <div className="border-t border-line px-4 py-3">
+          <label className="block text-[11px] font-medium text-muted mb-1.5">
+            {tr("Merge into existing memory")}
+          </label>
+          <select
+            value={mergeId}
+            onChange={(event) => setMergeId(event.target.value)}
+            disabled={busy}
+            className="w-full h-9 rounded-lg border border-line bg-paper px-2.5 text-[12px] outline-none focus:border-accent"
+          >
+            <option value="">{tr("Select a confirmed memory")}</option>
+            {memories.map((memory) => (
+              <option key={memory.id} value={memory.id}>
+                #{memory.id} · {memory.content.slice(0, 64)}
+              </option>
+            ))}
+          </select>
+        </div>
+      )}
+      {error && (
+        <div className="px-4 pb-3">
+          <InlineFeedback tone="danger" title={tr("Decision failed")} body={error} />
+        </div>
+      )}
+      <div className="border-t border-line px-4 py-3 flex flex-wrap gap-2">
+        <button
+          disabled={busy || !content.trim()}
+          onClick={() => void decide(changed ? "edit_accept" : "accept")}
+          className="rounded-full bg-ink text-panel px-3.5 py-1.5 text-[12px] disabled:opacity-50"
+        >
+          {tr(changed ? "Save and accept" : "Accept")}
+        </button>
+        {memories.length > 0 && (
+          <button
+            disabled={busy || !mergeId || !content.trim()}
+            onClick={() => void decide("merge")}
+            className="rounded-full border border-line px-3.5 py-1.5 text-[12px] text-ink disabled:opacity-50"
+          >
+            {tr("Merge")}
+          </button>
+        )}
+        <button
+          disabled={busy}
+          onClick={() => void decide("ignore")}
+          className="rounded-full border border-line px-3.5 py-1.5 text-[12px] text-muted disabled:opacity-50"
+        >
+          {tr("Ignore")}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function MemoryDetail({ memory }: { memory: MemoryRecord }) {
   const { tr } = useI18n();
   return <div>
@@ -534,6 +810,23 @@ function typeLabel(item: MemoryRecord, tr: (text: string) => string): string {
 }
 
 function scopeLabel(item: MemoryRecord, tr: (text: string) => string): string {
+  if (item.scope === "global") return tr("Global");
+  if (item.scope === "session") return tr("Session");
+  return item.workspace ? `${tr("Project")} · ${baseName(item.workspace)}` : tr("Project");
+}
+
+function candidateTypeLabel(
+  item: MemoryCandidate,
+  tr: (text: string) => string,
+): string {
+  const match = MEMORY_TYPES.find(([key]) => key === item.memory_type);
+  return match ? tr(match[1]) : tr("Uncategorized");
+}
+
+function candidateScopeLabel(
+  item: MemoryCandidate,
+  tr: (text: string) => string,
+): string {
   if (item.scope === "global") return tr("Global");
   if (item.scope === "session") return tr("Session");
   return item.workspace ? `${tr("Project")} · ${baseName(item.workspace)}` : tr("Project");

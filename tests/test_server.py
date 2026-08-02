@@ -361,6 +361,34 @@ def test_ws_simple_turn(tmp_path):
         assert "turn_end" in types
 
 
+def test_ws_client_message_id_is_acknowledged_and_deduplicated(tmp_path):
+    client = _client(tmp_path, [_text("done once")])
+    payload = {
+        "type": "user_message",
+        "client_message_id": "client-message-1",
+        "text": "hello",
+    }
+    with client.websocket_connect("/ws/session/idempotent") as ws:
+        assert ws.receive_json()["type"] == "ready"
+        ws.send_json(payload)
+        accepted = ws.receive_json()
+        assert accepted == {
+            "type": "message_accepted",
+            "data": {"client_message_id": "client-message-1"},
+        }
+        assert "turn_done" in _drain(ws)
+        ws.send_json(payload)
+        duplicate = ws.receive_json()
+        assert duplicate["type"] == "message_accepted"
+        assert duplicate["data"]["duplicate"] is True
+
+    manager = client.app.state.manager
+    engine = manager._engines["idempotent"]
+    user_messages = [message for message in engine.messages if message.get("role") == "user"]
+    assert len(user_messages) == 1
+    assert user_messages[0]["client_message_id"] == "client-message-1"
+
+
 def test_ws_rejects_oversized_message(tmp_path):
     from smallink.server import app as app_mod
     from smallink.attachments import MAX_ATTACHMENTS

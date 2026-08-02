@@ -2,17 +2,20 @@ import { useEffect, useState } from "react";
 import {
   disconnectConnector,
   getCloudStatus,
+  getConnectorSyncStatus,
   getConnectors,
   getSlackStatus,
   syncCodex,
   syncTraex,
   type CloudStatus,
   type Connector,
+  type ConnectorSyncStatus,
   type SlackStatus,
 } from "../../api";
 import { ConnectorBadge } from "../../connectors/ConnectorIcon";
 import { AllowlistBlock, ConnectorTools, ListeningSessionsBlock, UnauthorizedBlock } from "../ManageTabs";
 import { InlineFeedback, PageState } from "../AsyncFeedback";
+import { ConfirmDialog } from "../ConfirmDialog";
 import { AccountsDetail } from "./AccountsDetail";
 import { AvailableDetail } from "./AvailableDetail";
 import { CalendarDetail } from "./CalendarDetail";
@@ -177,7 +180,22 @@ function LocalConversationImportBlock({
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [syncStatus, setSyncStatus] = useState<ConnectorSyncStatus | null>(null);
+  const [statusError, setStatusError] = useState("");
   const isTraex = source === "traex";
+
+  const loadStatus = () => {
+    setStatusError("");
+    getConnectorSyncStatus(source)
+      .then(setSyncStatus)
+      .catch((reason) => {
+        setStatusError(
+          reason instanceof Error ? reason.message : tr("Could not load sync status"),
+        );
+      });
+  };
+
+  useEffect(loadStatus, [source]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const run = async () => {
     setBusy(true);
@@ -191,6 +209,7 @@ function LocalConversationImportBlock({
           sessions: r.sessions_read,
         }),
       );
+      setSyncStatus(r.sync ?? null);
     } catch {
       setError(
         tr(isTraex ? "Could not import TRAE conversations." : "Could not import Codex conversations."),
@@ -224,6 +243,28 @@ function LocalConversationImportBlock({
       </div>
       {result && <div className="px-3.5 pb-3 text-[12px] text-ok">{result}</div>}
       {error && <div className="px-3.5 pb-3 text-[12px] text-danger">{error}</div>}
+      {syncStatus && (
+        <div className="border-t border-line px-3.5 py-3">
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-[11px]">
+            <SyncMetric label={tr("Files scanned")} value={syncStatus.files_scanned} />
+            <SyncMetric label={tr("Sessions read")} value={syncStatus.sessions_read} />
+            <SyncMetric label={tr("Records seen")} value={syncStatus.records_seen} />
+            <SyncMetric label={tr("Records added")} value={syncStatus.records_ingested} />
+          </div>
+          <div className="text-[10.5px] text-faint mt-2">
+            {syncStatus.status === "failed"
+              ? tr("Last sync failed: {error}", { error: syncStatus.error || tr("unknown") })
+              : tr("Last synced {time}", {
+                  time: new Date(
+                    syncStatus.watermark?.last_success_at ||
+                      syncStatus.finished_at ||
+                      syncStatus.started_at,
+                  ).toLocaleString(),
+                })}
+          </div>
+        </div>
+      )}
+      {statusError && <div className="px-3.5 pb-3 text-[11px] text-danger">{statusError}</div>}
       {result && onOpenMemory && (
         <div className="px-3.5 pb-3">
           <button
@@ -239,6 +280,15 @@ function LocalConversationImportBlock({
   );
 }
 
+function SyncMetric({ label, value }: { label: string; value: number }) {
+  return (
+    <div className="rounded-lg bg-paper px-2.5 py-2">
+      <div className="text-[15px] font-semibold text-heading">{value}</div>
+      <div className="text-faint mt-0.5">{label}</div>
+    </div>
+  );
+}
+
 function GenericDetail({
   c,
   cloud: _cloud,
@@ -250,12 +300,8 @@ function GenericDetail({
   const { tr } = useI18n();
   const [disconnecting, setDisconnecting] = useState(false);
   const [disconnectError, setDisconnectError] = useState("");
+  const [confirmDisconnect, setConfirmDisconnect] = useState(false);
   const disconnect = async () => {
-    const localSource = c.name === "codex" || c.name === "traex";
-    const message = localSource
-      ? tr("Disconnect {name}? Imported source data stays in Smallink until you remove it separately.", { name: c.title })
-      : tr("Disconnect {name}?", { name: c.title });
-    if (!window.confirm(message)) return;
     setDisconnecting(true);
     setDisconnectError("");
     try {
@@ -269,6 +315,7 @@ function GenericDetail({
       );
     } finally {
       setDisconnecting(false);
+      setConfirmDisconnect(false);
     }
   };
   return (
@@ -296,7 +343,7 @@ function GenericDetail({
         {c.auth !== "none" && (
           <button
             className="text-[12.5px] text-danger/80 hover:text-danger shrink-0"
-            onClick={() => void disconnect()}
+            onClick={() => setConfirmDisconnect(true)}
             disabled={disconnecting}
           >
             {tr(disconnecting ? "Disconnecting…" : "Disconnect")}
@@ -306,6 +353,22 @@ function GenericDetail({
 
       {(c.name === "codex" || c.name === "traex") && (
         <LocalConversationImportBlock source={c.name} onOpenMemory={onOpenMemory} />
+      )}
+
+      {confirmDisconnect && (
+        <ConfirmDialog
+          title={tr("Disconnect {name}?", { name: c.title })}
+          body={
+            c.name === "codex" || c.name === "traex"
+              ? tr("Imported source data stays in Smallink until you remove it from the memory data page.")
+              : tr("You can connect this service again later.")
+          }
+          confirmLabel={tr("Disconnect")}
+          danger
+          busy={disconnecting}
+          onCancel={() => setConfirmDisconnect(false)}
+          onConfirm={() => void disconnect()}
+        />
       )}
 
       {disconnectError && (

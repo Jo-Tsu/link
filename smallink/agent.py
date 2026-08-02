@@ -23,7 +23,13 @@ from .connectors import (
 )
 from .engine import Approver, TurnEngine
 from .environment import environment_context
-from .memory import MemoryStore, Scope, format_memories
+from .memory import (
+    MemoryStore,
+    Scope,
+    format_memories,
+    query_text,
+    select_memories,
+)
 from .permissions import Mode, PermissionEngine
 from .project import load_agents_md
 from .roots import RootDir, normalize_roots, render_context
@@ -119,6 +125,7 @@ def build_engine(
     max_iterations: Optional[int] = None,
     model_settings: Optional[dict[str, Any]] = None,
     memory_store: Optional[MemoryStore] = None,
+    governance_store: Optional[Any] = None,
     messages: Optional[list[dict[str, Any]]] = None,
     extra_tools: Optional[list[Any]] = None,
     secrets: Optional[SecretStore] = None,
@@ -252,12 +259,6 @@ def build_engine(
 
     if memory_store is not None:
         instructions = f"{instructions}\n\n{_MEMORY_CONTEXT_GUIDANCE}"
-        remembered = memory_store.list(scope=Scope.GLOBAL)
-        if ws is not None:
-            remembered += memory_store.list(scope=Scope.WORKSPACE, workspace=str(ws))
-        block = format_memories(remembered)
-        if block:
-            instructions = f"{instructions}\n\n{block}"
 
     resolved_skill_root = Path(skill_state_root or state_dir()).expanduser()
     skill_loader = SkillLoader(_skill_dirs(ws, resolved_skill_root))
@@ -296,7 +297,9 @@ def build_engine(
         else None
     )
 
-    def context_provider() -> str:
+    def context_provider(
+        current_messages: Optional[list[dict[str, Any]]] = None,
+    ) -> str:
         parts = []
         if permissions.mode is Mode.PLAN:
             parts.append(_PLAN_MODE_CONTEXT)
@@ -306,6 +309,27 @@ def build_engine(
             ctx = roots_context()
             if ctx:
                 parts.append(ctx)
+        if memory_store is not None:
+            remembered = memory_store.list(scope=Scope.GLOBAL)
+            if ws is not None:
+                remembered += memory_store.list(
+                    scope=Scope.WORKSPACE,
+                    workspace=str(ws),
+                )
+            selected = select_memories(
+                remembered,
+                query_text(current_messages or messages or []),
+            )
+            block = format_memories(selected)
+            if block:
+                parts.append(block)
+                if governance_store is not None:
+                    for memory in selected:
+                        governance_store.record_usage(
+                            memory.id,
+                            session_id=session_id,
+                            workspace=str(ws) if ws else None,
+                        )
         return "\n\n".join(parts)
 
     engine = TurnEngine(

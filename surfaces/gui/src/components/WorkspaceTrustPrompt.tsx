@@ -31,7 +31,7 @@ export function WorkspaceTrustPrompt({
         <div className="gate-mark">✦</div>
         <h2 id="workspace-trust-title">{tr("Trust this workspace’s commands?")}</h2>
         <p className="gate-sub">
-          {tr("This project asks Link to run the commands below without individual approval. Trust applies to future configuration changes at this exact folder until you revoke it in Settings.")}
+          {tr("This project asks Smallink to run the commands below without individual approval. Trust applies to future configuration changes at this exact folder until you revoke it in Settings.")}
         </p>
         <div className="rounded-lg border border-line bg-paper px-3 py-2.5 max-h-48 overflow-y-auto">
           {request.requested_commands.map((command) => (

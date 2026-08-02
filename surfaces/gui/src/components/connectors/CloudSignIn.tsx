@@ -28,7 +28,7 @@ export function CloudSignInInline({ blurb }: { blurb?: string }) {
           });
         }}
       >
-        {waiting ? tr("Check your browser…") : tr("Sign in to Link Cloud")}
+        {waiting ? tr("Check your browser…") : tr("Sign in to Smallink Cloud")}
       </button>
       <div className="text-[11.5px] text-faint">
         {blurb ? tr(blurb) : tr("Sign-in unlocks one-click connections. Manual setup works without signing in.")}
@@ -47,7 +47,7 @@ export function CloudStatusPending() {
       className="text-[12px] text-faint py-2 text-center"
       data-testid="cloud-status-pending"
     >
-      {tr("Checking Link Cloud sign-in…")}
+      {tr("Checking Smallink Cloud sign-in…")}
     </div>
   );
 }

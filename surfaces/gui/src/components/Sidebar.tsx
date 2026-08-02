@@ -1205,7 +1205,7 @@ export function Sidebar(props: Props) {
                 ) : cloudAvailable ? (
                   <>
                     <div className="px-3 py-1.5 text-[11px] text-faint border-b border-line">
-                      {tr("Not signed in — one-click connections need Link Cloud")}
+                      {tr("Not signed in — one-click connections need Smallink Cloud")}
                     </div>
                     <button
                       className="w-full flex items-center gap-2.5 px-3 py-1.5 mb-1 text-[13px] text-left text-accent hover:bg-paper"
@@ -1223,7 +1223,7 @@ export function Sidebar(props: Props) {
                         });
                       }}
                     >
-                      <Icon name="plug" size={15} className="shrink-0" /> {tr("Sign in to Link Cloud")}
+                      <Icon name="plug" size={15} className="shrink-0" /> {tr("Sign in to Smallink Cloud")}
                     </button>
                   </>
                 ) : (
@@ -1279,7 +1279,7 @@ export function Sidebar(props: Props) {
                 ? cloud?.signed_in
                   ? tr("Account: {name}", { name: accountEmail })
                   : tr("Account: not signed in")
-                : tr("Link local mode")
+                : tr("Smallink local mode")
             }
           >
             <span
@@ -1302,12 +1302,12 @@ export function Sidebar(props: Props) {
                 ? cloud?.signed_in
                   ? accountName
                   : tr("Not signed in")
-                : tr("Link local")}
+                : tr("Smallink local")}
             </span>
             {cloudAvailable && cloud?.signed_in && (
               <span
                 className="w-[7px] h-[7px] rounded-full bg-ok shrink-0"
-                title={tr("Signed in to Link Cloud")}
+                title={tr("Signed in to Smallink Cloud")}
                 aria-hidden
               />
             )}

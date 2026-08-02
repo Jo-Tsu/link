@@ -29,6 +29,34 @@ export default defineConfig(({ command }) => {
     plugins: [react()],
     server: { port: 41737, strictPort: true },
     define: { __LINK_DEV_TOKEN__: JSON.stringify(devToken) },
+    build: {
+      rollupOptions: {
+        output: {
+          manualChunks(id: string) {
+            if (!id.includes("node_modules")) return undefined;
+            if (
+              id.includes("react-markdown") ||
+              id.includes("remark-") ||
+              id.includes("/unified/") ||
+              id.includes("/micromark") ||
+              id.includes("/mdast") ||
+              id.includes("/hast")
+            ) {
+              return "markdown";
+            }
+            if (id.includes("simple-icons")) return "connector-icons";
+            if (
+              id.includes("/react/") ||
+              id.includes("/react-dom/") ||
+              id.includes("/scheduler/")
+            ) {
+              return "react";
+            }
+            return undefined;
+          },
+        },
+      },
+    },
     // Tauri CLI looks for these; harmless for the browser build.
     clearScreen: false,
     envPrefix: ["VITE_", "TAURI_"],

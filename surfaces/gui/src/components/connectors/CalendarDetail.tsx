@@ -57,7 +57,7 @@ export function CalendarDetail({ c, cloud, slack: _slack, onChanged }: DetailPro
               ? tr("One-click Google sign-in is coming soon")
               : cloud?.signed_in
                 ? ""
-                : tr("Sign in to Link Cloud first")
+                : tr("Sign in to Smallink Cloud first")
           }
         >
           {c.managed_paused ? `＋ ${tr("Add account")} · ${tr("Coming soon")}` : busy ? tr("Check your browser…") : `＋ ${tr("Add account")}`}
@@ -68,7 +68,7 @@ export function CalendarDetail({ c, cloud, slack: _slack, onChanged }: DetailPro
         <div className={GRP}>
           <div className={ROW + " text-[12.5px] text-muted"}>
             {tr("Sign in with Google. Each account stays separate, and agents identify which one they use.")}
-            {cloud?.signed_in ? "" : ` ${tr("Link Cloud sign-in is required.")}`}
+            {cloud?.signed_in ? "" : ` ${tr("Smallink Cloud sign-in is required.")}`}
           </div>
         </div>
       )}

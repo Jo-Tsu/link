@@ -4,4 +4,4 @@ All first-party backend capabilities live under this package. The top-level ``li
 kept only as a compatibility forwarder for existing installations and historical integrations.
 """
 
-__version__ = "0.0.0"
+__version__ = "0.2.0"

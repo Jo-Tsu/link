@@ -9,13 +9,13 @@ request handlers touch it from different threads.
 from __future__ import annotations
 
 import json
-import sqlite3
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 from zoneinfo import ZoneInfo
 
+from ..sqlite import connect_sqlite
 from .models import ScheduledTask, TaskRun
 
 
@@ -66,8 +66,7 @@ class TaskStore:
     def __init__(self, path: str | Path) -> None:
         self.path = str(path)
         self._lock = threading.RLock()
-        self._conn = sqlite3.connect(self.path, check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
+        self._conn = connect_sqlite(self.path)
         self._init()
 
     def _init(self) -> None:
@@ -172,13 +171,12 @@ class TaskStore:
         return [TaskRun.from_dict(json.loads(r["data"])) for r in rows]
 
     def recover_incomplete_runs(
-        self, *, reason: str = "Smallink restarted before the automation completed"
+        self,
+        *,
+        runtime_status: Optional[Callable[[str], Optional[str]]] = None,
+        reason: str = "Smallink restarted before the automation completed",
     ) -> int:
-        """Close manual/scheduled runs left active by a previous process.
-
-        Automation history predates the shared runtime store, so it needs the same startup
-        recovery guarantee: no run may remain "running" after the process that owned it died.
-        """
+        """Reconcile legacy automation history from the shared runtime store."""
         finished_at = _epoch_now()
         recovered = 0
         with self._lock:
@@ -189,7 +187,10 @@ class TaskStore:
                 run = TaskRun.from_dict(json.loads(row["data"]))
                 if run.status != "running":
                     continue
-                run.status = "error"
+                shared_status = runtime_status(run.session_id) if runtime_status else None
+                if shared_status == "waiting_approval":
+                    continue
+                run.status = "interrupted"
                 run.error = run.error or reason
                 run.finished_at = finished_at
                 self._conn.execute(
@@ -203,7 +204,7 @@ class TaskStore:
                     task = ScheduledTask.from_dict(json.loads(task_row["data"]))
                     task.run_count += 1
                     task.last_run = run.finished_at
-                    task.last_status = "error"
+                    task.last_status = "interrupted"
                     task.updated_at = finished_at
                     task.next_run = compute_next_run(task) if task.enabled else None
                     self._conn.execute(

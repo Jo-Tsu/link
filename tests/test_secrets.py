@@ -85,3 +85,34 @@ def test_delete(tmp_path):
     assert store.delete("x") is True
     assert store.delete("x") is False
     assert store.get("x") is None
+
+
+def test_system_backend_uses_credential_store_and_migrates_file(tmp_path, monkeypatch):
+    credentials = {}
+
+    class Backend:
+        priority = 1
+
+    monkeypatch.setenv("SMALLINK_SECRET_BACKEND", "system")
+    monkeypatch.setattr("keyring.get_keyring", lambda: Backend())
+    monkeypatch.setattr(
+        "keyring.get_password",
+        lambda service, profile: credentials.get((service, profile)),
+    )
+    monkeypatch.setattr(
+        "keyring.set_password",
+        lambda service, profile, value: credentials.__setitem__((service, profile), value),
+    )
+    monkeypatch.setattr(
+        "keyring.delete_password",
+        lambda service, profile: credentials.pop((service, profile), None),
+    )
+    path = tmp_path / "secrets.json"
+    path.write_text('{"provider:openai":{"type":"api_key","api_key":"secret"}}')
+
+    store = SecretStore(path)
+
+    assert store.backend == "system"
+    assert not path.exists()
+    assert store.get("provider:openai")["api_key"] == "secret"
+    assert store.index_path.exists()

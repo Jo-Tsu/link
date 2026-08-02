@@ -17,6 +17,7 @@ import { InboxConfigure } from "./InboxConfigure";
 import { PanelHead } from "./IntegrationsView";
 import { shortPersonaName } from "../personaScope";
 import { useI18n } from "../i18n";
+import { InlineFeedback, PageState } from "./AsyncFeedback";
 
 const ICON_FOR: Record<string, "diamond" | "chat" | "code"> = {
   link: "diamond",
@@ -67,18 +68,36 @@ export function InboxView({
   const [unroutedCount, setUnroutedCount] = useState(0);
   const [kind, setKind] = useState<string>("all");
   const [personaFilter, setPersonaFilter] = useState<string>("all");
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState("");
+  const [routingError, setRoutingError] = useState("");
 
   const load = () => {
-    getInbox(undefined, "pending").then(setItems).catch(() => {});
-    getUnrouted().then((u) => setUnroutedCount(u.length)).catch(() => setUnroutedCount(0));
+    setLoadError("");
+    Promise.all([
+      getInbox(undefined, "pending").then(setItems),
+      getUnrouted().then((u) => setUnroutedCount(u.length)),
+    ])
+      .catch((reason) => {
+        setLoadError(reason instanceof Error ? reason.message : tr("Could not load Inbox"));
+      })
+      .finally(() => setLoading(false));
   };
-  const loadRouting = () =>
+  const loadRouting = () => {
+    setRoutingError("");
+    return (
     getInboxRouting()
       .then((bindings) => {
         const bound = bindings.find((b) => b.channel);
         setRouting(bound ? `${bound.channel}:${bound.target}` : null);
       })
-      .catch(() => setRouting(null));
+      .catch((reason) => {
+        setRoutingError(
+          reason instanceof Error ? reason.message : tr("Could not load Inbox routing"),
+        );
+      })
+    );
+  };
   useEffect(() => {
     load();
     loadRouting();
@@ -142,6 +161,36 @@ export function InboxView({
   const routingName = routing ? recent.find((c) => c.channel === routing)?.name : undefined;
   const routingLabel = routingName ? `#${routingName}` : routing;
 
+  if (loading) {
+    return (
+      <main className="flex-1 min-w-0 flex bg-paper">
+        <div className="max-w-4xl mx-auto w-full px-7 py-6">
+          <PageState
+            icon="inbox"
+            title={tr("Loading Inbox…")}
+            body={tr("Reading pending approvals, questions, and notifications.")}
+          />
+        </div>
+      </main>
+    );
+  }
+
+  if (loadError && items.length === 0) {
+    return (
+      <main className="flex-1 min-w-0 flex bg-paper">
+        <div className="max-w-4xl mx-auto w-full px-7 py-6">
+          <PageState
+            icon="inbox"
+            title={tr("Inbox is unavailable")}
+            body={loadError}
+            action={tr("Try again")}
+            onAction={load}
+          />
+        </div>
+      </main>
+    );
+  }
+
   return (
     <main className="flex-1 min-w-0 flex bg-paper">
       <div className="flex-1 min-w-0 overflow-y-auto hairline-scroll">
@@ -183,6 +232,20 @@ export function InboxView({
               )}
             </button>
           </div>
+          {(loadError || routingError) && (
+            <div className="mb-4">
+              <InlineFeedback
+                tone="warning"
+                title={tr("Inbox status may be out of date")}
+                body={[loadError, routingError].filter(Boolean).join(" · ")}
+                action={tr("Retry")}
+                onAction={() => {
+                  load();
+                  void loadRouting();
+                }}
+              />
+            </div>
+          )}
 
           {tab === "configure" ? (
             <InboxConfigure />

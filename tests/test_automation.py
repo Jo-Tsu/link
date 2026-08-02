@@ -374,9 +374,9 @@ def test_automation_store_recovers_runs_left_active_by_restart(tmp_path):
 
     assert store.recover_incomplete_runs() == 1
     recovered = store.find_run(run.run_id)
-    assert recovered.status == "error"
+    assert recovered.status == "interrupted"
     assert "restarted" in recovered.error
-    assert store.get(task.id).last_status == "error"
+    assert store.get(task.id).last_status == "interrupted"
 
 
 # -- REST ----------------------------------------------------------------------

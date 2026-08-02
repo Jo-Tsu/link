@@ -13,6 +13,7 @@ import {
 import { Icon } from "./Icon";
 import { PanelHead } from "./IntegrationsView";
 import { AutomationQuickstart } from "./AutomationQuickstart";
+import { InlineFeedback, PageState } from "./AsyncFeedback";
 import { useI18n, type TranslationParams } from "../i18n";
 
 // Shared utility strings (the §28 page shell — mirrors IntegrationsView's constants).
@@ -83,6 +84,8 @@ export function ScheduledView({ onOpenRun, onRunNow, onOpenConnectors, initialOp
   const [showForm, setShowForm] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState("");
 
   // The sidebar's Scheduled band can retarget an ALREADY-open Automations surface —
   // initial state alone would ignore the change (UX-023).
@@ -90,7 +93,17 @@ export function ScheduledView({ onOpenRun, onRunNow, onOpenConnectors, initialOp
     if (initialOpenId) setOpenId(initialOpenId);
   }, [initialOpenId]);
 
-  const refresh = () => getAutomations().then(setTasks).catch(() => setTasks([]));
+  const refresh = () => {
+    setLoadError("");
+    return getAutomations()
+      .then(setTasks)
+      .catch((reason) => {
+        setLoadError(
+          reason instanceof Error ? reason.message : tr("Could not load automations"),
+        );
+      })
+      .finally(() => setLoading(false));
+  };
   useEffect(() => {
     refresh();
     const h = setInterval(refresh, 5000);
@@ -135,11 +148,37 @@ export function ScheduledView({ onOpenRun, onRunNow, onOpenConnectors, initialOp
 
   const empty = tasks.length === 0;
 
+  if (loading) {
+    return (
+      <Shell>
+        <PageState
+          icon="clock"
+          title={tr("Loading automations…")}
+          body={tr("Reading schedules and recent run history.")}
+        />
+      </Shell>
+    );
+  }
+
+  if (loadError && tasks.length === 0) {
+    return (
+      <Shell>
+        <PageState
+          icon="clock"
+          title={tr("Automations are unavailable")}
+          body={loadError}
+          action={tr("Try again")}
+          onAction={() => void refresh()}
+        />
+      </Shell>
+    );
+  }
+
   return (
     <Shell>
       <div className="flex items-start gap-3">
         <div className="flex-1 min-w-0">
-          <PanelHead title={tr("Automations")} sub={tr("Recurring tasks Link runs on a schedule.")} />
+          <PanelHead title={tr("Automations")} sub={tr("Recurring tasks Smallink runs on a schedule.")} />
         </div>
         <button
           className="inline-flex items-center gap-1.5 text-[12.5px] px-3 py-1.5 rounded-lg border border-lineStrong bg-panel hover:border-accent hover:text-accent shrink-0"
@@ -152,13 +191,24 @@ export function ScheduledView({ onOpenRun, onRunNow, onOpenConnectors, initialOp
       <div className="text-[12px] text-faint flex gap-1.5 mb-4">
         <span aria-hidden>ⓘ</span>
         <span>
-          {tr("Link needs to be running when a task is due. If this Mac was asleep, the task catches up once after Link starts again.")}
+          {tr("Smallink needs to be running when a task is due. If this Mac was asleep, the task catches up once after Smallink starts again.")}
         </span>
       </div>
 
       {error && (
         <div className="mb-4 rounded-lg border border-danger/30 bg-dangerSoft px-3 py-2 text-[12.5px] text-danger" role="alert">
           {error}
+        </div>
+      )}
+      {loadError && (
+        <div className="mb-4">
+          <InlineFeedback
+            tone="warning"
+            title={tr("Automation status may be out of date")}
+            body={loadError}
+            action={tr("Retry")}
+            onAction={() => void refresh()}
+          />
         </div>
       )}
 
@@ -183,7 +233,7 @@ export function ScheduledView({ onOpenRun, onRunNow, onOpenConnectors, initialOp
       {empty ? (
         !showForm && (
           <div className={CARD + " p-4 text-[12.5px] text-muted"}>
-            {tr("No scheduled tasks yet — choose a template above, create one manually, or ask Link in a conversation.")}
+            {tr("No scheduled tasks yet — choose a template above, create one manually, or ask Smallink in a conversation.")}
           </div>
         )
       ) : (

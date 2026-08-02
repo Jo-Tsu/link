@@ -61,7 +61,7 @@ export async function pickFolder(): Promise<string | null> {
  * owner report 2026-07-04: "Browse" was desktop-only and the browser had paste-a-path only). */
 export async function chooseFolder(): Promise<string | null> {
   if (isTauri()) return pickFolder();
-  const { pickFolderViaServer } = await import("./api");
+  const { pickFolderViaServer } = await import("./localPickerApi");
   return pickFolderViaServer();
 }
 
@@ -71,7 +71,7 @@ export async function chooseSkillArchive(): Promise<string | null> {
     const path = await invoke<string>("pick_skill_archive");
     return typeof path === "string" && path ? path : null;
   }
-  const { pickSkillArchiveViaServer } = await import("./api");
+  const { pickSkillArchiveViaServer } = await import("./localPickerApi");
   return pickSkillArchiveViaServer();
 }
 

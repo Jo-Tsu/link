@@ -63,7 +63,7 @@ class TurnEngine:
         model_settings: Optional[dict[str, Any]] = None,
         messages: Optional[list[dict[str, Any]]] = None,
         audit_sink: Optional[Callable[[dict[str, Any]], None]] = None,
-        context_provider: Optional[Callable[[], str]] = None,
+        context_provider: Optional[Callable[..., str]] = None,
         directory_requester: Optional[
             Callable[[dict[str, Any]], "Awaitable[dict[str, Any]]"]
         ] = None,
@@ -154,7 +154,11 @@ class TurnEngine:
 
     # -- main loop --------------------------------------------------------------
     async def run(
-        self, user_input: "str | list", *, source: Optional[dict[str, Any]] = None
+        self,
+        user_input: "str | list",
+        *,
+        source: Optional[dict[str, Any]] = None,
+        client_message_id: Optional[str] = None,
     ) -> AsyncIterator[Event]:
         # `user_input` is a string, or OpenAI content-parts (text + image_url) for attachments.
         # `source` (a MessageSource dict) is a display-only sidecar for connector messages: it
@@ -168,6 +172,8 @@ class TurnEngine:
         }
         if source is not None:
             message["source"] = source
+        if client_message_id:
+            message["client_message_id"] = client_message_id
         self.messages.append(message)
         self._cancel.clear()
         data: dict[str, Any] = {"input": user_input}
@@ -889,7 +895,7 @@ class TurnEngine:
         # (e.g. filter-hidden counts), `ts` (append-time timestamps), and `reasoning`
         # (thinking text) — copying only messages that carry one. Whole `notice` messages
         # (error/interrupted/model-switch markers) are display-only too: dropped entirely.
-        _SIDECARS = ("source", "_display", "ts", "reasoning")
+        _SIDECARS = ("source", "_display", "ts", "reasoning", "client_message_id")
         out = [
             (
                 {k: v for k, v in msg.items() if k not in _SIDECARS}
@@ -960,9 +966,14 @@ class TurnEngine:
                     for msg in out
                 ]
 
-        context = (
-            self.context_provider() if self.context_provider is not None else ""
-        ) or ""
+        if self.context_provider is None:
+            context = ""
+        else:
+            try:
+                context = self.context_provider(self.messages)
+            except TypeError:
+                context = self.context_provider()
+        context = context or ""
         if not context:
             return out
         block = f"\n\n<system-context>\n{context}\n</system-context>"

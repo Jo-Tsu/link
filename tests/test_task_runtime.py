@@ -97,7 +97,7 @@ def test_runtime_store_links_child_agent_to_root(tmp_path):
     assert set(collaborations[0]["agent_roles"]) == {"link", "explorer"}
 
 
-def test_runtime_store_recovers_runs_left_active_by_restart(tmp_path):
+def test_runtime_store_cancels_running_but_preserves_waiting_approval(tmp_path):
     store = SQLiteTaskRuntimeStore(tmp_path / "link.db")
     task_run, root = store.start_root_run(
         session_id="session-restart",
@@ -114,12 +114,18 @@ def test_runtime_store_recovers_runs_left_active_by_restart(tmp_path):
         model="gpt-test",
         input_value="inspect",
     )
+    store.append_event(
+        root.agent_run_id, "permission_required", {"tool": "write_file"}
+    )
 
-    assert store.recover_incomplete_runs() == 2
-    assert store.get_task_run(task_run.task_run_id).status == "failed"
-    assert store.get_agent_run(root.agent_run_id).status == "failed"
-    assert store.get_agent_run(child.agent_run_id).status == "failed"
-    assert store.get_task_by_session("session-restart").status == "failed"
+    assert store.recover_incomplete_runs() == 1
+    assert store.get_task_run(task_run.task_run_id).status == "waiting_approval"
+    assert store.get_agent_run(root.agent_run_id).status == "waiting_approval"
+    assert store.get_agent_run(child.agent_run_id).status == "cancelled"
+    assert store.get_task_by_session("session-restart").status == "waiting_approval"
+    resumed = store.resume_waiting_root("session-restart")
+    assert resumed is not None and resumed.agent_run_id == root.agent_run_id
+    assert store.get_task_run(task_run.task_run_id).status == "running"
 
 
 async def test_tracked_runtime_omits_streaming_token_deltas(tmp_path):

@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-import sqlite3
 import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+from ..sqlite import connect_sqlite
 from .models import SensoryRecord
 
 
@@ -32,8 +32,7 @@ class SQLiteSensoryStore:
         if self.path != ":memory:":
             Path(self.path).expanduser().parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
-        self._conn = sqlite3.connect(self.path, check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
+        self._conn = connect_sqlite(self.path)
         self._conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS sensory_records (
@@ -52,6 +51,11 @@ class SQLiteSensoryStore:
                 content_hash TEXT NOT NULL,
                 sensitivity TEXT NOT NULL DEFAULT 'unknown',
                 governance_status TEXT NOT NULL DEFAULT 'pending',
+                governance_task_id TEXT,
+                governance_attempts INTEGER NOT NULL DEFAULT 0,
+                governance_claimed_at TEXT,
+                governance_processed_at TEXT,
+                governance_error TEXT,
                 metadata_json TEXT NOT NULL DEFAULT '{}',
                 source_locator TEXT,
                 UNIQUE(source_type, external_id, content_hash)
@@ -66,6 +70,17 @@ class SQLiteSensoryStore:
                 ON sensory_records(source_type, occurred_at DESC);
             """
         )
+        for ddl in (
+            "ALTER TABLE sensory_records ADD COLUMN governance_task_id TEXT",
+            "ALTER TABLE sensory_records ADD COLUMN governance_attempts INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE sensory_records ADD COLUMN governance_claimed_at TEXT",
+            "ALTER TABLE sensory_records ADD COLUMN governance_processed_at TEXT",
+            "ALTER TABLE sensory_records ADD COLUMN governance_error TEXT",
+        ):
+            try:
+                self._conn.execute(ddl)
+            except Exception:
+                pass
         self._conn.commit()
 
     def add(
@@ -149,6 +164,7 @@ class SQLiteSensoryStore:
         source_type: Optional[str] = None,
         governance_status: Optional[str] = None,
         conversation_id: Optional[str] = None,
+        query: Optional[str] = None,
     ) -> list[SensoryRecord]:
         clauses: list[str] = []
         params: list[Any] = []
@@ -161,6 +177,20 @@ class SQLiteSensoryStore:
                 clauses.append(f"{column}=?")
                 params.append(value)
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        if query:
+            search = f"%{query.strip().lower()}%"
+            clauses.append(
+                """
+                (
+                    LOWER(raw_content) LIKE ? OR LOWER(normalized_content) LIKE ?
+                    OR LOWER(COALESCE(project_path, '')) LIKE ?
+                    OR LOWER(COALESCE(conversation_id, '')) LIKE ?
+                    OR LOWER(external_id) LIKE ? OR LOWER(source_type) LIKE ?
+                )
+                """
+            )
+            params.extend([search] * 6)
+            where = " WHERE " + " AND ".join(clauses)
         params.extend([max(1, min(int(limit), 500)), max(0, int(offset))])
         with self._lock:
             rows = self._conn.execute(
@@ -175,6 +205,7 @@ class SQLiteSensoryStore:
         source_type: Optional[str] = None,
         governance_status: Optional[str] = None,
         conversation_id: Optional[str] = None,
+        query: Optional[str] = None,
     ) -> int:
         clauses: list[str] = []
         params: list[Any] = []
@@ -186,6 +217,19 @@ class SQLiteSensoryStore:
             if value:
                 clauses.append(f"{column}=?")
                 params.append(value)
+        if query:
+            search = f"%{query.strip().lower()}%"
+            clauses.append(
+                """
+                (
+                    LOWER(raw_content) LIKE ? OR LOWER(normalized_content) LIKE ?
+                    OR LOWER(COALESCE(project_path, '')) LIKE ?
+                    OR LOWER(COALESCE(conversation_id, '')) LIKE ?
+                    OR LOWER(external_id) LIKE ? OR LOWER(source_type) LIKE ?
+                )
+                """
+            )
+            params.extend([search] * 6)
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
         with self._lock:
             row = self._conn.execute(
@@ -211,8 +255,129 @@ class SQLiteSensoryStore:
             }
         return {"total": total, "pending": pending, "sources": sources}
 
+    def claim_for_governance(
+        self,
+        task_id: str,
+        *,
+        record_ids: Optional[list[str]] = None,
+        limit: int = 50,
+        retry_failed: bool = False,
+    ) -> list[SensoryRecord]:
+        statuses = ["pending", *(["failed"] if retry_failed else [])]
+        placeholders = ",".join("?" for _ in statuses)
+        clauses = [f"governance_status IN ({placeholders})"]
+        params: list[Any] = list(statuses)
+        if record_ids:
+            ids = list(dict.fromkeys(str(record_id) for record_id in record_ids if record_id))
+            if not ids:
+                return []
+            clauses.append("record_id IN (" + ",".join("?" for _ in ids) + ")")
+            params.extend(ids)
+        query = (
+            "SELECT record_id FROM sensory_records WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY occurred_at, record_id LIMIT ?"
+        )
+        params.append(max(1, min(int(limit), 500)))
+        now = _now()
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                rows = self._conn.execute(query, params).fetchall()
+                ids = [str(row["record_id"]) for row in rows]
+                if ids:
+                    self._conn.execute(
+                        """
+                        UPDATE sensory_records
+                        SET governance_status='processing', governance_task_id=?,
+                            governance_claimed_at=?, governance_error=NULL
+                        WHERE record_id IN ("""
+                        + ",".join("?" for _ in ids)
+                        + ")",
+                        [task_id, now, *ids],
+                    )
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+            if not ids:
+                return []
+            claimed = self._conn.execute(
+                "SELECT * FROM sensory_records WHERE record_id IN ("
+                + ",".join("?" for _ in ids)
+                + ") ORDER BY occurred_at, record_id",
+                ids,
+            ).fetchall()
+        return [self._record(row) for row in claimed]
+
+    def finish_governance(
+        self,
+        record_id: str,
+        task_id: str,
+        status: str,
+        *,
+        error: Optional[str] = None,
+    ) -> bool:
+        if status not in {"processed", "skipped", "failed"}:
+            raise ValueError("invalid governance status")
+        with self._lock:
+            cursor = self._conn.execute(
+                """
+                UPDATE sensory_records
+                SET governance_status=?, governance_attempts=governance_attempts+1,
+                    governance_processed_at=?, governance_error=?
+                WHERE record_id=? AND governance_task_id=? AND governance_status='processing'
+                """,
+                (status, _now(), error, record_id, task_id),
+            )
+            self._conn.commit()
+        return cursor.rowcount > 0
+
+    def release_governance_task(self, task_id: str) -> int:
+        with self._lock:
+            cursor = self._conn.execute(
+                """
+                UPDATE sensory_records
+                SET governance_status='pending', governance_task_id=NULL,
+                    governance_claimed_at=NULL
+                WHERE governance_task_id=? AND governance_status='processing'
+                """,
+                (task_id,),
+            )
+            self._conn.commit()
+        return int(cursor.rowcount)
+
+    def delete(
+        self,
+        *,
+        record_ids: Optional[list[str]] = None,
+        source_type: Optional[str] = None,
+        before: Optional[str] = None,
+    ) -> int:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if record_ids:
+            ids = list(dict.fromkeys(str(record_id) for record_id in record_ids if record_id))
+            if ids:
+                clauses.append("record_id IN (" + ",".join("?" for _ in ids) + ")")
+                params.extend(ids)
+        if source_type:
+            clauses.append("source_type=?")
+            params.append(source_type)
+        if before:
+            clauses.append("occurred_at<?")
+            params.append(before)
+        if not clauses:
+            raise ValueError("a record, source, or time boundary is required")
+        with self._lock:
+            cursor = self._conn.execute(
+                "DELETE FROM sensory_records WHERE " + " AND ".join(clauses), params
+            )
+            self._conn.commit()
+        return int(cursor.rowcount)
+
     @staticmethod
-    def _record(row: sqlite3.Row) -> SensoryRecord:
+    def _record(row) -> SensoryRecord:
         return SensoryRecord(
             record_id=row["record_id"],
             source_type=row["source_type"],
