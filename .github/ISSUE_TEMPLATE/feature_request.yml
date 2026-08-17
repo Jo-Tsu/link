@@ -1,5 +1,5 @@
 name: Feature request
-description: Propose a connector or product capability grounded in a real workflow
+description: Propose a Smallink capability grounded in a real workflow
 title: "[Feature]: "
 labels:
   - enhancement
@@ -7,7 +7,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Link is building the data intake foundation first. A strong proposal explains the user problem, source boundary, and observable result before suggesting implementation details.
+        A strong proposal explains the user problem, capability boundary, source data, permissions, and observable result before suggesting implementation details.
   - type: textarea
     id: problem
     attributes:
@@ -27,19 +27,20 @@ body:
     attributes:
       label: Product area
       options:
-        - New connector
-        - LinkAgent desktop experience
-        - Raw data browsing
-        - Web crawler
-        - Deployment and operations
+        - Agent and multi-agent collaboration
+        - Memory and data governance
+        - New application or connector
+        - Desktop interaction
+        - Automation and run center
+        - Model provider and tools
         - Developer experience
     validations:
       required: true
   - type: textarea
     id: source
     attributes:
-      label: Source and authorization boundary
-      description: For connector ideas, explain where the data lives and what the user should authorize.
+      label: Data source and authorization boundary
+      description: Explain where the data lives, what Smallink should access, and what the user should authorize.
   - type: textarea
     id: evidence
     attributes:

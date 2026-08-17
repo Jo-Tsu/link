@@ -1,0 +1,196 @@
+"""Small CLI to exercise connectors independently.
+
+python -m link.connectors.cli status
+    Show which platforms are configured (token present) + allowlist size.
+
+python -m link.connectors.cli fake [--user U1] [--allow U1]
+    Offline REPL: type messages as if they arrived from a platform; a built-in echo
+    handler replies through the gateway. Exercises auth + inbound dispatch + outbound
+    with no network. Try --user with someone NOT in --allow to see it dropped.
+
+python -m link.connectors.cli send --target telegram:12345 --text "hi"
+    Live outbound via the send_message tool (needs a bot token in the SecretStore).
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import sys
+
+from ..secrets import SecretStore
+from .base import MessageEvent
+from .config import ConnectorSettings, load_settings
+from .fake import FakeAdapter
+from .gateway import Gateway
+from .tools import make_send_message_tool
+
+
+def _cmd_status() -> int:
+    settings = load_settings(SecretStore())
+    print("Connector status:")
+    for platform, s in settings.items():
+        print(
+            f"  {platform:10s} enabled={s.enabled}  allow_all={s.allow_all}  "
+            f"allowed_users={len(s.allowed_users)}"
+        )
+    return 0
+
+
+async def _run_fake(user: str, allow: list[str]) -> int:
+    fake = FakeAdapter()
+    settings = {
+        "fake": ConnectorSettings(
+            platform="fake", enabled=True, allowed_users=set(allow), allow_all=not allow
+        )
+    }
+    gateway = Gateway(settings=settings)
+
+    async def echo_handler(event: MessageEvent) -> None:
+        reply = f"echo: {event.text}"
+        await gateway.deliver(event.source.target, reply)
+        print(f"  ↩ sent to {event.source.target}: {reply!r}")
+
+    gateway.set_handler(echo_handler)
+    gateway.register(fake)
+    await gateway.start()
+    print(f"fake gateway up (user={user}, allow={allow or '∗ all'}). Ctrl-D to quit.\n")
+
+    while True:
+        try:
+            text = await asyncio.to_thread(input, "you> ")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        text = text.strip()
+        if not text:
+            continue
+        before = len(fake.outbox)
+        await fake.inject(text, user_id=user, user_name=user)
+        if len(fake.outbox) == before:
+            print("  ⨯ dropped (not authorized)")
+    await gateway.stop()
+    return 0
+
+
+def _cmd_send(target: str, text: str) -> int:
+    tool = make_send_message_tool(SecretStore())
+    result = tool(target=target, text=text)
+    print(result)
+    return 0 if result.get("ok") else 1
+
+
+def _cmd_sync_local_source(
+    source: str, limit: int | None, folder: str | None, reconnect: bool
+) -> int:
+    """Connect, authorize and import a local rollout conversation source.
+
+    Flow: if no folder is already granted (or --reconnect), open the native folder picker so the
+    user grants access to its home directory. The chosen path is persisted in the connector
+    profile, then user-owned sessions are imported into sensory_records.
+    Standalone — builds a SessionManager against the default state dir, no running server needed.
+    """
+    from ..server import SessionManager
+    from .setup import connect_connector
+
+    manager = SessionManager()
+    profile = manager.secrets.get(f"{source}:default") or {}
+    granted = profile.get("sessions_path")
+    title = "Codex" if source == "codex" else "TRAE CLI"
+    default_folder = "~/.codex" if source == "codex" else "~/.trae"
+
+    if reconnect or not granted:
+        picked = folder
+        if not picked:
+            print(f"Opening folder picker — choose your {default_folder} folder to grant access…")
+            result = manager.pick_native_folder()
+            if not result.get("ok") or not result.get("path"):
+                print(
+                    f"No folder chosen — aborting. "
+                    f"(Pass --folder {default_folder} to skip the dialog.)"
+                )
+                return 1
+            picked = result["path"]
+        conn = connect_connector(manager.secrets, source, {"sessions_path": picked})
+        if not conn.get("ok"):
+            print(f"Could not connect {title}: {conn.get('error')}")
+            return 1
+        print(f"Connected {title} folder: {conn.get('sessions_path')}")
+
+    sync = manager.sync_codex if source == "codex" else manager.sync_traex
+    result = sync(limit_sessions=limit)
+    print(
+        f"{title} import: read {result['sessions_read']} sessions, "
+        f"saw {result['turns_seen']} turns, "
+        f"ingested {result['records_ingested']} new records."
+    )
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="link-connectors")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("status")
+
+    p_fake = sub.add_parser("fake")
+    p_fake.add_argument("--user", default="u1")
+    p_fake.add_argument(
+        "--allow", action="append", default=[], help="authorized user id (repeatable)"
+    )
+
+    p_send = sub.add_parser("send")
+    p_send.add_argument("--target", required=True)
+    p_send.add_argument("--text", required=True)
+
+    p_codex = sub.add_parser(
+        "sync-codex",
+        help="authorize a Codex folder, connect it, and import local sessions",
+    )
+    p_codex.add_argument(
+        "--limit", type=int, default=None, help="max newest sessions to read (default: all)"
+    )
+    p_codex.add_argument(
+        "--folder",
+        default=None,
+        help="Codex home or sessions folder; omit to open the native folder picker",
+    )
+    p_codex.add_argument(
+        "--reconnect",
+        action="store_true",
+        help="ask for folder authorization again even when a path is already connected",
+    )
+    p_traex = sub.add_parser(
+        "sync-traex",
+        help="authorize a TRAE folder, connect it, and import local user sessions",
+    )
+    p_traex.add_argument(
+        "--limit", type=int, default=None, help="max newest user sessions to read (default: all)"
+    )
+    p_traex.add_argument(
+        "--folder",
+        default=None,
+        help="TRAE home, cli, or sessions folder; omit to open the native folder picker",
+    )
+    p_traex.add_argument(
+        "--reconnect",
+        action="store_true",
+        help="ask for folder authorization again even when a path is already connected",
+    )
+
+    args = parser.parse_args(argv)
+    if args.cmd == "status":
+        return _cmd_status()
+    if args.cmd == "fake":
+        return asyncio.run(_run_fake(args.user, args.allow))
+    if args.cmd == "send":
+        return _cmd_send(args.target, args.text)
+    if args.cmd == "sync-codex":
+        return _cmd_sync_local_source("codex", args.limit, args.folder, args.reconnect)
+    if args.cmd == "sync-traex":
+        return _cmd_sync_local_source("traex", args.limit, args.folder, args.reconnect)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

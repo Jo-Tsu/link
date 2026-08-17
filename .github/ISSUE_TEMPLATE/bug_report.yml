@@ -1,5 +1,5 @@
 name: Bug report
-description: Report a reproducible problem in Link or LinkAgent
+description: Report a reproducible problem in Smallink
 title: "[Bug]: "
 labels:
   - bug
@@ -7,17 +7,18 @@ body:
   - type: markdown
     attributes:
       value: |
-        Thanks for helping improve Link. Remove tokens, private paths, and raw conversation content before attaching logs or screenshots.
+        Thanks for helping improve Smallink. Remove tokens, private paths, and raw conversation content before attaching logs or screenshots.
   - type: dropdown
     id: component
     attributes:
       label: Component
       options:
-        - Link Web / platform API
-        - LinkAgent
-        - Codex connector
-        - Web crawler
-        - Docker / deployment
+        - macOS desktop client
+        - Local sidecar / API
+        - Agent runtime and tools
+        - Memory and data governance
+        - MineM application / connector
+        - Automation and run center
         - Documentation
     validations:
       required: true
@@ -25,7 +26,7 @@ body:
     id: version
     attributes:
       label: Version
-      placeholder: 0.2.1 Developer Preview or commit SHA
+      placeholder: App version or commit SHA
     validations:
       required: true
   - type: textarea
@@ -55,7 +56,7 @@ body:
     id: environment
     attributes:
       label: Environment
-      placeholder: macOS version, CPU architecture, Docker version, browser
+      placeholder: macOS version, CPU architecture, installation type
     validations:
       required: true
   - type: textarea

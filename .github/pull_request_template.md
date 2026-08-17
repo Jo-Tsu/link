@@ -8,10 +8,11 @@
 
 ## 验证
 
-- [ ] `npm run lint`
-- [ ] `npm run build`
-- [ ] LinkAgent 前端构建
-- [ ] LinkAgent Rust 测试
+- [ ] `pytest tests -q`
+- [ ] `npm --prefix surfaces/gui test`
+- [ ] `npm --prefix surfaces/gui run build`
+- [ ] `npm --prefix surfaces/gui run e2e`
+- [ ] `cargo check --manifest-path surfaces/gui/src-tauri/Cargo.toml`
 
 ## 数据与隐私
 
