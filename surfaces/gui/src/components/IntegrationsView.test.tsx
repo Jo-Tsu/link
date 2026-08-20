@@ -1,15 +1,13 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { getConnectors, type Connector } from "../api";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { LanguageProvider } from "../i18n";
 import { IntegrationsView } from "./IntegrationsView";
 
-vi.mock("../api", () => ({
-  getConnectors: vi.fn(),
-}));
-
 vi.mock("./connectors/ConnectorsSection", () => ({
-  ConnectorsSection: () => <div>Connector catalog</div>,
+  ConnectorsSection: ({ onCountChange }: { onCountChange?: (count: number) => void }) => {
+    if (onCountChange) setTimeout(() => onCountChange(1), 0);
+    return <div>Connector catalog</div>;
+  },
 }));
 
 vi.mock("./SkillHub", () => ({
@@ -19,10 +17,6 @@ vi.mock("./SkillHub", () => ({
 }));
 
 describe("IntegrationsView", () => {
-  beforeEach(() => {
-    vi.mocked(getConnectors).mockResolvedValue([]);
-  });
-
   afterEach(() => {
     cleanup();
     vi.clearAllMocks();
@@ -42,12 +36,6 @@ describe("IntegrationsView", () => {
   });
 
   it("counts only connectors exposed by the current product rollout", async () => {
-    vi.mocked(getConnectors).mockResolvedValue([
-      { name: "minem" },
-      { name: "browser" },
-      { name: "slack" },
-    ] as Connector[]);
-
     render(
       <LanguageProvider>
         <IntegrationsView workspace="/tmp/smallink-project" />

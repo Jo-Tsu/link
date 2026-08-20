@@ -2,6 +2,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   decideMemoryCandidate,
+  decideMemoryCandidates,
   getMemory,
   getMemoryCandidate,
   getMemoryCandidates,
@@ -18,6 +19,7 @@ vi.mock("../api", async () => {
   return {
     ...actual,
     decideMemoryCandidate: vi.fn(),
+    decideMemoryCandidates: vi.fn(),
     getMemory: vi.fn(),
     getMemoryCandidate: vi.fn(),
     getMemoryCandidates: vi.fn(),
@@ -43,6 +45,13 @@ beforeEach(() => {
   ]);
   vi.mocked(getMemoryCandidates).mockResolvedValue([]);
   vi.mocked(decideMemoryCandidate).mockResolvedValue({ ok: true, memory_id: 8 });
+  vi.mocked(decideMemoryCandidates).mockResolvedValue({
+    ok: true,
+    action: "accept",
+    requested: 1,
+    processed: [{ candidate_id: "candidate-42", memory_id: 8 }],
+    failed: [],
+  });
   vi.mocked(runMemoryPipeline).mockResolvedValue({
     task_id: "governance-1",
     status: "completed",
@@ -133,6 +142,39 @@ describe("MemoryView", () => {
     render(<LanguageProvider><MemoryView /></LanguageProvider>);
     await screen.findByText("Personal memory");
     expect(screen.queryByTestId("memory-pending-banner")).toBeNull();
+  });
+
+  it("accepts selected candidate memories in one batch", async () => {
+    const candidate = {
+      candidate_id: "candidate-42",
+      task_id: "governance-1",
+      scope: "global" as const,
+      content: "Keep product decisions concise.",
+      memory_type: "user_preference",
+      workspace: null,
+      session_id: null,
+      created_at: "2026-07-31T09:00:00Z",
+      updated_at: "2026-07-31T09:00:00Z",
+      status: "pending" as const,
+      confidence: 0.9,
+      model: "test",
+      prompt_version: "v2",
+      sources: ["sensory-abc"],
+    };
+    vi.mocked(getMemory).mockResolvedValue([]);
+    vi.mocked(getMemoryCandidates)
+      .mockResolvedValueOnce([candidate])
+      .mockResolvedValue([]);
+
+    render(<LanguageProvider><MemoryView /></LanguageProvider>);
+    fireEvent.click(await screen.findByTestId("memory-pending-banner"));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select all candidates" }));
+    fireEvent.click(screen.getByRole("button", { name: "Accept selected" }));
+
+    await waitFor(() => expect(decideMemoryCandidates).toHaveBeenCalledWith(
+      ["candidate-42"],
+      "accept",
+    ));
   });
 
   it("opens imported source data and shows record details", async () => {

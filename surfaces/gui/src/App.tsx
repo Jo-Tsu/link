@@ -985,6 +985,9 @@ export function App() {
       setArtifactCount(0);
       return;
     }
+    // The visible rail owns this read and reports the count back. Only fetch here when the rail is
+    // hidden, where the compact topbar affordance is the user's sole path to produced files.
+    if (!railHidden) return;
     const targetSessionId = sessionId;
     getArtifacts(targetSessionId)
       .then((artifacts) => {
@@ -993,7 +996,7 @@ export function App() {
       .catch(() => {
         if (activeSessionIdRef.current === targetSessionId) setArtifactCount(0);
       });
-  }, [agent, surface, sessionId, browserRefreshKey]);
+  }, [agent, surface, sessionId, browserRefreshKey, railHidden]);
 
   // Keep the active session's pending Inbox items fresh (answer-in-context card). Loads on session
   // change + after each turn, plus a slow poll so an unattended agent's new question surfaces.
@@ -1820,6 +1823,7 @@ export function App() {
             todo={todo}
             running={running}
             onPreviewChange={onArtifactPreview}
+            onArtifactCount={setArtifactCount}
             showArtifacts={agent === "link"}
             personaId={agent}
             projectScoped={isProjectScoped(personaOf(agent))}

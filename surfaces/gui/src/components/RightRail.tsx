@@ -47,6 +47,7 @@ interface Props {
   // Fires when a full artifact preview opens/closes, so the app can auto-collapse the left nav
   // to give the preview (PDF/webpage/sheet) more room (#3).
   onPreviewChange?: (open: boolean) => void;
+  onArtifactCount?: (count: number) => void;
   // §32: the rail is the ONE session panel for every non-chat persona. Artifacts stays
   // link-only (deliverables; code-family gets "Files" later — slot reserved); the Access
   // section (the former Session-settings drawer) renders for all.
@@ -68,6 +69,7 @@ export function RightRail({
   todo,
   running,
   onPreviewChange,
+  onArtifactCount,
   showArtifacts = true,
   personaId,
   projectScoped,
@@ -93,11 +95,17 @@ export function RightRail({
     const targetSessionId = sessionId;
     return getArtifacts(targetSessionId)
       .then((list) => {
-        if (artifactRequestRef.current === requestId) setArtifacts(list);
+        if (artifactRequestRef.current === requestId) {
+          setArtifacts(list);
+          onArtifactCount?.(list.length);
+        }
         return list;
       })
       .catch(() => {
-        if (artifactRequestRef.current === requestId) setArtifacts([]);
+        if (artifactRequestRef.current === requestId) {
+          setArtifacts([]);
+          onArtifactCount?.(0);
+        }
         return [];
       });
   };

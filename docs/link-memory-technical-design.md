@@ -1,28 +1,31 @@
-# Link 个人记忆模块技术方案
+# Smallink 个人记忆模块技术方案
 
-版本：1.0  
-更新日期：2026-07-26  
-关联文档：[Link 个人记忆模块 PRD](./link-memory-prd.md)、[Link 产品技术架构设计](./link-technical-design.md)
+版本：1.1
+更新日期：2026-08-20
+关联文档：[Smallink 个人记忆模块 PRD](./link-memory-prd.md)、[Smallink 产品技术架构设计](./link-technical-design.md)
 
 > **本文档分两部分**：第 0 章记录**当前已落地的实现**（SQLite 过渡版，代码事实）；第 1 章起是**目标架构**（Postgres + pgvector，尚未实现）。阅读时请先分清“已实现”与“目标”，不要把目标章节当作已上线能力。
 
-## 0. 当前已实现（SQLite 过渡实现，2026-08）
+## 0. 当前已实现（SQLite 过渡实现，2026-08-20）
 
-本期只建**记忆的数据层管道**，不接入 agent 运行时：正常对话上下文不变，记忆**不注入 prompt、不注册写工具、不进对话**。目标是打通“外部原始数据 → 不可变原始层 → 清洗·标记·分层 → 结构化记忆存储（pending）”这条链，为后续治理/确认/检索打基础。
+当前实现已经贯通从不可变原始数据到智能体读取正式记忆的完整闭环。AI 只生成候选，用户通过单条或批量决定把候选纳入正式记忆或忽略；只有 `active` 正式记忆会按作用域和相关性进入对话上下文。
 
-### 0.1 两段式数据流
+### 0.1 当前数据流
 
 ```text
 外部采集者（agent / 连接器 / 脚本）
-      │  POST /v1/sensory-records         ← 通用 ingest 端点（本期新增）
+      │  POST /v1/sensory-records
       ▼
 sensory_records（不可变原始层，内容哈希幂等，governance_status='pending'）
-      │  POST /v1/memory/pipeline/run     ← 手动触发，非定时
+      │  AI Provider 分析与治理任务领取
       ▼
-MemoryPipeline.process()  清洗(LLM提炼) → 标记(memory_type) → 分层(scope)
+governance_tasks + memory_candidates（类型、范围、理由、置信度、来源）
+      │  用户单条/批量接受、编辑、合并或忽略
       ▼
-memories（status='pending'，带 source_record_id 溯源 + memory_history 版本行）
-      ✗ 本期不注入 prompt   ✗ 本期无确认流   ✗ 本期不接 agent 工具
+memories（active）+ memory_history + memory_sources + memory_decisions
+      │  global / workspace / session 作用域过滤 + 关键词相关性 + 字符预算
+      ▼
+Agent Context（记录实际使用的记忆版本）
 ```
 
 ### 0.2 已实现清单（代码事实）
@@ -38,6 +41,9 @@ memories（status='pending'，带 source_record_id 溯源 + memory_history 版�
 | 幂等重跑 | `MemoryPipeline.select_unprocessed` | 已处理判定来自 `memories.source_record_id` 集合（不改原始层）；重跑不重复产出 |
 | pending 隔离不变量 | `MemoryStore.list(status="active")` 默认 | 默认只返回 active，pending 永不进 `agent.py` 注入、永不进 `GET /v1/memory` 确认视图；`?status=pending` / `?status=all` 仅用于查验 |
 | 管道触发 | `POST /v1/memory/pipeline/run`（`asyncio.to_thread` 卸载阻塞 LLM）→ `manager.run_memory_pipeline` | 手动触发；**本期无自动/定时调度** |
+| 治理任务与候选 | `governance_tasks`、`memory_candidates`、治理路由 | Provider 分析后生成独立候选，保留来源、理由、类型、作用域与置信度；失败可重试 |
+| 人工决定 | 单条 decision 路由与 `POST /v1/memory/candidates/batch/decision` | 支持单条或批量接受/忽略；批量返回成功项与部分失败；接受操作在事务中写正式记忆、来源、版本和决定 |
+| 对话检索注入 | `agent.py` context provider | 仅查询 active 记忆；按 global、当前 workspace、当前 session 隔离，再按关键词相关性和字符预算注入，并记录使用版本 |
 | Codex 本地数据源 | `codex` connector → `POST /v1/connectors/codex/sync` | 用户授权 `~/.codex` 后按会话轮次增量导入，写入 `source_type='codex'` |
 | TRAE CLI 本地数据源 | `traex` connector → `POST /v1/connectors/traex/sync` | 用户授权 `~/.trae` 后读取 `cli/sessions`；只导入用户主线程和已有 `task_complete` 的轮次，排除子智能体与运行中尾部，写入 `source_type='traex'` |
 
@@ -62,11 +68,11 @@ curl "localhost:<port>/v1/memory?status=pending" -H "X-Link-Token: $LINK_API_TOK
 # 4. 重跑幂等 → {processed_records:0, memories_created:0, fallbacks:0}
 ```
 
-测试覆盖：`tests/test_memory_pipeline.py`（typed 抽取 / 多事实 / 坏 JSON 兜底 / provider 异常兜底 / 幂等 / 空 facts）、`tests/test_sensory.py`（ingest 写入 / 幂等 / 缺字段 400）、`tests/test_memory.py`（迁移回填 active / pending 排除 / 版本历史）。
+测试覆盖：`tests/test_memory_pipeline.py`（typed 抽取 / 多事实 / 坏 JSON 兜底 / provider 异常兜底 / 幂等 / 空 facts）、`tests/test_sensory.py`（ingest 写入 / 幂等 / 缺字段 400）、`tests/test_memory.py`（迁移回填 active / pending 排除 / 版本历史 / 作用域检索）、`tests/test_server.py`（候选单条与批量决定、正式入库和部分失败）。
 
-### 0.4 本期明确未做（延后到目标架构）
+### 0.4 当前仍未完成
 
-自动/定时触发、近似记忆去重与合并（mem0 的 ADD/UPDATE/NONE 决策）、`pending → active` 人工确认流与确认 UI、agent 检索注入（`agent.py:253-260` 未改）、真正的本地文件连接器与外部采集 agent 程序本体、Postgres/pgvector/向量检索。ingest 契约已按 minem `local_app` 范式预留，供下一期填充具体连接器。
+自动/定时治理调度、批量调整候选类型、正式记忆归档恢复、冲突任务和提示词评估、通用本地文件/外部连接器、Postgres/pgvector 与向量/混合检索尚未完成。MineM 当前是可连接和启动的本地应用连接器，还不是完整的应用中心与素材工作台。
 
 ### 0.5 过渡实现与目标的映射
 
@@ -74,14 +80,14 @@ curl "localhost:<port>/v1/memory?status=pending" -H "X-Link-Token: $LINK_API_TOK
 |---|---|---|
 | §7.9 `memory.memories`（Postgres，版本表分离） | `memories` 表内联正文 + 加 status/source_record_id | 正文未拆版本表；无 project_space_id |
 | §7.10 `memory_versions` | `memory_history`（old/new/event 行） | 是变更留痕，非“当前版本指针 + 不可变版本”模型 |
-| §4/§8 governance 候选与治理任务 | 无独立候选表；管道直接产出 pending 记忆 | 治理任务/AI 分析/候选来源等表未建；pending 记忆临时充当“待确认”载体 |
-| §14 Context Builder 检索注入 | 未实现（本期不进 prompt） | 检索/混合评分/上下文预算全部延后 |
+| §4/§8 governance 候选与治理任务 | 已有独立治理任务、候选、来源和用户决定 | 自动调度、批量改类型、冲突任务和提示词评估未完成 |
+| §14 Context Builder 检索注入 | 已有作用域、关键词相关性、字符预算和使用记录 | 向量/混合评分、Token 级预算和效果反馈未完成 |
 
 ---
 
 ## 1. 技术结论（目标架构）
 
-Link 记忆模块采用 Postgres 重新实现，不迁移旧数据原型的半成品页面逻辑，也不直接使用执行内核中的简单 `MemoryStore`。
+Smallink 记忆模块的目标架构采用 Postgres 重新实现，不迁移旧数据原型的半成品页面逻辑，也不直接使用执行内核中的简单 `MemoryStore`。
 
 正式技术边界：
 

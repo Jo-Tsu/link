@@ -316,6 +316,11 @@ def build_engine(
                     scope=Scope.WORKSPACE,
                     workspace=str(ws),
                 )
+            if session_id:
+                remembered += memory_store.list(
+                    scope=Scope.SESSION,
+                    session_id=session_id,
+                )
             selected = select_memories(
                 remembered,
                 query_text(current_messages or messages or []),

@@ -15,7 +15,7 @@ test("source data generates candidates and accepted candidates become memory", a
   await expect(page.getByText("Candidate memory drafts")).toBeVisible();
   await page.getByText("Prefers concise product reports.").click();
   await expect(page.getByText("Candidate details")).toBeVisible();
-  await page.getByRole("button", { name: "Accept" }).click();
+  await page.getByRole("button", { name: "Accept", exact: true }).click();
   await expect(page.getByText("Personal memory")).toBeVisible();
   await expect(page.getByText("Confirmed memories").locator("..")).toContainText("1");
 });

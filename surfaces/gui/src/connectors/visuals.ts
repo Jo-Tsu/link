@@ -9,6 +9,7 @@
 
 import type { Connector } from "../api";
 import type { ConnectorVisual } from "./ConnectorIcon";
+import { resolveConnector } from "./registry";
 
 export type ConnectorMap = Record<string, Connector>;
 
@@ -22,6 +23,8 @@ export function indexConnectors(list: Connector[]): ConnectorMap {
 /** Title-case a bare ref when there's no descriptor to read a real title from. */
 export function humanize(ref: string): string {
   if (!ref) return "";
+  const resolved = resolveConnector(ref);
+  if (resolved.key !== "fallback") return resolved.entry.label;
   return ref.charAt(0).toUpperCase() + ref.slice(1);
 }
 

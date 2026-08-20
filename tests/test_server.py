@@ -11,6 +11,7 @@ from smallink.providers import (
     ProviderClient,
     ToolCall,
 )
+from smallink.memory import Scope
 from smallink.server import SessionManager, create_app
 from smallink.sessions import SessionRecord
 
@@ -71,6 +72,43 @@ def test_agents_and_memory_rest(tmp_path):
     assert blocked.json()["error"] == "governance_required"
     assert client.get("/v1/memory").json()["memory"] == []
     assert client.get("/v1/skills/not-a-real-skill").status_code == 404
+
+
+def test_memory_candidates_support_batch_accept_and_partial_failure(tmp_path):
+    manager = SessionManager(workspace=tmp_path, provider=ScriptedProvider([]))
+    task_id = manager.governance_store.create_task(
+        ["source-1", "source-2"], model="test", prompt_version="v1"
+    )
+    candidates = [
+        manager.governance_store.add_candidate(
+            task_id=task_id,
+            content=content,
+            memory_type="user_preference",
+            scope=Scope.GLOBAL,
+            workspace=None,
+            session_id=None,
+            model="test",
+            prompt_version="v1",
+            source_ids=[source_id],
+        )
+        for content, source_id in (("Uses pnpm", "source-1"), ("Prefers concise UI", "source-2"))
+    ]
+    client = TestClient(create_app(manager))
+
+    response = client.post(
+        "/v1/memory/candidates/batch/decision",
+        json={
+            "candidate_ids": [candidates[0].candidate_id, "missing", candidates[1].candidate_id],
+            "action": "accept",
+        },
+    )
+
+    assert response.status_code == 200
+    result = response.json()
+    assert result["ok"] is False
+    assert len(result["processed"]) == 2
+    assert result["failed"] == [{"candidate_id": "missing", "error": "candidate not found"}]
+    assert len(manager.memory_store.list()) == 2
 
 
 def test_skill_create_and_import_rest(tmp_path):

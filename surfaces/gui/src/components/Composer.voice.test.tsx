@@ -49,6 +49,18 @@ afterEach(() => {
 });
 
 describe("Composer voice input (§37)", () => {
+  it("keeps the draft when Enter is pressed while the session is disconnected", () => {
+    const onSend = vi.fn();
+    render(<Composer {...props({ connected: false, onSend })} />);
+
+    const box = screen.getByPlaceholderText(/Ask the agent/) as HTMLTextAreaElement;
+    fireEvent.change(box, { target: { value: "keep this draft" } });
+    fireEvent.keyDown(box, { key: "Enter", shiftKey: false });
+
+    expect(onSend).not.toHaveBeenCalled();
+    expect(box.value).toBe("keep this draft");
+  });
+
   it("renders no mic at all outside the desktop app", () => {
     delete (globalThis as any).__TAURI__;
     render(<Composer {...props()} />);

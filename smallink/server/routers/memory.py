@@ -80,6 +80,13 @@ def memory_router(manager: Any) -> APIRouter:
         wanted = None if status in (None, "", "all") else status
         return {"candidates": manager.memory_candidates(status=wanted)}
 
+    @router.post("/v1/memory/candidates/batch/decision")
+    def decide_memory_candidates(body: dict) -> Any:
+        try:
+            return manager.decide_memory_candidates(body or {})
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     @router.get("/v1/memory/candidates/{candidate_id}")
     def memory_candidate(candidate_id: str) -> Any:
         candidate = manager.memory_candidate(candidate_id)

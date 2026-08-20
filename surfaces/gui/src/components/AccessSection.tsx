@@ -36,6 +36,7 @@ import { ConnectSetup } from "./ManageTabs";
 import { RootRow } from "./RootRow";
 import { ChannelPicker } from "./SubscriptionsChip";
 import { Toggle } from "./Toggle";
+import { isConnectorVisible, visibleConnectors } from "./connectors/visibility";
 import { useI18n } from "../i18n";
 
 // A channel address's platform: "slack:C0123" → "slack"; a bare id or "#mention" defaults to
@@ -92,9 +93,10 @@ export function AccessSection({
   // The connector index feeds brand colors and gates the "Channels ·" links; refetch on every
   // expand so a single failed fetch at mount can't hide them for the session's whole lifetime.
   useEffect(() => {
+    if (!open) return;
     let live = true;
     getConnectors()
-      .then((list) => live && setByName(indexConnectors(list)))
+      .then((list) => live && setByName(indexConnectors(visibleConnectors(list))))
       .catch(() => {});
     return () => {
       live = false;
@@ -187,8 +189,8 @@ export function AccessSection({
     loadSubs();
   };
 
-  const connected = conns?.connected ?? [];
-  const recommended = conns?.recommended ?? [];
+  const connected = (conns?.connected ?? []).filter((item) => isConnectorVisible(item.connector));
+  const recommended = (conns?.recommended ?? []).filter((item) => isConnectorVisible(item.connector));
   const live = connected.filter((c) => c.enabled);
 
   // Catalog list: available, not already in the Connected list (those have toggles above).

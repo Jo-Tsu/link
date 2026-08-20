@@ -321,6 +321,40 @@ def test_build_code_engine_injects_memory(tmp_path):
         engine.executor.close()
 
 
+def test_build_engine_injects_only_the_active_sessions_memory(tmp_path):
+    from smallink.agent import build_code_engine
+
+    store = SQLiteMemoryStore(tmp_path / "mem.db")
+    store.add(
+        "Use the launch checklist for this conversation",
+        scope=Scope.SESSION,
+        session_id="active-session",
+    )
+    store.add(
+        "Use the private migration checklist",
+        scope=Scope.SESSION,
+        session_id="other-session",
+    )
+
+    engine = build_code_engine(
+        workspace=tmp_path,
+        provider=_StubProvider(),
+        memory_store=store,
+        session_id="active-session",
+    )
+    try:
+        context = engine.context_provider(
+            [
+                *engine.messages,
+                {"role": "user", "content": "Which checklist should I use?"},
+            ]
+        )
+        assert "launch checklist" in context
+        assert "private migration checklist" not in context
+    finally:
+        engine.executor.close()
+
+
 def test_memory_retrieval_is_relevant_and_budgeted(tmp_path):
     from smallink.memory import select_memories
 

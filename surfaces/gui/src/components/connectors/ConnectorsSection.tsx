@@ -1,10 +1,8 @@
 import { useEffect, useState } from "react";
 import {
   disconnectConnector,
-  getCloudStatus,
   getConnectorSyncStatus,
   getConnectors,
-  getSlackStatus,
   syncCodex,
   syncTraex,
   type CloudStatus,
@@ -57,25 +55,31 @@ const DETAIL_PAGES: Record<string, (p: DetailProps) => JSX.Element> = {
   hunter: (p) => <AccountsDetail {...p} />,
 };
 
-export function ConnectorsSection({ onOpenMemory }: { onOpenMemory?: () => void }) {
+export function ConnectorsSection({
+  onOpenMemory,
+  onCountChange,
+}: {
+  onOpenMemory?: () => void;
+  onCountChange?: (count: number) => void;
+}) {
   const { tr } = useI18n();
   const [detail, setDetail] = useState<string | null>(null);
   const [connectors, setConnectors] = useState<Connector[]>([]);
-  const [cloud, setCloud] = useState<CloudStatus | null>(null);
-  const [slack, setSlack] = useState<SlackStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
 
   const refresh = () => {
     setError("");
     getConnectors()
-      .then((rows) => setConnectors(visibleConnectors(rows)))
+      .then((rows) => {
+        const visible = visibleConnectors(rows);
+        setConnectors(visible);
+        onCountChange?.(visible.length);
+      })
       .catch((reason) => {
         setError(reason instanceof Error ? reason.message : tr("Could not load connectors"));
       })
       .finally(() => setLoading(false));
-    getCloudStatus().then(setCloud).catch(() => setCloud(null));
-    getSlackStatus().then(setSlack).catch(() => setSlack(null));
   };
   useEffect(() => {
     refresh();
@@ -124,14 +128,14 @@ export function ConnectorsSection({ onOpenMemory }: { onOpenMemory?: () => void 
         ) : !c.connected ? (
           /* Pre-connect page (§38). When a connect completes, the poll flips
              c.connected and this same route re-renders as the connected page. */
-          <AvailableDetail c={c} cloud={cloud} onChanged={refresh} />
+          <AvailableDetail c={c} cloud={null} onChanged={refresh} />
         ) : Page ? (
-          <Page c={c} cloud={cloud} slack={slack} onChanged={refresh} />
+          <Page c={c} cloud={null} slack={null} onChanged={refresh} />
         ) : (
           <GenericDetail
             c={c}
-            cloud={cloud}
-            slack={slack}
+            cloud={null}
+            slack={null}
             onChanged={refresh}
             onGone={() => setDetail(null)}
             onOpenMemory={onOpenMemory}
@@ -156,8 +160,8 @@ export function ConnectorsSection({ onOpenMemory }: { onOpenMemory?: () => void 
       )}
       <ConnectorsList
         connectors={connectors}
-        cloud={cloud}
-        slack={slack}
+        cloud={null}
+        slack={null}
         onOpen={setDetail}
         onChanged={refresh}
         onOpenMemory={onOpenMemory}

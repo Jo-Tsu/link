@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import {
   decideMemoryCandidate,
+  decideMemoryCandidates,
   deleteSensoryRecords,
   getMemory,
   getMemoryCandidate,
@@ -45,6 +46,12 @@ export function MemoryView() {
   const [selectedType, setSelectedType] = useState<MemoryType | null>(null);
   const [selectedMemory, setSelectedMemory] = useState<MemoryRecord | null>(null);
   const [selectedCandidate, setSelectedCandidate] = useState<MemoryCandidate | null>(null);
+  const [selectedCandidateIds, setSelectedCandidateIds] = useState<Set<string>>(new Set());
+  const [batchBusy, setBatchBusy] = useState(false);
+  const [batchFeedback, setBatchFeedback] = useState<{
+    tone: "success" | "warning";
+    body: string;
+  } | null>(null);
   const [sourceStats, setSourceStats] = useState<SensoryStats | null>(null);
   const [statsError, setStatsError] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -62,6 +69,10 @@ export function MemoryView() {
       const [active, awaiting] = await Promise.all([getMemory(), getMemoryCandidates()]);
       setMemories(active);
       setPending(awaiting);
+      const pendingIds = new Set(awaiting.map((candidate) => candidate.candidate_id));
+      setSelectedCandidateIds((current) =>
+        new Set([...current].filter((candidateId) => pendingIds.has(candidateId))),
+      );
       try {
         setSourceStats(await getSensoryStats());
         setStatsError(false);
@@ -91,6 +102,36 @@ export function MemoryView() {
     setSelectedType(null);
     setSelectedMemory(null);
     setSelectedCandidate(null);
+    setSelectedCandidateIds(new Set());
+    setBatchFeedback(null);
+  };
+
+  const decideSelected = async (action: "accept" | "ignore") => {
+    const candidateIds = [...selectedCandidateIds];
+    if (!candidateIds.length) return;
+    setBatchBusy(true);
+    setBatchFeedback(null);
+    try {
+      const result = await decideMemoryCandidates(candidateIds, action);
+      setSelectedCandidate(null);
+      setSelectedCandidateIds(new Set());
+      setBatchFeedback({
+        tone: result.failed.length ? "warning" : "success",
+        body: tr("Processed {processed} candidates; {failed} failed.", {
+          processed: result.processed.length,
+          failed: result.failed.length,
+        }),
+      });
+      const remaining = await load();
+      if (remaining?.length === 0) openHome();
+    } catch (reason) {
+      setBatchFeedback({
+        tone: "warning",
+        body: reason instanceof Error ? reason.message : tr("Could not save memory decisions"),
+      });
+    } finally {
+      setBatchBusy(false);
+    }
   };
 
   const generateCandidates = async (retryFailed = false) => {
@@ -172,6 +213,45 @@ export function MemoryView() {
               body={tr("Accept, edit, merge, or ignore each candidate. Only accepted memories are available to agents.")}
             />
           </div>
+          {batchFeedback && (
+            <div className="mb-4">
+              <InlineFeedback tone={batchFeedback.tone} title={tr("Batch decision")} body={batchFeedback.body} />
+            </div>
+          )}
+          {pending.length > 0 && (
+            <div className="mb-3 flex flex-wrap items-center gap-2 rounded-lg border border-line bg-panel px-3 py-2">
+              <label className="inline-flex items-center gap-2 text-[12px] text-muted">
+                <input
+                  type="checkbox"
+                  aria-label={tr("Select all candidates")}
+                  checked={selectedCandidateIds.size === pending.length}
+                  onChange={(event) => setSelectedCandidateIds(
+                    event.target.checked
+                      ? new Set(pending.map((candidate) => candidate.candidate_id))
+                      : new Set(),
+                  )}
+                />
+                {tr("{count} selected", { count: selectedCandidateIds.size })}
+              </label>
+              <span className="flex-1" />
+              <button
+                type="button"
+                disabled={batchBusy || selectedCandidateIds.size === 0}
+                onClick={() => void decideSelected("ignore")}
+                className="rounded-lg border border-line px-3 py-1.5 text-[12px] text-muted disabled:opacity-40"
+              >
+                {tr("Ignore selected")}
+              </button>
+              <button
+                type="button"
+                disabled={batchBusy || selectedCandidateIds.size === 0}
+                onClick={() => void decideSelected("accept")}
+                className="rounded-lg bg-accent px-3 py-1.5 text-[12px] text-onAccent disabled:opacity-40"
+              >
+                {tr(batchBusy ? "Processing…" : "Accept selected")}
+              </button>
+            </div>
+          )}
           <div className="grid grid-cols-1 min-[1080px]:grid-cols-[minmax(0,1fr)_360px] gap-4 items-start">
             <section className="border border-line rounded-lg bg-panel overflow-hidden min-w-0" data-testid="memory-pending-list">
               {pending.length === 0 ? (
@@ -180,23 +260,40 @@ export function MemoryView() {
                   <div className="text-[12px] text-muted mt-1">{tr("Extracted candidate memories will appear here.")}</div>
                 </div>
               ) : pending.map((item) => (
-                <button
+                <div
                   key={item.candidate_id}
-                  className={`w-full text-left px-4 py-3 border-b border-line last:border-b-0 hover:bg-paper/70 ${
+                  className={`flex items-start border-b border-line last:border-b-0 hover:bg-paper/70 ${
                     selectedCandidate?.candidate_id === item.candidate_id ? "bg-accentSoft/35" : ""
                   }`}
-                  onClick={() => {
-                    setSelectedCandidate(item);
-                    void getMemoryCandidate(item.candidate_id)
-                      .then(setSelectedCandidate)
-                      .catch(() => undefined);
-                  }}
                 >
-                  <div className="text-[13px] text-ink line-clamp-2">{item.content}</div>
-                  <div className="text-[11px] text-muted mt-1.5">
-                    {candidateTypeLabel(item, tr)} · {candidateScopeLabel(item, tr)} · {formatTime(item.created_at, tr)}
-                  </div>
-                </button>
+                  <label className="grid place-items-center self-stretch px-3 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      aria-label={tr("Select candidate: {content}", { content: item.content })}
+                      checked={selectedCandidateIds.has(item.candidate_id)}
+                      onChange={(event) => setSelectedCandidateIds((current) => {
+                        const next = new Set(current);
+                        if (event.target.checked) next.add(item.candidate_id);
+                        else next.delete(item.candidate_id);
+                        return next;
+                      })}
+                    />
+                  </label>
+                  <button
+                    className="min-w-0 flex-1 text-left py-3 pr-4"
+                    onClick={() => {
+                      setSelectedCandidate(item);
+                      void getMemoryCandidate(item.candidate_id)
+                        .then(setSelectedCandidate)
+                        .catch(() => undefined);
+                    }}
+                  >
+                    <div className="text-[13px] text-ink line-clamp-2">{item.content}</div>
+                    <div className="text-[11px] text-muted mt-1.5">
+                      {candidateTypeLabel(item, tr)} · {candidateScopeLabel(item, tr)} · {formatTime(item.created_at, tr)}
+                    </div>
+                  </button>
+                </div>
               ))}
             </section>
             <section className="border border-line rounded-lg bg-panel min-w-0 min-[1080px]:sticky min-[1080px]:top-6">

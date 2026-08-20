@@ -1,9 +1,7 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
-  getCloudStatus,
   getConnectors,
-  getSlackStatus,
   type Connector,
 } from "../../api";
 import { LanguageProvider } from "../../i18n";
@@ -14,8 +12,6 @@ vi.mock("../../api", async () => {
   return {
     ...actual,
     getConnectors: vi.fn(),
-    getCloudStatus: vi.fn(),
-    getSlackStatus: vi.fn(),
   };
 });
 
@@ -57,23 +53,6 @@ describe("ConnectorsSection visibility", () => {
       connector("browser", "Browser"),
       connector("slack", "Slack"),
     ]);
-    vi.mocked(getCloudStatus).mockResolvedValue({
-      available: false,
-      signed_in: false,
-      account: "",
-      user_id: "",
-    });
-    vi.mocked(getSlackStatus).mockResolvedValue({
-      mode: "",
-      relay: {
-        state: "offline",
-        reconnects: 0,
-        last_event_at: null,
-        last_error: "",
-      },
-      signed_in: false,
-      teams: {},
-    });
 
     render(
       <LanguageProvider>
@@ -92,8 +71,6 @@ describe("ConnectorsSection visibility", () => {
     vi.mocked(getConnectors)
       .mockRejectedValueOnce(new Error("service offline"))
       .mockResolvedValueOnce([connector("minem", "MineM")]);
-    vi.mocked(getCloudStatus).mockRejectedValue(new Error("offline"));
-    vi.mocked(getSlackStatus).mockRejectedValue(new Error("offline"));
 
     render(
       <LanguageProvider>

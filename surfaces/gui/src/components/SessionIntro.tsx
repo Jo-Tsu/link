@@ -22,6 +22,9 @@ const HUBSPOT_PROMPT =
   "Create a report on my recent HubSpot leads: sources, stages, and who needs follow-up.";
 const GH_SLACK_PROMPT =
   "Set up a weekly progress report: summarize activity in my GitHub repos and post it to Slack every Friday morning.";
+const SHOW_HUBSPOT_TASK = isConnectorVisible("hubspot");
+const SHOW_GITHUB_SLACK_TASK =
+  isConnectorVisible("github") && isConnectorVisible("slack");
 
 export function SessionIntro({
   sessionId,
@@ -40,6 +43,7 @@ export function SessionIntro({
   const [addingFolder, setAddingFolder] = useState(false);
 
   useEffect(() => {
+    if (!SHOW_HUBSPOT_TASK && !SHOW_GITHUB_SLACK_TASK) return;
     // Live = what this session can touch right now (connected AND not muted here) — the same
     // truth the §23 glance renders, so the dots here can never disagree with the row above.
     getSessionConnections(sessionId)
@@ -53,9 +57,6 @@ export function SessionIntro({
   const shared = roots.filter((r) => !r.primary);
   const hubspotReady = live.has("hubspot");
   const ghSlackReady = live.has("github") && live.has("slack");
-  const showHubspotTask = isConnectorVisible("hubspot");
-  const showGithubSlackTask =
-    isConnectorVisible("github") && isConnectorVisible("slack");
 
   const dot = (name: string, on: boolean) => (
     <span className={"task-dot" + (on ? "" : " off")} key={name}>
@@ -102,7 +103,7 @@ export function SessionIntro({
           </div>
         )}
 
-        {showHubspotTask && <button
+        {SHOW_HUBSPOT_TASK && <button
           className={"task-card" + (hubspotReady ? "" : " gated")}
           data-testid="intro-task-hubspot"
           onClick={() => (hubspotReady ? onPrefill(tr(HUBSPOT_PROMPT)) : onOpenSessionSettings())}
@@ -117,7 +118,7 @@ export function SessionIntro({
           <span className="task-card-act">{tr(hubspotReady ? "Start →" : "Configure ›")}</span>
         </button>}
 
-        {showGithubSlackTask && <button
+        {SHOW_GITHUB_SLACK_TASK && <button
           className={"task-card" + (ghSlackReady ? "" : " gated")}
           data-testid="intro-task-github-slack"
           onClick={() => (ghSlackReady ? onPrefill(tr(GH_SLACK_PROMPT)) : onOpenSessionSettings())}

@@ -1,7 +1,5 @@
-import { useEffect, useState } from "react";
-import { getConnectors } from "../api";
+import { useState } from "react";
 import { ConnectorsSection } from "./connectors/ConnectorsSection";
-import { visibleConnectors } from "./connectors/visibility";
 import { Icon } from "./Icon";
 import { SkillHub } from "./SkillHub";
 import { useI18n } from "../i18n";
@@ -28,19 +26,8 @@ export function IntegrationsView({
 }) {
   const { tr } = useI18n();
   const [tab, setTab] = useState<IntTab>("connectors");
-  // Sub-nav count: how many connectors exist. Polled so the badge stays live.
+  // The catalog reports its visible count from the same refresh that renders the list.
   const [connCount, setConnCount] = useState<number | null>(null);
-
-  useEffect(() => {
-    const load = () => {
-      getConnectors()
-        .then((rows) => setConnCount(visibleConnectors(rows).length))
-        .catch(() => {});
-    };
-    load();
-    const t = setInterval(load, 5000);
-    return () => clearInterval(t);
-  }, []);
 
   return (
     <main className="flex-1 min-w-0 flex bg-paper">
@@ -82,7 +69,7 @@ export function IntegrationsView({
                 title={tr("Connectors")}
                 sub={tr("Manage the data sources and tools Smallink can use. Connected items appear first.")}
               />
-              <ConnectorsSection onOpenMemory={onOpenMemory} />
+              <ConnectorsSection onOpenMemory={onOpenMemory} onCountChange={setConnCount} />
             </section>
           ) : (
             <SkillHub workspace={workspace} onCreateWithAgent={onCreateSkillWithAgent} />

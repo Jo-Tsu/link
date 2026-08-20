@@ -260,7 +260,13 @@ export function Composer(props: Props) {
 
   const submit = () => {
     const t = text.trim();
-    if ((!t && attachments.length === 0) || props.running || dictation?.recording || dictationBusy) return;
+    if (
+      !props.connected ||
+      (!t && attachments.length === 0) ||
+      props.running ||
+      dictation?.recording ||
+      dictationBusy
+    ) return;
     // No model connected: keep the draft (don't drop it) and send the user to setup instead.
     if (needsModel) {
       props.onConnectModel?.();

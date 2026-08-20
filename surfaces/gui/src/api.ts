@@ -431,6 +431,28 @@ export async function decideMemoryCandidate(
   return data;
 }
 
+export interface BatchMemoryDecisionResult {
+  ok: boolean;
+  action: "accept" | "ignore";
+  requested: number;
+  processed: Array<{ candidate_id: string; memory_id?: number; idempotent?: boolean }>;
+  failed: Array<{ candidate_id: string; error: string }>;
+}
+
+export async function decideMemoryCandidates(
+  candidateIds: string[],
+  action: "accept" | "ignore",
+): Promise<BatchMemoryDecisionResult> {
+  const res = await fetch(`${httpBase()}/v1/memory/candidates/batch/decision`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ candidate_ids: candidateIds, action }),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.detail || data.error || "Could not save memory decisions");
+  return data;
+}
+
 export async function getRuntimeTasks(limit = 100): Promise<RuntimeTask[]> {
   const res = await fetch(`${httpBase()}/v1/tasks?limit=${limit}`);
   if (!res.ok) throw new Error("Could not load runs");

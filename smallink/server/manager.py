@@ -4215,6 +4215,40 @@ class SessionManager:
             ),
         )
 
+    def decide_memory_candidates(self, body: dict[str, Any]) -> dict[str, Any]:
+        """Apply one safe decision to multiple candidates and report partial failures."""
+        raw_ids = body.get("candidate_ids")
+        if not isinstance(raw_ids, list):
+            raise ValueError("candidate_ids must be a list")
+        candidate_ids = list(dict.fromkeys(str(value).strip() for value in raw_ids if str(value).strip()))
+        if not candidate_ids:
+            raise ValueError("candidate_ids must not be empty")
+        action = str(body.get("action", ""))
+        if action not in {"accept", "ignore"}:
+            raise ValueError("batch action must be accept or ignore")
+
+        processed: list[dict[str, Any]] = []
+        failed: list[dict[str, str]] = []
+        for candidate_id in candidate_ids:
+            try:
+                processed.append(
+                    {
+                        "candidate_id": candidate_id,
+                        **self.decide_memory_candidate(candidate_id, {"action": action}),
+                    }
+                )
+            except KeyError:
+                failed.append({"candidate_id": candidate_id, "error": "candidate not found"})
+            except ValueError as exc:
+                failed.append({"candidate_id": candidate_id, "error": str(exc)})
+        return {
+            "ok": not failed,
+            "action": action,
+            "requested": len(candidate_ids),
+            "processed": processed,
+            "failed": failed,
+        }
+
     def sync_codex(self, limit_sessions: Optional[int] = None) -> dict[str, Any]:
         """Read local Codex rollout sessions and ingest each conversation TURN (one user
         prompt + its following assistant replies) as one sensory_record (source_type='codex').
