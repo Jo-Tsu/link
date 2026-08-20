@@ -131,6 +131,10 @@ export interface Project {
   default_model?: string | null;
   pinned: boolean;
   sort_order: number;
+  project_type?: "folder" | "system_app";
+  owner_app_id?: string | null;
+  system_key?: string | null;
+  disabled_at?: string | null;
   session_count: number;
   created_at: string;
   updated_at: string;

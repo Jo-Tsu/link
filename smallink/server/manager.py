@@ -17,11 +17,13 @@ import shutil
 import subprocess
 import time
 from collections.abc import AsyncIterator
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
 from ..agent import build_engine
 from ..agents import get_agent
+from ..apps import AppManifest, SQLiteAppStore, builtin_app_registry
 from ..connections import (
     PersonaConnectionStore,
     SessionConnectionStore,
@@ -58,6 +60,7 @@ from ..connectors import (
     update_connector_tools,
 )
 from ..connectors.sync_store import ConnectorSyncStore
+from ..connectors.minem_client import get_minem_client
 from ..connectors.browser_automation import (
     browser_close_session,
     browser_state,
@@ -80,6 +83,7 @@ from ..memory import (
     SQLiteGovernanceStore,
     SQLiteMemoryStore,
 )
+from ..knowledge import SQLiteKnowledgeStore, knowledge_tools
 from ..permissions import Mode
 from ..agents import list_agents as _list_agents
 from ..providers import (
@@ -103,6 +107,10 @@ _SCOPES = {s.value for s in Scope}
 MODEL_PURPOSES = ("chat", "memory", "title")
 
 logger = logging.getLogger("smallink.manager")
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _sensory_safe(value: Any) -> Any:
@@ -178,6 +186,7 @@ class SessionManager:
         else:
             base = state_dir()
         base.mkdir(parents=True, exist_ok=True)
+        self._data_base = base
 
         self.memory_store: MemoryStore = SQLiteMemoryStore(base / "link.db")
         self.governance_store = SQLiteGovernanceStore(base / "link.db")
@@ -187,7 +196,11 @@ class SessionManager:
         self.runtime_store.repair_legacy_project_ids()
         self.runtime_store.recover_incomplete_runs()
         self.sensory_store = SQLiteSensoryStore(base / "link.db")
+        self.knowledge_store = SQLiteKnowledgeStore(base / "link.db")
         self.connector_sync_store = ConnectorSyncStore(base / "link.db")
+        self.app_registry = builtin_app_registry()
+        self.app_store = SQLiteAppStore(base / "link.db")
+        self._ensure_builtin_app_projects()
         self.session_store.canonicalize_workspaces()  # collapse /tmp vs /private/tmp etc.
         if self.default_workspace:
             self.session_store.touch_workspace(self.default_workspace)
@@ -199,6 +212,8 @@ class SessionManager:
         self._autotitle_inflight: set[str] = set()
         self._autotitle_tasks: set[asyncio.Task] = set()
         self._autotitle_attempts: dict[str, int] = {}
+        self._governance_scheduler_task: Optional[asyncio.Task] = None
+        self._governance_schedule_running = False
         self.workspace_trust = WorkspaceTrustStore()
         self.secrets = SecretStore()
         # No explicit provider injected → route by the model's `provider:` prefix (OpenAI default,
@@ -214,7 +229,6 @@ class SessionManager:
         self._mcp_authorizing: set[str] = set()
         self._mcp_errors: dict[str, str] = {}
         self.gateway: Optional[Gateway] = None
-        self._data_base = base
         # Desktop/UI prefs (default model, onboarding state) — not secrets; a plain JSON file.
         self._prefs = self._load_prefs()
         if self._prefs.get("default_model"):
@@ -477,6 +491,17 @@ class SessionManager:
                 if Path(str(r.get("path", ""))).is_dir()
             ]
             roots = [{"path": ws, "writable": True, "label": "scratch"}, *extra]
+        project_id = record.project_id if record else None
+        if project_id is None and ws:
+            project = self.session_store.get_project_by_workspace(ws)
+            project_id = project.project_id if project else None
+        runtime_tools = list(extra_tools or [])
+        specialist_read_tools: list[Any] = []
+        if ag.family == "knowledge":
+            specialist_read_tools = knowledge_tools(
+                self.knowledge_store, project_id=project_id
+            )
+            runtime_tools.extend(specialist_read_tools)
         engine = build_engine(
             agent=ag,
             workspace=ws,
@@ -486,7 +511,7 @@ class SessionManager:
             memory_store=self.memory_store,
             governance_store=self.governance_store,
             messages=messages,
-            extra_tools=extra_tools,
+            extra_tools=runtime_tools,
             secrets=self.secrets,
             task_store=self.task_store,
             wake_store=self.wakes,
@@ -509,6 +534,7 @@ class SessionManager:
             # Per-session connection hierarchy: expose only effective-enabled connectors' tools.
             connector_filter=self.effective_connectors(session_id, agent_name),
             subagent_observer=AgentRunObserver(self.runtime_store, session_id),
+            subagent_read_tools=specialist_read_tools,
             skill_state_root=self._data_base,
         )
         # An automation run rebuilt here (manual "Run now" over WS, durable resume) still
@@ -1597,6 +1623,43 @@ class SessionManager:
             return {"ok": False, "canceled": True}
         return {"ok": True, "path": path}
 
+    def pick_native_app_file(self, app_id: str) -> dict[str, Any]:
+        """Choose a local source file for an application import."""
+        self._app_manifest(app_id)
+        import sys
+
+        if sys.platform == "darwin":
+            cmd = [
+                "osascript",
+                "-e",
+                'tell application "System Events" to activate',
+                "-e",
+                'POSIX path of (choose file with prompt "Choose a file to import into MineM")',
+            ]
+        elif sys.platform == "win32":
+            script = (
+                "Add-Type -AssemblyName System.Windows.Forms; "
+                "$f = New-Object System.Windows.Forms.OpenFileDialog; "
+                "$f.Title = 'Choose a file to import into MineM'; "
+                "$f.Multiselect = $false; "
+                "if ($f.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) "
+                "{ [Console]::Out.Write($f.FileName) }"
+            )
+            cmd = ["powershell.exe", "-NoProfile", "-STA", "-Command", script]
+        else:
+            cmd = ["zenity", "--file-selection", "--title=Choose a file to import into MineM"]
+        try:
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        except (OSError, subprocess.TimeoutExpired):
+            return {"ok": False, "error": "no native file picker available"}
+        path = (out.stdout or "").strip()
+        if out.returncode != 0 or not path:
+            return {"ok": False, "canceled": True}
+        selected = Path(path).expanduser()
+        if not selected.is_file():
+            return {"ok": False, "error": "selected file is unavailable"}
+        return {"ok": True, "path": str(selected.resolve())}
+
     def _note_provider_use(self, name: str) -> None:
         """Router on_use hook: remember when a provider last served a completion. Persisted
         THROTTLED (once per provider per minute) — this fires on every model call, from engine
@@ -2466,6 +2529,7 @@ class SessionManager:
         durable sessions: a channel message to its subscribers, a DM to the designated DM session
         (else parked). Returns the platforms whose listeners came up."""
         self.scheduler.start()  # tick scheduler for automations (independent of connectors)
+        self.start_governance_scheduler()
         return await self._build_and_start_gateway()
 
     async def refresh_gateway(self) -> list[str]:
@@ -2647,12 +2711,21 @@ class SessionManager:
                 self.unregister_session_client(session_id, cb)
 
     async def aclose(self) -> None:
+        if self._governance_scheduler_task is not None:
+            self._governance_scheduler_task.cancel()
+            try:
+                await self._governance_scheduler_task
+            except asyncio.CancelledError:
+                pass
+            self._governance_scheduler_task = None
         await self.scheduler.stop()
         await self.stop_gateway()
         await self.mcp.aclose()
         self.governance_store.close()
         self.connector_sync_store.close()
+        self.app_store.close()
         self.sensory_store.close()
+        self.knowledge_store.close()
         self.runtime_store.close()
         self.session_store.close()
         self.memory_store.close()
@@ -3993,8 +4066,15 @@ class SessionManager:
         record = self.session_store.load(session_id)
         return record.messages if record else []
 
-    def list_runtime_tasks(self, *, limit: int = 100) -> list[dict[str, Any]]:
-        return [task.to_dict() for task in self.runtime_store.list_tasks(limit=limit)]
+    def list_runtime_tasks(
+        self, *, limit: int = 100, project_id: Optional[str] = None
+    ) -> list[dict[str, Any]]:
+        return [
+            task.to_dict()
+            for task in self.runtime_store.list_tasks(
+                limit=limit, project_id=project_id
+            )
+        ]
 
     def list_agent_collaborations(self, *, limit: int = 100) -> list[dict[str, Any]]:
         return self.runtime_store.list_collaborative_runs(limit=limit)
@@ -4052,12 +4132,14 @@ class SessionManager:
         source_type: Optional[str] = None,
         governance_status: Optional[str] = None,
         conversation_id: Optional[str] = None,
+        project_path: Optional[str] = None,
         query: Optional[str] = None,
     ) -> dict[str, Any]:
         filters = {
             "source_type": source_type,
             "governance_status": governance_status,
             "conversation_id": conversation_id,
+            "project_path": project_path,
             "query": query,
         }
         records = self.sensory_store.list(limit=limit, offset=offset, **filters)
@@ -4071,6 +4153,115 @@ class SessionManager:
     def sensory_record(self, record_id: str) -> Optional[dict[str, Any]]:
         record = self.sensory_store.get(record_id)
         return record.to_dict() if record else None
+
+    def sensory_provenance(self, record_id: str) -> Optional[dict[str, Any]]:
+        record = self.sensory_store.get(record_id)
+        if record is None:
+            return None
+        return {
+            "source": record.to_dict(),
+            **self.governance_store.provenance_for_record(record_id),
+        }
+
+    def knowledge_items(
+        self, *, project_id: Optional[str] = None, status: Optional[str] = "active"
+    ) -> list[dict[str, Any]]:
+        if project_id is not None and self.get_project(project_id) is None:
+            raise KeyError(project_id)
+        return self.knowledge_store.list(
+            project_id=project_id, status=status, limit=500
+        )
+
+    def knowledge_item(self, item_id: str) -> Optional[dict[str, Any]]:
+        return self.knowledge_store.get(item_id)
+
+    def index_knowledge_source(
+        self,
+        record_id: str,
+        *,
+        project_id: Optional[str] = None,
+        title: str = "",
+    ) -> dict[str, Any]:
+        record = self.sensory_store.get(record_id)
+        if record is None:
+            raise KeyError(record_id)
+        project = self.session_store.get_project(project_id) if project_id else None
+        if project_id and project is None:
+            raise KeyError(project_id)
+        if project is None and record.project_path:
+            project = self.session_store.get_project_by_workspace(record.project_path)
+        content = record.normalized_content or record.raw_content
+        inferred = " ".join(content.replace("\n", " ").split())[:120]
+        item = self.knowledge_store.upsert(
+            project_id=project.project_id if project else project_id,
+            source_type=f"sensory:{record.source_type}",
+            external_id=record.record_id,
+            title=title.strip() or inferred or record.content_type,
+            content=content,
+            source_record_id=record.record_id,
+            metadata={
+                "content_type": record.content_type,
+                "source_type": record.source_type,
+                "source_locator": record.source_locator,
+                "conversation_id": record.conversation_id,
+            },
+        )
+        return {"ok": True, "item": item}
+
+    def index_project_knowledge(self, project_id: str) -> dict[str, Any]:
+        project = self.session_store.get_project(project_id)
+        if project is None:
+            raise KeyError(project_id)
+        eligible = {
+            "app_capability_result",
+            "document",
+            "document_text",
+            "artifact",
+            "file_content",
+            "web_page",
+            "meeting_transcript",
+        }
+        records = self.sensory_store.list(
+            project_path=project.workspace_path, limit=500
+        )
+        indexed: list[str] = []
+        skipped = 0
+        for record in records:
+            if record.content_type not in eligible:
+                skipped += 1
+                continue
+            result = self.index_knowledge_source(
+                record.record_id, project_id=project_id
+            )
+            indexed.append(str(result["item"]["item_id"]))
+        return {
+            "ok": True,
+            "project_id": project_id,
+            "indexed": len(set(indexed)),
+            "skipped": skipped,
+            "item_ids": list(dict.fromkeys(indexed)),
+        }
+
+    def search_knowledge(
+        self,
+        query: str,
+        *,
+        project_id: Optional[str] = None,
+        limit: int = 20,
+    ) -> dict[str, Any]:
+        if project_id is not None and self.get_project(project_id) is None:
+            raise KeyError(project_id)
+        return self.knowledge_store.search(
+            query, project_id=project_id, limit=limit
+        )
+
+    def archive_knowledge_item(
+        self, item_id: str, archived: bool
+    ) -> dict[str, Any]:
+        if self.knowledge_store.get(item_id) is None:
+            raise KeyError(item_id)
+        self.knowledge_store.archive(item_id, archived=archived)
+        return {"ok": True, "item": self.knowledge_store.get(item_id)}
 
     def delete_sensory_records(
         self,
@@ -4182,6 +4373,114 @@ class SessionManager:
             retry_failed=retry_failed,
         )
 
+    def governance_schedule(self) -> dict[str, Any]:
+        raw = self._prefs.get("governance_schedule")
+        config = raw if isinstance(raw, dict) else {}
+        interval = max(15, min(int(config.get("interval_minutes", 1440)), 10080))
+        last_run_at = config.get("last_run_at")
+        next_run_at: Optional[str] = None
+        if bool(config.get("enabled", False)):
+            try:
+                last = datetime.fromisoformat(str(last_run_at)) if last_run_at else datetime.now(timezone.utc)
+                if last.tzinfo is None:
+                    last = last.replace(tzinfo=timezone.utc)
+                from datetime import timedelta
+
+                next_run_at = (last + timedelta(minutes=interval)).isoformat()
+            except (TypeError, ValueError):
+                next_run_at = _now_iso()
+        return {
+            "enabled": bool(config.get("enabled", False)),
+            "interval_minutes": interval,
+            "batch_limit": max(1, min(int(config.get("batch_limit", 50)), 500)),
+            "last_run_at": last_run_at,
+            "next_run_at": next_run_at,
+            "last_result": config.get("last_result"),
+            "running": self._governance_schedule_running,
+        }
+
+    def set_governance_schedule(self, body: dict[str, Any]) -> dict[str, Any]:
+        current = self.governance_schedule()
+        enabled = bool(body.get("enabled", current["enabled"]))
+        try:
+            interval = int(body.get("interval_minutes", current["interval_minutes"]))
+            batch_limit = int(body.get("batch_limit", current["batch_limit"]))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("governance schedule values must be integers") from exc
+        if not 15 <= interval <= 10080:
+            raise ValueError("interval_minutes must be between 15 and 10080")
+        if not 1 <= batch_limit <= 500:
+            raise ValueError("batch_limit must be between 1 and 500")
+        previous = self._prefs.get("governance_schedule")
+        preserved = previous if isinstance(previous, dict) else {}
+        self._prefs["governance_schedule"] = {
+            **preserved,
+            "enabled": enabled,
+            "interval_minutes": interval,
+            "batch_limit": batch_limit,
+        }
+        self._save_prefs()
+        return self.governance_schedule()
+
+    def start_governance_scheduler(self) -> None:
+        if self._governance_scheduler_task is None or self._governance_scheduler_task.done():
+            self._governance_scheduler_task = asyncio.create_task(
+                self._governance_scheduler_loop(),
+                name="smallink-governance-scheduler",
+            )
+
+    async def _governance_scheduler_loop(self) -> None:
+        while True:
+            try:
+                await self.run_scheduled_governance_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("scheduled memory governance failed")
+            await asyncio.sleep(15)
+
+    async def run_scheduled_governance_once(
+        self, *, force: bool = False
+    ) -> dict[str, Any]:
+        config = self.governance_schedule()
+        if self._governance_schedule_running:
+            return {"status": "skipped", "reason": "already_running"}
+        if not force and not config["enabled"]:
+            return {"status": "skipped", "reason": "disabled"}
+        if not force and config["next_run_at"]:
+            try:
+                due = datetime.fromisoformat(str(config["next_run_at"]))
+                if due.tzinfo is None:
+                    due = due.replace(tzinfo=timezone.utc)
+                if due > datetime.now(timezone.utc):
+                    return {"status": "skipped", "reason": "not_due"}
+            except ValueError:
+                pass
+        pending = self.sensory_store.count(governance_status="pending")
+        if pending == 0:
+            return {"status": "skipped", "reason": "no_pending_records"}
+        self._governance_schedule_running = True
+        try:
+            result = await asyncio.to_thread(
+                self.run_memory_pipeline,
+                None,
+                int(config["batch_limit"]),
+                False,
+                False,
+            )
+            stored = self._prefs.get("governance_schedule")
+            schedule = stored if isinstance(stored, dict) else {}
+            schedule["last_run_at"] = _now_iso()
+            schedule["last_result"] = result
+            self._prefs["governance_schedule"] = schedule
+            self._save_prefs()
+            await self.broadcast_event(
+                {"type": "governance_task_updated", "data": result}
+            )
+            return {"status": "ran", "result": result}
+        finally:
+            self._governance_schedule_running = False
+
     def memory_candidates(self, status: Optional[str] = "pending") -> list[dict[str, Any]]:
         return [
             candidate.to_dict()
@@ -4247,6 +4546,78 @@ class SessionManager:
             "requested": len(candidate_ids),
             "processed": processed,
             "failed": failed,
+        }
+
+    def retype_memory_candidates(self, body: dict[str, Any]) -> dict[str, Any]:
+        raw_ids = body.get("candidate_ids")
+        if not isinstance(raw_ids, list):
+            raise ValueError("candidate_ids must be a list")
+        candidate_ids = list(
+            dict.fromkeys(
+                str(value).strip() for value in raw_ids if str(value).strip()
+            )
+        )
+        if not candidate_ids:
+            raise ValueError("candidate_ids must not be empty")
+        memory_type = str(body.get("memory_type", "")).strip()
+        processed: list[dict[str, Any]] = []
+        failed: list[dict[str, str]] = []
+        for candidate_id in candidate_ids:
+            try:
+                candidate = self.governance_store.set_candidate_type(
+                    candidate_id, memory_type
+                )
+                processed.append(candidate.to_dict())
+            except KeyError:
+                failed.append(
+                    {"candidate_id": candidate_id, "error": "candidate not found"}
+                )
+            except ValueError as exc:
+                failed.append({"candidate_id": candidate_id, "error": str(exc)})
+        return {
+            "ok": not failed,
+            "memory_type": memory_type,
+            "requested": len(candidate_ids),
+            "processed": processed,
+            "failed": failed,
+        }
+
+    def governance_tasks(
+        self, *, status: Optional[str] = None, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        return self.governance_store.list_tasks(status=status, limit=limit)
+
+    def governance_task(self, task_id: str) -> Optional[dict[str, Any]]:
+        task = self.governance_store.get_task(task_id)
+        if task is None:
+            return None
+        task["candidates"] = [
+            candidate.to_dict()
+            for candidate in self.governance_store.list_candidates(status=None)
+            if candidate.task_id == task_id
+        ]
+        return task
+
+    def set_memory_status(self, memory_id: int, status: str) -> dict[str, Any]:
+        result = self.governance_store.set_memory_status(
+            self.memory_store, memory_id, status
+        )
+        memory = result["memory"]
+        return {
+            "ok": True,
+            "idempotent": result["idempotent"],
+            "memory": {
+                "id": memory.id,
+                "scope": memory.scope.value,
+                "content": memory.content,
+                "key": memory.key,
+                "workspace": memory.workspace,
+                "session_id": memory.session_id,
+                "created_at": memory.created_at,
+                "status": memory.status,
+                "updated_at": memory.updated_at,
+                "source_record_id": memory.source_record_id,
+            },
         }
 
     def sync_codex(self, limit_sessions: Optional[int] = None) -> dict[str, Any]:
@@ -4490,6 +4861,274 @@ class SessionManager:
 
     # -- projects ---------------------------------------------------------------
 
+    def _ensure_builtin_app_projects(self) -> None:
+        for manifest in self.app_registry.list():
+            self._ensure_app_project(manifest)
+            self.app_store.ensure_instance(manifest.app_id, enabled=True)
+
+    def _ensure_app_project(self, manifest: AppManifest) -> ProjectRecord:
+        existing = self.session_store.get_project_by_system_key(manifest.system_project_id)
+        if existing is not None:
+            return existing
+        by_id = self.session_store.get_project(manifest.system_project_id)
+        if by_id is not None:
+            return by_id
+        managed_workspace = self._data_base / "apps" / manifest.app_id / "workspace"
+        managed_workspace.mkdir(parents=True, exist_ok=True)
+        project = ProjectRecord(
+            project_id=manifest.system_project_id,
+            name=manifest.system_project_name,
+            icon="S",
+            workspace_path=str(managed_workspace.resolve()),
+            description=manifest.description,
+            status="active",
+            default_agent=manifest.default_agent,
+            pinned=True,
+            sort_order=-100,
+            project_type="system_app",
+            owner_app_id=manifest.app_id,
+            system_key=manifest.system_project_id,
+        )
+        self.session_store.create_project(project)
+        return project
+
+    def _app_manifest(self, app_id: str) -> AppManifest:
+        manifest = self.app_registry.get(app_id)
+        if manifest is None:
+            raise KeyError(app_id)
+        return manifest
+
+    def _app_status_payload(self, app_id: str) -> dict[str, Any]:
+        self._app_manifest(app_id)
+        if app_id != "minem":
+            return {"app_installed": False, "cli_available": False, "health": "offline"}
+        inspected = get_minem_client().inspect()
+        self.app_store.update_instance(
+            app_id,
+            install_state="installed" if inspected.get("app_installed") or inspected.get("cli_available") else "not_installed",
+            runtime_state="available" if inspected.get("health") == "running" else "offline",
+            status=inspected,
+            last_checked_at=_now_iso(),
+        )
+        return inspected
+
+    def app_descriptor(self, app_id: str, *, inspect_runtime: bool = True) -> dict[str, Any]:
+        manifest = self._app_manifest(app_id)
+        project = self._ensure_app_project(manifest)
+        instance = self.app_store.ensure_instance(app_id)
+        status = self._app_status_payload(app_id) if inspect_runtime else instance.get("status", {})
+        instance = self.app_store.get_instance(app_id) or instance
+        return {
+            **manifest.to_dict(),
+            "instance": instance,
+            "runtime": status,
+            "project": self.get_project(project.project_id),
+        }
+
+    def list_apps(self) -> list[dict[str, Any]]:
+        return [self.app_descriptor(item.app_id) for item in self.app_registry.list()]
+
+    def enable_app(self, app_id: str) -> dict[str, Any]:
+        manifest = self._app_manifest(app_id)
+        self._ensure_app_project(manifest)
+        if app_id != "minem":
+            raise ValueError("application adapter is not available")
+        result = connect_connector(self.secrets, manifest.connector_id, {})
+        self.app_store.update_instance(
+            app_id,
+            enabled=bool(result.get("ok")),
+            install_state="installed" if result.get("ok") else "not_installed",
+            runtime_state="available" if result.get("ok") else "error",
+            app_version=result.get("app_version"),
+            protocol_version=result.get("api_version"),
+            status=result,
+            last_checked_at=_now_iso(),
+            last_error=None if result.get("ok") else result.get("error"),
+        )
+        return {"ok": bool(result.get("ok")), "app": self.app_descriptor(app_id, inspect_runtime=False), "result": result}
+
+    def check_app(self, app_id: str) -> dict[str, Any]:
+        self._app_manifest(app_id)
+        result = get_minem_client().status() if app_id == "minem" else {"ok": False, "error": "adapter unavailable"}
+        self.app_store.update_instance(
+            app_id,
+            install_state="installed" if result.get("app_installed") or result.get("cli_available") else "not_installed",
+            runtime_state="available" if result.get("ok") else "error",
+            app_version=result.get("app_version"),
+            protocol_version=result.get("api_version"),
+            status=result,
+            last_checked_at=_now_iso(),
+            last_error=None if result.get("ok") else result.get("error"),
+        )
+        return {"ok": bool(result.get("ok")), "app": self.app_descriptor(app_id, inspect_runtime=False), "result": result}
+
+    def disable_app(self, app_id: str) -> dict[str, Any]:
+        manifest = self._app_manifest(app_id)
+        disconnect_connector(self.secrets, manifest.connector_id)
+        self.app_store.update_instance(app_id, enabled=False, runtime_state="disabled", last_error=None)
+        self.session_store.update_project(manifest.system_project_id, status="paused")
+        return {"ok": True, "app": self.app_descriptor(app_id, inspect_runtime=False)}
+
+    def _record_app_result(
+        self,
+        app_id: str,
+        capability: str,
+        arguments: dict[str, Any],
+        result: dict[str, Any],
+        *,
+        session_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        manifest = self._app_manifest(app_id)
+        project = self._ensure_app_project(manifest)
+        run = self.app_store.record_capability_run(
+            app_id=app_id,
+            project_id=project.project_id,
+            session_id=session_id,
+            capability=capability,
+            arguments=_sensory_safe(arguments),
+            result=_sensory_safe(result),
+        )
+        sensory = self.sensory_store.add(
+            source_type=app_id,
+            connector_id=manifest.connector_id,
+            content_type="app_capability_result",
+            raw_content={
+                "capability": capability,
+                "arguments": _sensory_safe(arguments),
+                "result": _sensory_safe(result),
+            },
+            external_id=run["capability_run_id"],
+            project_path=project.workspace_path,
+            conversation_id=session_id,
+            sensitivity="private",
+            metadata={
+                "app_id": app_id,
+                "project_id": project.project_id,
+                "capability": capability,
+                "capability_run_id": run["capability_run_id"],
+            },
+            source_locator=f"{app_id}://capability/{run['capability_run_id']}",
+        )
+        self._capture_app_assets(app_id, project.project_id, result, sensory.record_id)
+        return {**result, "smallink": {**run, "sensory_record_id": sensory.record_id}}
+
+    def _capture_app_assets(
+        self, app_id: str, project_id: str, payload: Any, sensory_record_id: str
+    ) -> None:
+        seen: set[tuple[str, str]] = set()
+
+        def visit(value: Any, inherited_links: Optional[dict[str, Any]] = None) -> None:
+            if isinstance(value, list):
+                for item in value:
+                    visit(item, inherited_links)
+                return
+            if not isinstance(value, dict):
+                return
+            links = value.get("links") if isinstance(value.get("links"), dict) else inherited_links
+            asset_type = str(value.get("type") or value.get("assetType") or "").lower()
+            code = str(value.get("code") or value.get("assetCode") or "").strip()
+            external_id = str(value.get("id") or value.get("assetId") or "").strip()
+            looks_like_asset = asset_type in {"report", "page", "resource", "case", "single_html", "html", "ppt"}
+            looks_like_asset = looks_like_asset or code.startswith(("RPT-", "CTRL-", "RES-"))
+            if looks_like_asset and (external_id or code):
+                stable_id = external_id or code
+                version_id = str(value.get("versionId") or value.get("version_id") or value.get("version") or "")
+                key = (stable_id, version_id)
+                if key not in seen:
+                    seen.add(key)
+                    preview = value.get("previewUrl") or value.get("preview") or value.get("url")
+                    if not preview and links:
+                        preview = links.get("preview")
+                    digest = hashlib.sha256(
+                        json.dumps(value, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+                    ).hexdigest()
+                    self.app_store.upsert_asset(
+                        app_id=app_id,
+                        project_id=project_id,
+                        external_asset_id=stable_id,
+                        external_code=code or None,
+                        asset_type=asset_type or None,
+                        version_id=version_id,
+                        title=str(value.get("title") or value.get("name") or "") or None,
+                        preview_ref=str(preview) if preview else None,
+                        content_hash=digest,
+                        sensory_record_id=sensory_record_id,
+                    )
+                    self.knowledge_store.upsert(
+                        project_id=project_id,
+                        source_type=f"app:{app_id}",
+                        external_id=stable_id,
+                        title=str(
+                            value.get("title")
+                            or value.get("name")
+                            or code
+                            or stable_id
+                        ),
+                        content=json.dumps(
+                            value,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            default=str,
+                        ),
+                        source_record_id=sensory_record_id,
+                        metadata={
+                            "app_id": app_id,
+                            "asset_type": asset_type or None,
+                            "external_code": code or None,
+                            "version_id": version_id or None,
+                            "source_locator": f"{app_id}://asset/{stable_id}",
+                        },
+                    )
+            for child in value.values():
+                if child is not links:
+                    visit(child, links)
+
+        visit(payload)
+
+    def app_assets(
+        self,
+        app_id: str,
+        *,
+        query: str = "",
+        asset_type: str = "all",
+        limit: int = 60,
+        session_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        manifest = self._app_manifest(app_id)
+        if app_id != "minem":
+            raise ValueError("application adapter is not available")
+        arguments = {"query": query, "type": asset_type, "limit": limit}
+        if query.strip():
+            result = get_minem_client().search_assets(query, asset_type=asset_type, limit=limit)
+            items = result.get("results", [])
+            capability = "asset.search"
+        else:
+            result = get_minem_client().list_assets(asset_type=asset_type, limit=limit)
+            items = result.get("assets", [])
+            capability = "asset.list"
+        recorded = self._record_app_result(app_id, capability, arguments, result, session_id=session_id)
+        return {**recorded, "items": items, "project_id": manifest.system_project_id}
+
+    def invoke_app_capability(
+        self,
+        app_id: str,
+        capability: str,
+        arguments: dict[str, Any],
+        *,
+        session_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        manifest = self._app_manifest(app_id)
+        if capability not in manifest.capabilities:
+            raise ValueError("capability is not declared by this application")
+        if app_id != "minem":
+            raise ValueError("application adapter is not available")
+        result = get_minem_client().invoke(capability, arguments)
+        return self._record_app_result(app_id, capability, arguments, result, session_id=session_id)
+
+    def app_activity(self, app_id: str, *, limit: int = 50) -> list[dict[str, Any]]:
+        self._app_manifest(app_id)
+        return self.app_store.list_runs(app_id, limit=limit)
+
     def list_projects(self, status: Optional[str] = None) -> list[dict[str, Any]]:
         projects = self.session_store.list_projects(status=status)
         return [
@@ -4504,6 +5143,10 @@ class SessionManager:
                 "default_model": p.default_model,
                 "pinned": p.pinned,
                 "sort_order": p.sort_order,
+                "project_type": p.project_type,
+                "owner_app_id": p.owner_app_id,
+                "system_key": p.system_key,
+                "disabled_at": p.disabled_at,
                 "session_count": self.session_store.project_session_count(p.project_id),
                 "created_at": p.created_at,
                 "updated_at": p.updated_at,
@@ -4560,6 +5203,10 @@ class SessionManager:
             "default_model": p.default_model,
             "pinned": p.pinned,
             "sort_order": p.sort_order,
+            "project_type": p.project_type,
+            "owner_app_id": p.owner_app_id,
+            "system_key": p.system_key,
+            "disabled_at": p.disabled_at,
             "session_count": self.session_store.project_session_count(p.project_id),
             "created_at": p.created_at,
             "updated_at": p.updated_at,
@@ -4572,6 +5219,9 @@ class SessionManager:
         return {"ok": True, "project": self.get_project(project_id)}
 
     def delete_project(self, project_id: str) -> dict[str, Any]:
+        project = self.session_store.get_project(project_id)
+        if project is not None and project.project_type == "system_app":
+            return {"ok": False, "error": "system application projects cannot be deleted"}
         ok = self.session_store.delete_project(project_id)
         if not ok:
             return {"ok": False, "error": "project not found"}
@@ -4582,6 +5232,59 @@ class SessionManager:
             s for s in self.list_sessions()
             if s.get("project_id") == project_id
         ]
+
+    def project_overview(self, project_id: str) -> Optional[dict[str, Any]]:
+        project = self.get_project(project_id)
+        if project is None:
+            return None
+        workspace = str(project["workspace_path"])
+        sessions = self.project_sessions(project_id)
+        tasks = self.list_runtime_tasks(limit=100, project_id=project_id)
+        source_records = self.sensory_store.list(
+            project_path=workspace, limit=100
+        )
+        source_statuses = {
+            status: self.sensory_store.count(
+                project_path=workspace, governance_status=status
+            )
+            for status in ("pending", "processing", "processed", "skipped", "failed")
+        }
+        source_total = self.sensory_store.count(project_path=workspace)
+        governance = self.governance_store.source_summary(workspace)
+        governed_items = self.governance_store.project_items(workspace, limit=100)
+        knowledge = self.knowledge_store.list(project_id=project_id, limit=100)
+        app_assets: list[dict[str, Any]] = []
+        app_asset_total = 0
+        owner_app_id = project.get("owner_app_id")
+        if owner_app_id:
+            app_assets = self.app_store.list_assets(
+                str(owner_app_id), project_id=project_id, limit=100
+            )
+            app_asset_total = self.app_store.count_assets(
+                str(owner_app_id), project_id=project_id
+            )
+        return {
+            "project": project,
+            "metrics": {
+                "sessions": len(sessions),
+                "tasks": len(tasks),
+                "source_records": source_total,
+                "pending_governance": source_statuses["pending"],
+                "memory_candidates": governance["candidate_total"],
+                "memories": governance["memory_total"],
+                "app_assets": app_asset_total,
+                "knowledge": self.knowledge_store.count(project_id=project_id),
+            },
+            "sessions": sessions[:100],
+            "tasks": tasks,
+            "source_records": [record.to_dict() for record in source_records],
+            "source_statuses": source_statuses,
+            "candidates": governed_items["candidates"],
+            "memories": governed_items["memories"],
+            "memory_types": governance["memory_types"],
+            "app_assets": app_assets,
+            "knowledge": knowledge,
+        }
 
     def list_agents(self) -> list[dict[str, Any]]:
         return _list_agents()

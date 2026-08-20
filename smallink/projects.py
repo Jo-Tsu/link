@@ -18,5 +18,9 @@ class ProjectRecord:
     default_model: Optional[str] = None
     pinned: bool = False
     sort_order: int = 0
+    project_type: str = "folder"
+    owner_app_id: Optional[str] = None
+    system_key: Optional[str] = None
+    disabled_at: Optional[str] = None
     created_at: Optional[str] = None
     updated_at: Optional[str] = None

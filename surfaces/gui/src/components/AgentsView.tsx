@@ -41,6 +41,7 @@ type AgentMember = {
   permission: string;
   relationship: string;
   delegation: string;
+  parentId?: string;
 };
 
 const EXPLORER: AgentMember = {
@@ -57,7 +58,59 @@ const EXPLORER: AgentMember = {
   permission: "Read-only",
   relationship: "Called automatically by Code when broad repository research is useful.",
   delegation: "Cannot delegate another agent.",
+  parentId: "code",
 };
+
+const RUNTIME_SPECIALISTS: AgentMember[] = [
+  {
+    id: "researcher",
+    name: "Researcher",
+    tagline: "Collect cited evidence across project knowledge, files, and the web.",
+    icon: "search",
+    family: "knowledge",
+    group: "system",
+    enabled: true,
+    builtin: true,
+    tools: ["knowledge_search", "web_search", "web_fetch", "grep", "read_file", "list_files"],
+    workspace: "project",
+    permission: "Read-only",
+    relationship: "Started by a workspace agent when a task needs a separate evidence-gathering context.",
+    delegation: "Returns one cited report to its parent and cannot delegate another agent.",
+    parentId: "link",
+  },
+  {
+    id: "analyst",
+    name: "Analyst",
+    tagline: "Compare evidence, reveal patterns, and prepare decision-ready synthesis.",
+    icon: "chart",
+    family: "knowledge",
+    group: "system",
+    enabled: true,
+    builtin: true,
+    tools: ["knowledge_search", "web_search", "web_fetch", "grep", "read_file", "list_files"],
+    workspace: "project",
+    permission: "Read-only",
+    relationship: "Started by a workspace agent when evidence needs independent synthesis or tradeoff analysis.",
+    delegation: "Returns one analysis report to its parent and cannot delegate another agent.",
+    parentId: "link",
+  },
+  {
+    id: "reviewer",
+    name: "Reviewer",
+    tagline: "Find defects, risks, missing evidence, and validation gaps.",
+    icon: "shield",
+    family: "knowledge",
+    group: "system",
+    enabled: true,
+    builtin: true,
+    tools: ["knowledge_search", "web_search", "web_fetch", "grep", "read_file", "list_files"],
+    workspace: "project",
+    permission: "Read-only",
+    relationship: "Started by a workspace agent for an independent quality and risk review.",
+    delegation: "Returns one review report to its parent and cannot delegate another agent.",
+    parentId: "link",
+  },
+];
 
 export function AgentsView({ onOpenSession }: { onOpenSession?: (sessionId: string) => void }) {
   const { tr } = useI18n();
@@ -132,7 +185,14 @@ export function AgentsView({ onOpenSession }: { onOpenSession?: (sessionId: stri
   const members = useMemo<AgentMember[]>(() => {
     const personaMembers = personas.map(personaToMember);
     const codeEnabled = personaMembers.some((member) => member.id === "code" && member.enabled);
-    return [...personaMembers, { ...EXPLORER, enabled: codeEnabled }];
+    const workspaceAgentEnabled = personaMembers.some(
+      (member) => member.enabled && member.workspace !== "none",
+    );
+    return [
+      ...personaMembers,
+      { ...EXPLORER, enabled: codeEnabled },
+      ...RUNTIME_SPECIALISTS.map((member) => ({ ...member, enabled: workspaceAgentEnabled })),
+    ];
   }, [personas]);
   const selectedCollaboration = collaborations.find((item) => item.task_run_id === selectedRunId) ?? null;
   const selectedAgent = run?.agent_runs.find((item) => item.agent_run_id === selectedAgentId) ?? null;
@@ -402,13 +462,15 @@ function AgentArchitecturePanel({
                 />
               ))}
               {systemNodes.map((node) => {
-                const parent = node.member.id === "explorer" ? codeNode : undefined;
+                const parent = selectableNodes.find(
+                  (candidate) => candidate.member.id === node.member.parentId,
+                );
                 const startX = parent ? parent.x + ARCHITECTURE_NODE_WIDTH / 2 : centerX;
                 const startY = parent ? parent.y + ARCHITECTURE_NODE_HEIGHT : 300;
                 return (
                   <path
                     key={`delegate-${node.member.id}`}
-                    className={`agent-architecture-edge delegation ${parent?.member.enabled ? "" : "muted"}`}
+                    className={`agent-architecture-edge delegation ${node.member.enabled ? "" : "muted"}`}
                     d={`M ${startX} ${startY} V ${node.y - 24} H ${node.x + ARCHITECTURE_NODE_WIDTH / 2} V ${node.y}`}
                     markerEnd="url(#agent-delegation-arrow)"
                   />
@@ -417,7 +479,7 @@ function AgentArchitecturePanel({
               <text className="agent-architecture-edge-label" x={centerX + 12} y={153}>{tr("submit")}</text>
               <text className="agent-architecture-edge-label" x={centerX + 12} y={320}>{tr("select role")}</text>
               {systemNodes.length > 0 && (
-                <text className="agent-architecture-edge-label delegation" x={(codeNode?.x ?? centerX) + ARCHITECTURE_NODE_WIDTH / 2 + 12} y={532}>{tr("delegate")}</text>
+                <text className="agent-architecture-edge-label delegation" x={centerX + 12} y={532}>{tr("delegate")}</text>
               )}
             </svg>
 
@@ -494,13 +556,13 @@ function ArchitectureAgentNode({
       className={`agent-architecture-node agent ${member.enabled ? "enabled" : "disabled"} ${delegated ? "delegated" : ""}`}
       style={{ left: x, top: y }}
       onClick={() => onSelect(member)}
-      aria-label={tr("Open {name} details", { name: member.name })}
+      aria-label={tr("Open {name} details", { name: tr(member.name) })}
     >
       <span className="agent-architecture-avatar">
         <PersonaGlyph icon={member.icon} family={member.family} size={18} />
         <i className={member.enabled ? "online" : "offline"} />
       </span>
-      <strong>{member.name}</strong>
+      <strong>{tr(member.name)}</strong>
       <span className="agent-architecture-role">
         {tr(groupLabel(member.group))} · {member.enabled ? tr("Enabled") : tr("Disabled")}
       </span>
@@ -544,7 +606,7 @@ function CollaborationsPanel({
         </span>
         <h2 className="text-[15px] font-semibold text-heading mt-4">{tr("No multi-agent collaboration yet")}</h2>
         <p className="text-[12px] leading-relaxed text-muted mt-1 max-w-md mx-auto">
-          {tr("When Code delegates broad repository research to Explorer, the real collaboration will appear here.")}
+          {tr("When a workspace agent delegates research, analysis, or review, the real collaboration will appear here.")}
         </p>
       </div>
     );
@@ -572,7 +634,7 @@ function CollaborationsPanel({
                     {item.project_id ? baseName(item.project_id) : tr("No project")} · {formatTime(item.started_at)}
                   </div>
                   <div className="flex flex-wrap gap-1 mt-2">
-                    {item.agent_roles.map((role) => <AgentChip key={role}>{roleName(role)}</AgentChip>)}
+                    {item.agent_roles.map((role) => <AgentChip key={role}>{tr(roleName(role))}</AgentChip>)}
                     <AgentChip>{tr("{count} delegations", { count: item.child_agent_count })}</AgentChip>
                   </div>
                 </div>
@@ -661,14 +723,14 @@ function AgentTreeNode({
       <button
         className={`agent-run-node rounded-lg border bg-panel text-left ${selectedId === node.agent_run_id ? "selected" : "border-line"}`}
         onClick={() => onSelect(node.agent_run_id)}
-        aria-label={tr("Inspect {name} run", { name: roleName(node.agent_role) })}
+        aria-label={tr("Inspect {name} run", { name: tr(roleName(node.agent_role)) })}
       >
         <div className="flex items-start gap-2.5">
           <span className="w-8 h-8 rounded-full grid place-items-center bg-accentSoft text-accent shrink-0">
-            <PersonaGlyph icon={node.agent_role === "explorer" ? "search" : node.agent_role} family={node.agent_role === "explorer" ? "code" : undefined} size={15} />
+            <PersonaGlyph icon={roleIcon(node.agent_role)} family={node.agent_role === "explorer" ? "code" : "knowledge"} size={15} />
           </span>
           <div className="min-w-0 flex-1">
-            <div className="text-[13px] font-semibold text-heading truncate">{roleName(node.agent_role)}</div>
+            <div className="text-[13px] font-semibold text-heading truncate">{tr(roleName(node.agent_role))}</div>
             <div className="text-[10.5px] text-muted mt-0.5">
               {node.parent_agent_run_id ? tr("Delegated child") : tr("Root agent")}
             </div>
@@ -708,7 +770,7 @@ function AgentRunDetail({ run, events }: { run: RuntimeAgentRun; events: Runtime
     <section className="rounded-lg border border-line bg-panel overflow-hidden">
       <div className="px-4 py-3 border-b border-line flex items-center justify-between gap-3">
         <div>
-          <h3 className="text-[13px] font-semibold text-ink">{roleName(run.agent_role)}</h3>
+          <h3 className="text-[13px] font-semibold text-ink">{tr(roleName(run.agent_role))}</h3>
           <p className="text-[10.5px] text-muted mt-0.5">
             {run.parent_agent_run_id
               ? tr("This sub-agent received a bounded task from its parent agent.")
@@ -763,7 +825,7 @@ function MemberDialog({ member, onClose }: { member: AgentMember; onClose: () =>
           </span>
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-2">
-              <h2 className="text-[18px] font-semibold text-heading">{member.name}</h2>
+              <h2 className="text-[18px] font-semibold text-heading">{tr(member.name)}</h2>
               <span className={`text-[10.5px] px-2 py-0.5 rounded-full ${member.enabled ? "bg-okSoft text-ok" : "bg-paper text-muted"}`}>
                 {member.enabled ? tr("Enabled") : tr("Disabled")}
               </span>
@@ -848,8 +910,10 @@ function personaToMember(persona: Persona): AgentMember {
       ? "Receives a user task directly and owns its final answer."
       : "Runs as an independent specialist selected by the user.",
     delegation: persona.id === "code"
-      ? "Can delegate broad read-only repository research to Explorer."
-      : "General agent-to-agent delegation is not connected for this role yet.",
+      ? "Can delegate repository exploration, research, analysis, and review."
+      : persona.workspace !== "none"
+        ? "Can delegate read-only research, analysis, and review."
+        : "This role does not own a workspace, so specialist delegation is unavailable.",
   };
 }
 
@@ -869,7 +933,17 @@ function roleName(role: string): string {
   if (role === "link") return "Smallink";
   if (role === "code") return "Code";
   if (role === "explorer") return "Explorer";
+  if (role === "researcher") return "Researcher";
+  if (role === "analyst") return "Analyst";
+  if (role === "reviewer") return "Reviewer";
   return role ? role.charAt(0).toUpperCase() + role.slice(1) : "Agent";
+}
+
+function roleIcon(role: string): string {
+  if (role === "explorer" || role === "researcher") return "search";
+  if (role === "analyst") return "chart";
+  if (role === "reviewer") return "shield";
+  return role;
 }
 
 function rootRuns(runs: RuntimeAgentRun[]): RuntimeAgentRun[] {

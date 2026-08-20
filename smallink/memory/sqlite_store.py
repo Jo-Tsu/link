@@ -173,6 +173,30 @@ class SQLiteMemoryStore(MemoryStore):
         self._record_history(item_id, old=old, new=content, event="UPDATE")
         return self.get(item_id)
 
+    def set_status(self, item_id: int, status: str) -> Optional[MemoryItem]:
+        if status not in {"active", "archived"}:
+            raise ValueError("memory status must be active or archived")
+        with self._lock:
+            existing = self._conn.execute(
+                "SELECT content, status FROM memories WHERE id = ?", (item_id,)
+            ).fetchone()
+            if existing is None:
+                return None
+            if existing["status"] == status:
+                return self.get(item_id)
+            self._conn.execute(
+                "UPDATE memories SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (status, item_id),
+            )
+            self._conn.commit()
+        self._record_history(
+            item_id,
+            old=existing["content"],
+            new=existing["content"],
+            event="ARCHIVE" if status == "archived" else "RESTORE",
+        )
+        return self.get(item_id)
+
     def delete(self, item_id: int) -> bool:
         with self._lock:
             existing = self._conn.execute(

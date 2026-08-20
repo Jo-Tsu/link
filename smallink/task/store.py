@@ -455,12 +455,18 @@ class SQLiteTaskRuntimeStore:
             self._conn.commit()
         return self.get_agent_run(agent_run_id)
 
-    def list_tasks(self, *, limit: int = 100) -> list[TaskRecord]:
+    def list_tasks(
+        self, *, limit: int = 100, project_id: Optional[str] = None
+    ) -> list[TaskRecord]:
+        query = "SELECT * FROM runtime_tasks"
+        params: list[Any] = []
+        if project_id is not None:
+            query += " WHERE project_id=?"
+            params.append(project_id)
+        query += " ORDER BY updated_at DESC LIMIT ?"
+        params.append(max(1, min(int(limit), 500)))
         with self._lock:
-            rows = self._conn.execute(
-                "SELECT * FROM runtime_tasks ORDER BY updated_at DESC LIMIT ?",
-                (max(1, min(int(limit), 500)),),
-            ).fetchall()
+            rows = self._conn.execute(query, params).fetchall()
         return [self._task(row) for row in rows]
 
     def list_collaborative_runs(self, *, limit: int = 100) -> list[dict[str, Any]]:

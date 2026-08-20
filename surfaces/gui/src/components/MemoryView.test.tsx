@@ -3,13 +3,19 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   decideMemoryCandidate,
   decideMemoryCandidates,
+  getGovernanceTask,
+  getGovernanceSchedule,
+  getGovernanceTasks,
   getMemory,
   getMemoryCandidate,
   getMemoryCandidates,
   getSensoryRecord,
   getSensoryRecords,
   getSensoryStats,
+  retypeMemoryCandidates,
   runMemoryPipeline,
+  setMemoryArchived,
+  updateGovernanceSchedule,
 } from "../api";
 import { LanguageProvider } from "../i18n";
 import { MemoryView } from "./MemoryView";
@@ -20,20 +26,25 @@ vi.mock("../api", async () => {
     ...actual,
     decideMemoryCandidate: vi.fn(),
     decideMemoryCandidates: vi.fn(),
+    getGovernanceTask: vi.fn(),
+    getGovernanceSchedule: vi.fn(),
+    getGovernanceTasks: vi.fn(),
     getMemory: vi.fn(),
     getMemoryCandidate: vi.fn(),
     getMemoryCandidates: vi.fn(),
     getSensoryRecord: vi.fn(),
     getSensoryRecords: vi.fn(),
     getSensoryStats: vi.fn(),
+    retypeMemoryCandidates: vi.fn(),
     runMemoryPipeline: vi.fn(),
+    setMemoryArchived: vi.fn(),
+    updateGovernanceSchedule: vi.fn(),
   };
 });
 
 beforeEach(() => {
   localStorage.setItem("link:language:v1", "en");
-  vi.mocked(getMemory).mockResolvedValue([
-    {
+  const activeMemory = {
       id: 7,
       scope: "global",
       content: "Prefers concise product interfaces.",
@@ -41,9 +52,22 @@ beforeEach(() => {
       workspace: null,
       session_id: null,
       created_at: "2026-07-29T09:00:00Z",
-    },
-  ]);
+      status: "active",
+    } as const;
+  vi.mocked(getMemory).mockImplementation(async (status) => status === "archived" ? [] : [activeMemory]);
   vi.mocked(getMemoryCandidates).mockResolvedValue([]);
+  vi.mocked(getGovernanceTasks).mockResolvedValue([]);
+  const schedule = {
+    enabled: false,
+    interval_minutes: 1440,
+    batch_limit: 50,
+    last_run_at: null,
+    next_run_at: null,
+    last_result: null,
+    running: false,
+  };
+  vi.mocked(getGovernanceSchedule).mockResolvedValue(schedule);
+  vi.mocked(updateGovernanceSchedule).mockResolvedValue(schedule);
   vi.mocked(decideMemoryCandidate).mockResolvedValue({ ok: true, memory_id: 8 });
   vi.mocked(decideMemoryCandidates).mockResolvedValue({
     ok: true,
@@ -52,6 +76,14 @@ beforeEach(() => {
     processed: [{ candidate_id: "candidate-42", memory_id: 8 }],
     failed: [],
   });
+  vi.mocked(retypeMemoryCandidates).mockResolvedValue({
+    ok: true,
+    memory_type: "product_decision",
+    requested: 1,
+    processed: [],
+    failed: [],
+  });
+  vi.mocked(setMemoryArchived).mockResolvedValue(activeMemory);
   vi.mocked(runMemoryPipeline).mockResolvedValue({
     task_id: "governance-1",
     status: "completed",
@@ -175,6 +207,79 @@ describe("MemoryView", () => {
       ["candidate-42"],
       "accept",
     ));
+  });
+
+  it("updates the type of selected candidate memories in one batch", async () => {
+    const candidate = {
+      candidate_id: "candidate-42",
+      task_id: "governance-1",
+      scope: "global" as const,
+      content: "Keep product decisions concise.",
+      memory_type: "user_preference",
+      workspace: null,
+      session_id: null,
+      created_at: "2026-07-31T09:00:00Z",
+      updated_at: "2026-07-31T09:00:00Z",
+      status: "pending" as const,
+      confidence: 0.9,
+      model: "test",
+      prompt_version: "v2",
+      sources: ["sensory-abc"],
+    };
+    vi.mocked(getMemory).mockResolvedValue([]);
+    vi.mocked(getMemoryCandidates).mockResolvedValue([candidate]);
+
+    render(<LanguageProvider><MemoryView /></LanguageProvider>);
+    fireEvent.click(await screen.findByTestId("memory-pending-banner"));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select all candidates" }));
+    fireEvent.change(screen.getByRole("combobox", { name: "Memory type for selected candidates" }), {
+      target: { value: "product_decision" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Apply type" }));
+
+    await waitFor(() => expect(retypeMemoryCandidates).toHaveBeenCalledWith(
+      ["candidate-42"],
+      "product_decision",
+    ));
+  });
+
+  it("archives confirmed memory from its detail view", async () => {
+    render(<LanguageProvider><MemoryView /></LanguageProvider>);
+    fireEvent.click(await screen.findByRole("button", { name: "Open User preferences memories" }));
+    fireEvent.click(await screen.findByText("Prefers concise product interfaces."));
+    fireEvent.click(screen.getByRole("button", { name: "Archive memory" }));
+    await waitFor(() => expect(setMemoryArchived).toHaveBeenCalledWith(7, true));
+  });
+
+  it("opens a governance task and shows its persisted candidate state", async () => {
+    const task = {
+      task_id: "governance-1",
+      status: "reviewing" as const,
+      model: "gpt-5.6-sol",
+      prompt_version: "memory-extraction-v2",
+      total_records: 2,
+      processed_records: 2,
+      candidates_created: 1,
+      skipped_records: 0,
+      failed_records: 0,
+      candidate_total: 1,
+      pending_candidates: 1,
+      accepted_candidates: 0,
+      ignored_candidates: 0,
+      created_at: "2026-07-31T09:00:00Z",
+      updated_at: "2026-07-31T09:01:00Z",
+      candidates: [],
+      records: [],
+    };
+    vi.mocked(getGovernanceTasks).mockResolvedValue([task]);
+    vi.mocked(getGovernanceTask).mockResolvedValue(task);
+
+    render(<LanguageProvider><MemoryView /></LanguageProvider>);
+    fireEvent.click(await screen.findByRole("button", { name: /Governance tasks: 1.*View tasks/ }));
+    fireEvent.click(screen.getByRole("button", { name: /Governance task/ }));
+
+    await waitFor(() => expect(getGovernanceTask).toHaveBeenCalledWith("governance-1"));
+    expect(screen.getByText("Pending candidates").parentElement?.textContent).toContain("1");
   });
 
   it("opens imported source data and shows record details", async () => {

@@ -49,6 +49,7 @@ const baseProps = {
   onSelectSession: vi.fn(),
   onNewProject: vi.fn(),
   onNewSessionInProject: vi.fn(),
+  onOpenProject: vi.fn(),
   onRenameSession: vi.fn(),
   onDeleteSession: vi.fn(),
   onArchiveSession: vi.fn(),
@@ -60,6 +61,7 @@ const baseProps = {
   onOpenScheduled: vi.fn(),
   onOpenAutomation: vi.fn(),
   onOpenIntegrations: vi.fn(),
+  onOpenApps: vi.fn(),
   onOpenMemory: vi.fn(),
   onOpenAgents: vi.fn(),
   onOpenAudit: vi.fn(),
@@ -68,6 +70,7 @@ const baseProps = {
   runsActive: false,
   scheduledActive: false,
   integrationsActive: false,
+  appsActive: false,
   memoryActive: false,
   agentsActive: false,
   auditActive: false,
@@ -89,7 +92,7 @@ afterEach(() => {
 });
 
 describe("Sidebar group/filter control", () => {
-  it("renders Search as a compact header action and keeps Connectors as the first module", async () => {
+  it("renders Search as a compact header action and keeps Applications as the first module", async () => {
     stubFetch([
       { match: "/v1/personas", method: "GET", json: PERSONAS },
       { match: "/v1/settings", method: "GET", json: { nav_layout: "flat" } },
@@ -104,9 +107,9 @@ describe("Sidebar group/filter control", () => {
     expect(screen.getByRole("dialog", { name: "Search conversations" })).toBeTruthy();
 
     fireEvent.keyDown(screen.getByRole("dialog", { name: "Search conversations" }), { key: "Escape" });
-    const connectors = screen.getByTestId("nav-connectors");
-    fireEvent.click(connectors);
-    expect(baseProps.onOpenIntegrations).toHaveBeenCalled();
+    const applications = screen.getByTestId("nav-apps");
+    fireEvent.click(applications);
+    expect(baseProps.onOpenApps).toHaveBeenCalled();
   });
 
   it("choosing Agent persists via setNavLayout and switches to the per-agent accordion", async () => {
@@ -394,8 +397,12 @@ describe("Project session isolation", () => {
     });
 
     await screen.findByText("Project Alpha");
+    const alphaRow = screen.getByText("Project Alpha").closest("[title='/work/alpha']");
+    expect(alphaRow).toBeTruthy();
+    fireEvent.click(within(alphaRow as HTMLElement).getByRole("button", { name: "Expand project" }));
     fireEvent.click(screen.getByText("Project Alpha"));
-    const alphaProject = screen.getByText("Project Alpha").closest("[title='/work/alpha']")?.parentElement;
+    expect(baseProps.onOpenProject).toHaveBeenCalledWith("project-a");
+    const alphaProject = alphaRow?.parentElement;
     const betaProject = screen.getByText("Project Beta").closest("[title='/work/beta']")?.parentElement;
     expect(alphaProject && within(alphaProject).getByText("Alpha chat")).toBeTruthy();
     expect(alphaProject && within(alphaProject).queryByText("Beta chat")).toBeNull();

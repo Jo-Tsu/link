@@ -80,7 +80,7 @@ test("rapid switching between two projects never lets the older chat replace the
   const projectsBand = page.getByTestId("projects-band");
   const alphaChat = projectsBand.getByText("Alpha chat", { exact: true });
   await expect(alphaChat).toBeVisible({ timeout: 10_000 });
-  await projectsBand.getByText("Project Beta", { exact: true }).click();
+  await projectsBand.getByRole("button", { name: "Expand project" }).click();
   const betaChat = projectsBand.getByText("Beta chat", { exact: true });
   await expect(betaChat).toBeVisible();
 

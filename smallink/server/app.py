@@ -161,6 +161,7 @@ from ..inbox import VIS_INBOX, VIS_INLINE, args_preview
 from ..permissions import Mode
 from ..providers import AssistantTurn
 from ..skills import SkillStoreError
+from .routers.knowledge import knowledge_router
 from .routers.memory import memory_router
 from .routers.prompts import prompts_router
 from .manager import SessionManager
@@ -244,6 +245,7 @@ def create_app(manager: SessionManager) -> FastAPI:
         allow_headers=["*"],
     )
     app.state.manager = manager
+    app.include_router(knowledge_router(manager))
     app.include_router(memory_router(manager))
     app.include_router(prompts_router(manager))
 
@@ -635,6 +637,92 @@ def create_app(manager: SessionManager) -> FastAPI:
 
     # -- projects ---------------------------------------------------------------
 
+    # -- application center -----------------------------------------------------
+
+    @app.get("/v1/apps")
+    def list_apps() -> dict[str, Any]:
+        return {"apps": manager.list_apps()}
+
+    @app.get("/v1/apps/{app_id}")
+    def get_app(app_id: str) -> Any:
+        try:
+            return manager.app_descriptor(app_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="application not found") from exc
+
+    @app.post("/v1/apps/{app_id}/enable")
+    def enable_app(app_id: str) -> Any:
+        try:
+            return manager.enable_app(app_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="application not found") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/v1/apps/{app_id}/check")
+    def check_app(app_id: str) -> Any:
+        try:
+            return manager.check_app(app_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="application not found") from exc
+
+    @app.post("/v1/apps/{app_id}/disable")
+    def disable_app(app_id: str) -> Any:
+        try:
+            return manager.disable_app(app_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="application not found") from exc
+
+    @app.get("/v1/apps/{app_id}/assets")
+    def app_assets(
+        app_id: str,
+        query: str = "",
+        asset_type: str = "all",
+        limit: int = 60,
+        session_id: str | None = None,
+    ) -> Any:
+        try:
+            return manager.app_assets(
+                app_id,
+                query=query,
+                asset_type=asset_type,
+                limit=limit,
+                session_id=session_id,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="application not found") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/v1/apps/{app_id}/pick-file")
+    async def pick_app_file(app_id: str) -> Any:
+        try:
+            return await asyncio.to_thread(manager.pick_native_app_file, app_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="application not found") from exc
+
+    @app.post("/v1/apps/{app_id}/capabilities/{capability}")
+    def invoke_app_capability(app_id: str, capability: str, body: dict) -> Any:
+        payload = body or {}
+        try:
+            return manager.invoke_app_capability(
+                app_id,
+                capability,
+                payload.get("arguments") if isinstance(payload.get("arguments"), dict) else payload,
+                session_id=payload.get("session_id"),
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="application not found") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/v1/apps/{app_id}/activity")
+    def app_activity(app_id: str, limit: int = 50) -> Any:
+        try:
+            return {"activity": manager.app_activity(app_id, limit=limit)}
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="application not found") from exc
+
     @app.get("/v1/projects")
     def list_projects(status: str | None = None) -> dict[str, Any]:
         return {"projects": manager.list_projects(status=status)}
@@ -661,6 +749,13 @@ def create_app(manager: SessionManager) -> FastAPI:
     @app.get("/v1/projects/{project_id}/sessions")
     def project_sessions(project_id: str) -> dict[str, Any]:
         return {"sessions": manager.project_sessions(project_id)}
+
+    @app.get("/v1/projects/{project_id}/overview")
+    def project_overview(project_id: str) -> Any:
+        overview = manager.project_overview(project_id)
+        if overview is None:
+            return JSONResponse(status_code=404, content={"error": "project not found"})
+        return overview
 
     @app.get("/v1/sessions")
     def sessions(workspace: str | None = None) -> dict[str, Any]:

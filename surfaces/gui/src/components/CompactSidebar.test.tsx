@@ -11,16 +11,16 @@ describe("CompactSidebar", () => {
       onNewSession: vi.fn(),
       onSearch: vi.fn(),
       onGoHome: vi.fn(),
-      onOpenIntegrations: vi.fn(),
+      onOpenApps: vi.fn(),
       onOpenMemory: vi.fn(),
       onOpenAgents: vi.fn(),
       onOpenRuns: vi.fn(),
       onOpenScheduled: vi.fn(),
       onOpenSettings: vi.fn(),
     };
-    render(<CompactSidebar surface="integrations" {...handlers} />);
+    render(<CompactSidebar surface="apps" {...handlers} />);
 
-    expect(screen.getByRole("button", { name: "Connectors" }).getAttribute("aria-current")).toBe("page");
+    expect(screen.getByRole("button", { name: "Applications" }).getAttribute("aria-current")).toBe("page");
     fireEvent.click(screen.getByRole("button", { name: "New session" }));
     fireEvent.click(screen.getByRole("button", { name: "Search" }));
     fireEvent.click(screen.getByRole("button", { name: "Show sidebar (⌘B)" }));

@@ -47,6 +47,7 @@ from .skills import (
 from .tools import ToolRegistry
 from .tools.ask import ask_user_tool
 from .tools.directories import request_directory_tool
+from .tools.delegation import delegation_tools
 from .tools.plan import propose_plan_tool
 from .tools.subagent import explorer_tools
 from .web import make_web_fetch_tool, make_web_search_tool
@@ -88,6 +89,16 @@ Narration: before each batch of tool calls, write ONE short plain sentence sayin
 you're doing and why (e.g. "Checking what merged since yesterday's digest."). It is shown \
 to the user as live progress. Don't narrate trivial single-call follow-ups, don't repeat \
 the previous line, and never let narration replace your final answer."""
+
+_DELEGATION_GUIDANCE = """\
+Multi-agent delegation:
+- You own the user's task and final answer. A specialist returns evidence or critique to you; it \
+does not replace your judgment.
+- Use `delegate_to_agent` when a meaningful subtask benefits from an isolated context: \
+`researcher` gathers cited evidence, `analyst` compares and synthesizes it, and `reviewer` checks \
+an artifact or proposal for defects and gaps. Keep trivial work in the main context.
+- Give the specialist a self-contained assignment and expected output. Independent delegations \
+may be requested together. Specialists are read-only and cannot delegate again."""
 
 
 def _enabled_connector_tools(secrets: SecretStore) -> tuple[set[str], set[str]]:
@@ -142,6 +153,7 @@ def build_engine(
     routing_targets: Optional[list[str]] = None,
     connector_filter: Optional[set[str]] = None,
     subagent_observer: Optional[Any] = None,
+    subagent_read_tools: Optional[list[Any]] = None,
     skill_state_root: Optional[str | Path] = None,
 ) -> TurnEngine:
     ws = Path(workspace).expanduser().resolve() if workspace else None
@@ -211,9 +223,12 @@ def build_engine(
                 roots=root_list or None,
             )
         )
-    # Web search + fetch: research tools for every agent (keyless DuckDuckGo default).
-    registry.register(make_web_search_tool(secrets))
-    registry.register(make_web_fetch_tool())
+    # Web search + fetch: research tools for every agent (keyless DuckDuckGo default). Reuse the
+    # same callables in specialist children so provider/config resolution stays consistent.
+    web_search_tool = make_web_search_tool(secrets)
+    web_fetch_tool = make_web_fetch_tool()
+    registry.register(web_search_tool)
+    registry.register(web_fetch_tool)
     # ask_user: the universal human-in-the-loop Q&A primitive (every agent; engine-intercepted).
     if question_asker is not None:
         registry.register(ask_user_tool())
@@ -229,6 +244,25 @@ def build_engine(
                 workspace=ws,
                 provider=provider,
                 model=model,
+                model_settings=model_settings,
+                run_observer=subagent_observer,
+            )
+        )
+    # Workspace-backed agents may delegate bounded read-only research, analysis, and review.
+    # Children receive only file/search, web, and explicitly supplied retrieval tools; connector,
+    # shell, write, scheduling, and recursive delegation capabilities never cross this boundary.
+    delegation_enabled = agent.family in {"code", "knowledge"} and ws is not None
+    if delegation_enabled:
+        registry.register_all(
+            delegation_tools(
+                workspace=ws,
+                provider=provider,
+                model=model,
+                read_tools=[
+                    web_search_tool,
+                    web_fetch_tool,
+                    *(subagent_read_tools or []),
+                ],
                 model_settings=model_settings,
                 run_observer=subagent_observer,
             )
@@ -251,6 +285,8 @@ def build_engine(
         registry.register_all(selfwake_tools(wake_store, session_id))
 
     instructions = f"{agent.system_prompt}\n\n{_NARRATION_GUIDANCE}"
+    if delegation_enabled:
+        instructions = f"{instructions}\n\n{_DELEGATION_GUIDANCE}"
     if ws is not None:
         instructions = f"{instructions}\n\n{environment_context(ws)}"
         conventions = load_agents_md(ws)

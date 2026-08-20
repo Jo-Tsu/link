@@ -1,7 +1,7 @@
 import { Icon, type IconName } from "./Icon";
 import { useI18n } from "../i18n";
 
-type SurfaceKey = "session" | "integrations" | "memory" | "agents" | "runs" | "scheduled" | "settings" | string;
+type SurfaceKey = "session" | "apps" | "integrations" | "memory" | "agents" | "runs" | "scheduled" | "settings" | string;
 
 export function CompactSidebar({
   surface,
@@ -9,7 +9,7 @@ export function CompactSidebar({
   onNewSession,
   onSearch,
   onGoHome,
-  onOpenIntegrations,
+  onOpenApps,
   onOpenMemory,
   onOpenAgents,
   onOpenRuns,
@@ -21,7 +21,7 @@ export function CompactSidebar({
   onNewSession: () => void;
   onSearch: () => void;
   onGoHome: () => void;
-  onOpenIntegrations: () => void;
+  onOpenApps: () => void;
   onOpenMemory: () => void;
   onOpenAgents: () => void;
   onOpenRuns: () => void;
@@ -44,7 +44,7 @@ export function CompactSidebar({
       <RailButton icon="plus" label={t("nav.newSession")} onClick={onNewSession} emphasized />
       <RailButton icon="search" label={t("nav.search")} onClick={onSearch} />
       <div className="compact-divider" />
-      <RailButton icon="plug" label={t("nav.connectors")} active={surface === "integrations"} onClick={onOpenIntegrations} />
+      <RailButton icon="table" label={t("nav.applications")} active={surface === "apps"} onClick={onOpenApps} />
       <RailButton icon="diamond" label={t("nav.memory")} active={surface === "memory"} onClick={onOpenMemory} />
       <RailButton icon="sparkle" label={t("nav.agents")} active={surface === "agents"} onClick={onOpenAgents} />
       <RailButton icon="branch" label={tr("Run center")} active={surface === "runs"} onClick={onOpenRuns} />

@@ -164,6 +164,7 @@ class SQLiteSensoryStore:
         source_type: Optional[str] = None,
         governance_status: Optional[str] = None,
         conversation_id: Optional[str] = None,
+        project_path: Optional[str] = None,
         query: Optional[str] = None,
     ) -> list[SensoryRecord]:
         clauses: list[str] = []
@@ -172,6 +173,7 @@ class SQLiteSensoryStore:
             ("source_type", source_type),
             ("governance_status", governance_status),
             ("conversation_id", conversation_id),
+            ("project_path", project_path),
         ):
             if value:
                 clauses.append(f"{column}=?")
@@ -205,6 +207,7 @@ class SQLiteSensoryStore:
         source_type: Optional[str] = None,
         governance_status: Optional[str] = None,
         conversation_id: Optional[str] = None,
+        project_path: Optional[str] = None,
         query: Optional[str] = None,
     ) -> int:
         clauses: list[str] = []
@@ -213,6 +216,7 @@ class SQLiteSensoryStore:
             ("source_type", source_type),
             ("governance_status", governance_status),
             ("conversation_id", conversation_id),
+            ("project_path", project_path),
         ):
             if value:
                 clauses.append(f"{column}=?")

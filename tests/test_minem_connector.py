@@ -82,6 +82,85 @@ def test_minem_cli_rejects_invalid_json(tmp_path):
     assert "JSON" in result["error"]
 
 
+def test_minem_cli_uses_validated_manifest_runtime_without_fixed_port(
+    tmp_path, monkeypatch
+):
+    script = tmp_path / "runtime_probe.py"
+    script.write_text(
+        """
+import json
+import os
+
+print(json.dumps({
+    "schemaVersion": "minem.cli/v1",
+    "ok": True,
+    "data": {"release": {"version": "0.5.0", "apiVersion": 1}},
+    "meta": {"serverUrl": os.environ.get("MINEM_BASE_URL", "")},
+}))
+""".strip(),
+        encoding="utf-8",
+    )
+    client = MineMClient([sys.executable, str(script)])
+    monkeypatch.setattr(
+        client,
+        "_read_manifest",
+        lambda: {
+            "status": "running",
+            "managedByClient": False,
+            "baseUrl": "http://127.0.0.1:43127",
+        },
+    )
+
+    result = client.status()
+    assert result["ok"] is True
+    assert result["runtime_url"] == "http://127.0.0.1:43127"
+
+
+def test_minem_cli_rejects_non_loopback_manifest_runtime(tmp_path, monkeypatch):
+    script = tmp_path / "runtime_probe.py"
+    script.write_text(
+        """
+import json
+import os
+
+print(json.dumps({
+    "schemaVersion": "minem.cli/v1",
+    "ok": True,
+    "data": {"release": {"version": "0.5.0", "apiVersion": 1}},
+    "meta": {"serverUrl": os.environ.get("MINEM_BASE_URL", "")},
+}))
+""".strip(),
+        encoding="utf-8",
+    )
+    client = MineMClient([sys.executable, str(script)])
+    monkeypatch.setattr(
+        client,
+        "_read_manifest",
+        lambda: {"status": "running", "baseUrl": "https://example.com:443"},
+    )
+
+    result = client.status()
+    assert result["ok"] is True
+    assert result["runtime_url"] == ""
+
+
+def test_minem_capability_allowlist_requires_confirmation(tmp_path):
+    client = _fake_cli(tmp_path)
+
+    rejected = client.invoke(
+        "asset.delete",
+        {"reference": "CTRL-PAGE-001"},
+    )
+    assert rejected == {
+        "ok": False,
+        "error": "confirm=true is required for this MineM operation",
+        "error_code": "INVALID_ARGUMENT",
+    }
+    unsupported = client.invoke("shell.exec", {"command": "echo nope"})
+    assert unsupported["ok"] is False
+    assert unsupported["error_code"] == "INVALID_ARGUMENT"
+
+
 def test_minem_connector_connects_via_cli_and_enables_read_tools(tmp_path, monkeypatch):
     from smallink.connectors import minem_client
 

@@ -12,11 +12,11 @@ test("a fresh Smallink session streams a persisted-style response", async ({ pag
   await expect(page.getByText("Echo: Audit this product", { exact: true })).toBeVisible();
 });
 
-test("current connector catalog exposes only MineM", async ({ page }) => {
+test("current application center exposes only MineM", async ({ page }) => {
   await page.goto("/");
-  await page.getByTestId("nav-connectors").click();
+  await page.getByTestId("nav-apps").click();
 
-  await expect(page.getByText("MineM", { exact: true })).toBeVisible();
+  await expect(page.getByTestId("app-minem")).toBeVisible();
   await expect(page.getByText("Codex", { exact: true })).toHaveCount(0);
   await expect(page.getByText("TRAE CLI", { exact: true })).toHaveCount(0);
   await expect(page.getByText("Notion", { exact: true })).toHaveCount(0);

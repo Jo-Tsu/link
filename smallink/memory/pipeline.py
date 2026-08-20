@@ -24,25 +24,11 @@ from typing import TYPE_CHECKING, Any, Optional
 
 from .base import MemoryStore, Scope
 from .governance import SQLiteGovernanceStore
+from .types import MEMORY_TYPES
 
 if TYPE_CHECKING:  # avoid a runtime import cycle with the sensory package
     from ..sensory import SQLiteSensoryStore
     from ..sensory.models import SensoryRecord
-
-# The single source of truth for memory types — must stay in sync with MemoryView.tsx's
-# MEMORY_TYPES. Stored in the memory row's `key` column.
-MEMORY_TYPES = (
-    "user_preference",
-    "project_context",
-    "product_decision",
-    "reasoning_process",
-    "open_question",
-    "reusable_pattern",
-    "work_habit",
-    "artifact_summary",
-    "document_insight",
-    "life_memory",
-)
 
 _SCOPE_VALUES = {s.value for s in Scope}
 PROMPT_VERSION = "memory-extraction-v2"

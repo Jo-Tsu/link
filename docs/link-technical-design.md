@@ -1,7 +1,7 @@
 # Smallink 产品技术架构设计
 
-文档版本：4.6  
-更新日期：2026-08-09  
+文档版本：4.7
+更新日期：2026-08-21
 适用范围：Smallink Desktop、Smallink Core、智能体运行、多智能体、数据接入、治理、记忆、知识和项目空间
 
 关联文档：[产品 PRD](./link-product-prd.md)、[整体架构导读](./smallink-architecture-guide.md)、[智能体 AI 底座](./smallink-agent-ai-foundation-guide.md)、[应用中心与 MineM 技术设计](./smallink-app-center-minem-technical-design.md)
@@ -24,7 +24,7 @@ Smallink 以现有智能体执行底座为唯一代码基础进行重构。
 - Skills。
 - MCP。
 - Persona。
-- Explorer 子智能体。
+- Explorer 代码探索子智能体，以及 Researcher、Analyst、Reviewer 通用只读专家。
 - 权限和人工确认。
 - Inbox 和无人值守。
 - 自动化和 SelfWake。
@@ -1300,6 +1300,7 @@ link/
 
 ### 30.2 引入 Postgres Repository
 
+- 迁移执行细节、校验门禁和回滚步骤以 [Smallink Postgres 迁移运行手册](./smallink-postgres-migration-runbook.md) 为准。
 - 先建立新 Schema 和迁移工具。
 - 旧 Store 通过 Adapter 实现相同接口。
 - 新数据双写只用于短期验证，并带一致性检查。
@@ -1559,15 +1560,29 @@ flowchart LR
 
 ### 36.5 过渡边界
 
-SQLite 运行仓库是迁移适配器，不修改 ADR-003。以下目标仍未完成：
+SQLite 运行仓库是迁移适配器，不修改 ADR-003。2026-08-21 已新增统一 `delegate_to_agent` 协议：工作空间智能体可启动 `researcher`、`analyst`、`reviewer` 三类只读子运行；Explorer 继续作为代码探索兼容入口。所有子运行使用独立上下文、禁止写入/终端/连接器/递归委派，并写入真实父子 AgentRun、输出和事件；客户端架构图和协作历史读取同一运行仓库。
+
+以下目标仍未完成：
 
 - Postgres Repository 和数据迁移。
-- 通用多智能体委派、依赖图、预算和父子取消。
-- 通用 AgentRun 依赖图、并行执行与跨任务可视化。
+- 通用 AgentRun 依赖图、预算、父子取消、失败重试和跨任务调度。
 - RunEvent 断线续传游标。
-- 记忆和知识上下文进入 ContextBundle。
+- Token 级 ContextBundle、向量语义召回和效果反馈。
 
-在 Postgres 切换和通用多智能体依赖图完成前，技术验收标准第 2、3、11、12 项仍不能判定为全部完成。
+在 Postgres 切换和高级多智能体调度完成前，技术验收标准中涉及唯一事实源、任意执行点恢复和预算控制的项目仍不能判定为全部完成。
+
+### 36.6A 项目知识与可解释检索（2026-08-21）
+
+`smallink/knowledge` 已形成独立存储边界：
+
+1. `knowledge_items` 保存项目级稳定知识对象和 active/archive 状态。
+2. `knowledge_versions` 保存内容哈希、正文、来源记录和来源定位。
+3. `knowledge_chunks` 保存段落切片；FTS5 虚表提供 BM25 候选召回。
+4. `hybrid_lexical_v1` 将 BM25、查询词覆盖和精确短语命中组合为可解释分数。
+5. 检索结果返回 `source_record_id`、`source_locator` 和评分解释，不返回无来源的结论。
+6. 项目智能体只获得只读 `knowledge_search`；MineM 素材读取可自动形成项目知识版本。
+
+该实现是混合词法检索，不等同于 pgvector 向量语义召回。Postgres 切换后继续保留相同领域接口和引用契约。
 
 ### 36.6 记忆入口与原始数据边界（2026-07-29）
 

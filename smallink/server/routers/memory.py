@@ -17,6 +17,7 @@ def memory_router(manager: Any) -> APIRouter:
         source_type: str | None = None,
         governance_status: str | None = None,
         conversation_id: str | None = None,
+        project_path: str | None = None,
         query: str | None = None,
     ) -> dict[str, Any]:
         return manager.sensory_records(
@@ -25,6 +26,7 @@ def memory_router(manager: Any) -> APIRouter:
             source_type=source_type,
             governance_status=governance_status,
             conversation_id=conversation_id,
+            project_path=project_path,
             query=query,
         )
 
@@ -36,6 +38,14 @@ def memory_router(manager: Any) -> APIRouter:
     def sensory_record(record_id: str) -> Any:
         record = manager.sensory_record(record_id)
         return record if record is not None else JSONResponse(
+            status_code=404,
+            content={"error": "sensory record not found"},
+        )
+
+    @router.get("/v1/sensory-records/{record_id}/provenance")
+    def sensory_provenance(record_id: str) -> Any:
+        provenance = manager.sensory_provenance(record_id)
+        return provenance if provenance is not None else JSONResponse(
             status_code=404,
             content={"error": "sensory record not found"},
         )
@@ -70,6 +80,17 @@ def memory_router(manager: Any) -> APIRouter:
             bool(body.get("allow_sensitive_cloud", False)),
         )
 
+    @router.get("/v1/memory/governance/schedule")
+    def governance_schedule() -> dict[str, Any]:
+        return manager.governance_schedule()
+
+    @router.patch("/v1/memory/governance/schedule")
+    def update_governance_schedule(body: dict) -> Any:
+        try:
+            return manager.set_governance_schedule(body or {})
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     @router.get("/v1/memory")
     def memory(status: str | None = "active") -> dict[str, Any]:
         wanted = None if status in (None, "", "all") else status
@@ -80,10 +101,32 @@ def memory_router(manager: Any) -> APIRouter:
         wanted = None if status in (None, "", "all") else status
         return {"candidates": manager.memory_candidates(status=wanted)}
 
+    @router.get("/v1/memory/governance/tasks")
+    def governance_tasks(
+        status: str | None = None, limit: int = 100
+    ) -> dict[str, Any]:
+        wanted = None if status in (None, "", "all") else status
+        return {"tasks": manager.governance_tasks(status=wanted, limit=limit)}
+
+    @router.get("/v1/memory/governance/tasks/{task_id}")
+    def governance_task(task_id: str) -> Any:
+        task = manager.governance_task(task_id)
+        return task if task is not None else JSONResponse(
+            status_code=404,
+            content={"error": "governance task not found"},
+        )
+
     @router.post("/v1/memory/candidates/batch/decision")
     def decide_memory_candidates(body: dict) -> Any:
         try:
             return manager.decide_memory_candidates(body or {})
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @router.patch("/v1/memory/candidates/batch/type")
+    def retype_memory_candidates(body: dict) -> Any:
+        try:
+            return manager.retype_memory_candidates(body or {})
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -117,5 +160,23 @@ def memory_router(manager: Any) -> APIRouter:
                 "message": "Formal memories can only be created from a confirmed governance candidate.",
             },
         )
+
+    @router.post("/v1/memory/{memory_id}/archive")
+    def archive_memory(memory_id: int) -> Any:
+        try:
+            return manager.set_memory_status(memory_id, "archived")
+        except KeyError:
+            return JSONResponse(
+                status_code=404, content={"error": "memory not found"}
+            )
+
+    @router.post("/v1/memory/{memory_id}/restore")
+    def restore_memory(memory_id: int) -> Any:
+        try:
+            return manager.set_memory_status(memory_id, "active")
+        except KeyError:
+            return JSONResponse(
+                status_code=404, content={"error": "memory not found"}
+            )
 
     return router

@@ -140,6 +140,7 @@ interface Props {
   onOpenRuns: () => void;
   onOpenScheduled: () => void;
   onOpenAutomation: (id: string) => void;
+  onOpenApps: () => void;
   onOpenIntegrations: () => void;
   onOpenMemory: () => void;
   onOpenAgents: () => void;
@@ -147,9 +148,11 @@ interface Props {
   onOpenInbox: () => void;
   onGoHome: () => void;
   onNewSessionInProject: (projectId: string) => void;
+  onOpenProject: (projectId: string) => void;
   runsActive: boolean;
   scheduledActive: boolean;
   integrationsActive: boolean;
+  appsActive: boolean;
   memoryActive: boolean;
   agentsActive: boolean;
   auditActive: boolean;
@@ -840,10 +843,9 @@ export function Sidebar(props: Props) {
               <div key={proj.project_id}>
                 <div
                   className={
-                    "flex items-center gap-1.5 px-1.5 py-1.5 rounded-lg cursor-pointer select-none hover:bg-paper group " +
+                    "flex items-center gap-1.5 px-1.5 py-1.5 rounded-lg select-none hover:bg-paper group " +
                     (isActive ? "text-ink" : "text-muted hover:text-ink")
                   }
-                  onClick={() => setProjToggled((s) => toggleSet(s, proj.project_id))}
                   title={proj.workspace_path}
                 >
                   {proj.icon ? (
@@ -851,13 +853,14 @@ export function Sidebar(props: Props) {
                   ) : (
                     <Icon name="folder" size={15} className="shrink-0" />
                   )}
-                  <span
+                  <button
                     className={
-                      "truncate min-w-0 text-[12.5px] flex-1 " + (isActive ? "font-semibold" : "font-medium")
+                      "truncate min-w-0 text-[12.5px] flex-1 text-left " + (isActive ? "font-semibold" : "font-medium")
                     }
+                    onClick={() => props.onOpenProject(proj.project_id)}
                   >
                     {proj.name}
-                  </span>
+                  </button>
                   <button
                     className="w-5 h-5 grid place-items-center rounded text-faint opacity-0 group-hover:opacity-100 hover:text-ink hover:bg-panel"
                     title={tr("New session in project")}
@@ -869,11 +872,14 @@ export function Sidebar(props: Props) {
                   >
                     <Icon name="plus" size={12} />
                   </button>
-                  <Icon
-                    name={open ? "chevronDown" : "chevronRight"}
-                    size={12}
-                    className="text-faint shrink-0"
-                  />
+                  <button
+                    className="w-5 h-5 grid place-items-center rounded text-faint hover:text-ink hover:bg-panel"
+                    title={tr(open ? "Collapse project" : "Expand project")}
+                    aria-label={tr(open ? "Collapse project" : "Expand project")}
+                    onClick={() => setProjToggled((s) => toggleSet(s, proj.project_id))}
+                  >
+                    <Icon name={open ? "chevronDown" : "chevronRight"} size={12} />
+                  </button>
                 </div>
                 {open && (
                   projSessions.length > 0 ? (
@@ -1126,10 +1132,9 @@ export function Sidebar(props: Props) {
                   <div key={proj}>
                     <div
                       className={
-                        "flex items-center gap-1.5 px-1.5 py-1 rounded-lg cursor-pointer select-none hover:bg-panel group " +
+                        "flex items-center gap-1.5 px-1.5 py-1 rounded-lg select-none hover:bg-panel group " +
                         (isActive ? "text-ink" : "text-muted hover:text-ink")
                       }
-                      onClick={() => setProjToggled((s) => toggleSet(s, proj))}
                       title={projWorkspace}
                     >
                       {projIcon ? (
@@ -1137,13 +1142,14 @@ export function Sidebar(props: Props) {
                       ) : (
                         <Icon name="folder" size={15} className="shrink-0" />
                       )}
-                      <span
+                      <button
                         className={
-                          "truncate min-w-0 text-[12.5px] flex-1 " + (isActive ? "font-semibold" : "font-medium")
+                          "truncate min-w-0 text-[12.5px] flex-1 text-left " + (isActive ? "font-semibold" : "font-medium")
                         }
+                        onClick={() => projEntity ? props.onOpenProject(projEntity.project_id) : setProjToggled((s) => toggleSet(s, proj))}
                       >
                         {projName}
-                      </span>
+                      </button>
                       {projEntity && (
                         <button
                           className="w-5 h-5 grid place-items-center rounded text-faint opacity-0 group-hover:opacity-100 hover:text-ink hover:bg-panel"
@@ -1157,11 +1163,14 @@ export function Sidebar(props: Props) {
                           <Icon name="plus" size={12} />
                         </button>
                       )}
-                      <Icon
-                        name={open ? "chevronDown" : "chevronRight"}
-                        size={12}
-                        className="text-faint shrink-0"
-                      />
+                      <button
+                        className="w-5 h-5 grid place-items-center rounded text-faint hover:text-ink hover:bg-panel"
+                        title={tr(open ? "Collapse project" : "Expand project")}
+                        aria-label={tr(open ? "Collapse project" : "Expand project")}
+                        onClick={() => setProjToggled((s) => toggleSet(s, proj))}
+                      >
+                        <Icon name={open ? "chevronDown" : "chevronRight"} size={12} />
+                      </button>
                     </div>
                     {open &&
                       (list.length > 0 ? (
@@ -1274,18 +1283,18 @@ export function Sidebar(props: Props) {
         onManage={props.onManagePersonas}
       />
 
-      {/* Search is the compact icon in the brand row; capability navigation begins here. */}
+      {/* Applications are user-facing products; their connectors remain implementation details. */}
       <div className="px-2.5 mt-1">
         <button
           className={
             "w-full flex items-center gap-2.5 px-2.5 py-2 rounded-lg text-[13px] text-left hover:bg-paper hover:text-ink " +
-            (props.integrationsActive ? "sidebar-selection" : "text-muted")
+            (props.appsActive ? "sidebar-selection" : "text-muted")
           }
-          data-testid="nav-connectors"
-          onClick={props.onOpenIntegrations}
+          data-testid="nav-apps"
+          onClick={props.onOpenApps}
         >
-          <Icon name="plug" size={15} className="shrink-0" />
-          <span className="flex-1">{t("nav.connectors")}</span>
+          <Icon name="table" size={15} className="shrink-0" />
+          <span className="flex-1">{t("nav.applications")}</span>
         </button>
       </div>
 

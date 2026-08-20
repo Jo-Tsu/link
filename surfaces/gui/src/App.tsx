@@ -73,6 +73,12 @@ const RunsView = lazy(() =>
 const IntegrationsView = lazy(() =>
   import("./components/IntegrationsView").then((module) => ({ default: module.IntegrationsView })),
 );
+const AppsView = lazy(() =>
+  import("./components/AppsView").then((module) => ({ default: module.AppsView })),
+);
+const ProjectView = lazy(() =>
+  import("./components/ProjectView").then((module) => ({ default: module.ProjectView })),
+);
 const MemoryView = lazy(() =>
   import("./components/MemoryView").then((module) => ({ default: module.MemoryView })),
 );
@@ -177,8 +183,9 @@ function resumeTargetForAgent(agent: string, sessions: SessionInfo[]): LastSessi
 
 function fallbackWorkspace(current: string | null, projects: Project[]): string {
   if (current) return current;
-  const active = projects.find((p) => p.status === "active");
-  return active?.workspace_path || projects[0]?.workspace_path || "";
+  const folders = projects.filter((project) => project.project_type !== "system_app");
+  const active = folders.find((p) => p.status === "active");
+  return active?.workspace_path || folders[0]?.workspace_path || "";
 }
 
 function samePayload<T>(current: T, next: T): boolean {
@@ -267,8 +274,10 @@ export function App() {
   // load; corrected by loadSettings.
   const [modelReady, setModelReady] = useState(true);
   const [surface, setSurface] = useState<
-    "session" | "agents" | "runs" | "scheduled" | "integrations" | "memory" | "audit" | "inbox" | "persona" | "settings"
+    "session" | "project" | "apps" | "agents" | "runs" | "scheduled" | "integrations" | "memory" | "audit" | "inbox" | "persona" | "settings"
   >("session");
+  const [projectViewId, setProjectViewId] = useState<string | null>(null);
+  const [appViewId, setAppViewId] = useState<string | null>(null);
   // A remembered Scheduled-detail target must not outlive the surface (see the
   // scheduledOpenId comment above): nav re-entry lands on the list, never a
   // possibly-deleted automation's dead detail.
@@ -1461,7 +1470,7 @@ export function App() {
           onNewSession={() => startNewSession()}
           onSearch={() => setSearchOpen(true)}
           onGoHome={() => setSurface("session")}
-          onOpenIntegrations={() => setSurface("integrations")}
+          onOpenApps={() => { setAppViewId(null); setSurface("apps"); }}
           onOpenMemory={() => setSurface("memory")}
           onOpenAgents={() => setSurface("agents")}
           onOpenRuns={() => setSurface("runs")}
@@ -1500,14 +1509,20 @@ export function App() {
           setSurface("scheduled");
         }}
         onOpenIntegrations={() => setSurface("integrations")}
+        onOpenApps={() => { setAppViewId(null); setSurface("apps"); }}
         onOpenMemory={() => setSurface("memory")}
         onOpenAgents={() => setSurface("agents")}
         onOpenAudit={() => setSurface("audit")}
         onOpenInbox={() => setSurface("inbox")}
         onGoHome={() => setSurface("session")}
+        onOpenProject={(projectId) => {
+          setProjectViewId(projectId);
+          setSurface("project");
+        }}
         scheduledActive={surface === "scheduled"}
         runsActive={surface === "runs"}
         integrationsActive={surface === "integrations"}
+        appsActive={surface === "apps"}
         memoryActive={surface === "memory"}
         agentsActive={surface === "agents"}
         auditActive={surface === "audit"}
@@ -1547,6 +1562,19 @@ export function App() {
           onOpenConnectors={() => setSurface("integrations")}
           initialOpenId={scheduledOpenId}
         />
+      ) : surface === "project" && projectViewId ? (
+        <ProjectView
+          projectId={projectViewId}
+          onBack={() => setSurface("session")}
+          onNewSession={newSessionInProject}
+          onOpenSession={(info) => selectSession(info.session_id, info.workspace, info.agent)}
+          onOpenApplication={(appId) => {
+            setAppViewId(appId);
+            setSurface("apps");
+          }}
+        />
+      ) : surface === "apps" ? (
+        <AppsView initialAppId={appViewId} onNewProjectSession={newSessionInProject} />
       ) : surface === "integrations" ? (
         <IntegrationsView
           workspace={workspace || undefined}

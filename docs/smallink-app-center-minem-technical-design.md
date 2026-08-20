@@ -857,6 +857,21 @@ server/public_api/v1/
 
 ## 20. 迁移方案
 
+### 20.0 当前落地状态（2026-08-21）
+
+已完成：
+
+- `smallink/apps` 中的内置 App Manifest、Registry、Instance、CapabilityRun 和 AssetRef；
+- 唯一且受保护的 `system:minem` 系统项目；
+- 应用中心和 MineM 素材工作台第一版；
+- CLI 白名单覆盖素材读取、改名、删除、导入、页面/案例/汇报相关正式能力；
+- 素材读取与语义操作写入 SensoryRecord、稳定素材引用和项目知识；
+- 专属项目会话与项目聚合页；
+- 本地开发服务 `managedByClient=false` 时，从受信清单向 CLI 注入动态 loopback URL，避免重复等待桌面 App；
+- Fake CLI 合约测试和真实 MineM 0.5.0-beta.9 只读冒烟测试。
+
+仍未完成：MineM 版本化 Public UI API、可嵌入 Workspace Bridge、完整领域 Surface、复杂编排与影响预览，以及写操作的隔离真实 E2E 数据集。因此本节后续阶段继续有效，不得把第一版素材工作台描述为 MineM 全功能等价替代。
+
 ### 20.1 阶段 1
 
 - 建立 App Manifest、Registry 和 Instance；

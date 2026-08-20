@@ -1,12 +1,12 @@
 # Smallink 个人记忆模块技术方案
 
-版本：1.1
-更新日期：2026-08-20
-关联文档：[Smallink 个人记忆模块 PRD](./link-memory-prd.md)、[Smallink 产品技术架构设计](./link-technical-design.md)
+版本：1.2
+更新日期：2026-08-21
+关联文档：[Smallink 个人记忆模块 PRD](./link-memory-prd.md)、[Smallink 产品技术架构设计](./link-technical-design.md)、[Smallink Postgres 迁移运行手册](./smallink-postgres-migration-runbook.md)
 
 > **本文档分两部分**：第 0 章记录**当前已落地的实现**（SQLite 过渡版，代码事实）；第 1 章起是**目标架构**（Postgres + pgvector，尚未实现）。阅读时请先分清“已实现”与“目标”，不要把目标章节当作已上线能力。
 
-## 0. 当前已实现（SQLite 过渡实现，2026-08-20）
+## 0. 当前已实现（SQLite 过渡实现，2026-08-21）
 
 当前实现已经贯通从不可变原始数据到智能体读取正式记忆的完整闭环。AI 只生成候选，用户通过单条或批量决定把候选纳入正式记忆或忽略；只有 `active` 正式记忆会按作用域和相关性进入对话上下文。
 
@@ -40,10 +40,15 @@ Agent Context（记录实际使用的记忆版本）
 | LLM 失败兜底 | `MemoryPipeline.process`（`_write_fallback`） | 解析失败/空/异常时，把原文存为 1 条 `key=None` 的 pending 记忆，**绝不抛错**，保证采集意图不丢 |
 | 幂等重跑 | `MemoryPipeline.select_unprocessed` | 已处理判定来自 `memories.source_record_id` 集合（不改原始层）；重跑不重复产出 |
 | pending 隔离不变量 | `MemoryStore.list(status="active")` 默认 | 默认只返回 active，pending 永不进 `agent.py` 注入、永不进 `GET /v1/memory` 确认视图；`?status=pending` / `?status=all` 仅用于查验 |
-| 管道触发 | `POST /v1/memory/pipeline/run`（`asyncio.to_thread` 卸载阻塞 LLM）→ `manager.run_memory_pipeline` | 手动触发；**本期无自动/定时调度** |
+| 管道触发 | `POST /v1/memory/pipeline/run`（`asyncio.to_thread` 卸载阻塞 LLM）→ `manager.run_memory_pipeline` | 保留手动触发；正式治理另有增量调度器 |
 | 治理任务与候选 | `governance_tasks`、`memory_candidates`、治理路由 | Provider 分析后生成独立候选，保留来源、理由、类型、作用域与置信度；失败可重试 |
 | 人工决定 | 单条 decision 路由与 `POST /v1/memory/candidates/batch/decision` | 支持单条或批量接受/忽略；批量返回成功项与部分失败；接受操作在事务中写正式记忆、来源、版本和决定 |
+| 候选批量分类 | `POST /v1/memory/candidates/batch/type` | 对选中候选统一调整十种标准记忆类型，不改变来源和 AI 理由 |
+| 正式记忆归档 | `POST /v1/memory/{id}/archive`、`POST /v1/memory/{id}/restore` | 归档后退出默认检索，来源、历史和版本不删除；恢复后重新进入 active 集合 |
+| 增量自动治理 | `GET/PATCH /v1/memory/governance/schedule` + `SessionManager` 后台循环 | 默认关闭；支持 15 分钟到 7 天周期和 1-500 条批量；只处理新增 pending 原始记录并记录最近执行结果 |
+| 治理任务列表 | `GET /v1/memory/governance/tasks`、`GET /v1/memory/governance/tasks/{task_id}` | 列表展示待处理/审阅中/完成状态；候选全部作出决定后任务自动完成 |
 | 对话检索注入 | `agent.py` context provider | 仅查询 active 记忆；按 global、当前 workspace、当前 session 隔离，再按关键词相关性和字符预算注入，并记录使用版本 |
+| 项目知识检索 | `knowledge/store.py`、`knowledge/tools.py`、`server/routers/knowledge.py` | 知识条目版本化切片，使用 FTS5/BM25、查询词覆盖和精确短语进行可解释混合词法排序；返回 source_record_id/source_locator 引用 |
 | Codex 本地数据源 | `codex` connector → `POST /v1/connectors/codex/sync` | 用户授权 `~/.codex` 后按会话轮次增量导入，写入 `source_type='codex'` |
 | TRAE CLI 本地数据源 | `traex` connector → `POST /v1/connectors/traex/sync` | 用户授权 `~/.trae` 后读取 `cli/sessions`；只导入用户主线程和已有 `task_complete` 的轮次，排除子智能体与运行中尾部，写入 `source_type='traex'` |
 
@@ -68,11 +73,11 @@ curl "localhost:<port>/v1/memory?status=pending" -H "X-Link-Token: $LINK_API_TOK
 # 4. 重跑幂等 → {processed_records:0, memories_created:0, fallbacks:0}
 ```
 
-测试覆盖：`tests/test_memory_pipeline.py`（typed 抽取 / 多事实 / 坏 JSON 兜底 / provider 异常兜底 / 幂等 / 空 facts）、`tests/test_sensory.py`（ingest 写入 / 幂等 / 缺字段 400）、`tests/test_memory.py`（迁移回填 active / pending 排除 / 版本历史 / 作用域检索）、`tests/test_server.py`（候选单条与批量决定、正式入库和部分失败）。
+测试覆盖：`tests/test_memory_pipeline.py`（typed 抽取 / 多事实 / 坏 JSON 兜底 / provider 异常兜底 / 幂等 / 空 facts）、`tests/test_sensory.py`（ingest 写入 / 幂等 / 缺字段 400）、`tests/test_memory.py`（迁移回填 active / pending 排除 / 版本历史 / 作用域检索）、`tests/test_memory_governance_lifecycle.py`（任务状态、批量分类、归档恢复、增量调度）、`tests/test_knowledge.py`（入库、版本、切片、项目隔离、排序解释和引用）。
 
 ### 0.4 当前仍未完成
 
-自动/定时治理调度、批量调整候选类型、正式记忆归档恢复、冲突任务和提示词评估、通用本地文件/外部连接器、Postgres/pgvector 与向量/混合检索尚未完成。MineM 当前是可连接和启动的本地应用连接器，还不是完整的应用中心与素材工作台。
+尚未完成：记忆冲突任务、提示词评估、Postgres/pgvector 迁移、向量语义召回和 Token 级上下文预算。MineM 已进入应用中心并拥有 `system:minem`、素材列表/详情/搜索/改名/删除/导入、来源沉淀和项目知识索引；完整可嵌入工作台及 MineM 全量领域能力仍需通过版本化 Public UI API/Workspace Bridge 接入。
 
 ### 0.5 过渡实现与目标的映射
 
@@ -80,8 +85,8 @@ curl "localhost:<port>/v1/memory?status=pending" -H "X-Link-Token: $LINK_API_TOK
 |---|---|---|
 | §7.9 `memory.memories`（Postgres，版本表分离） | `memories` 表内联正文 + 加 status/source_record_id | 正文未拆版本表；无 project_space_id |
 | §7.10 `memory_versions` | `memory_history`（old/new/event 行） | 是变更留痕，非“当前版本指针 + 不可变版本”模型 |
-| §4/§8 governance 候选与治理任务 | 已有独立治理任务、候选、来源和用户决定 | 自动调度、批量改类型、冲突任务和提示词评估未完成 |
-| §14 Context Builder 检索注入 | 已有作用域、关键词相关性、字符预算和使用记录 | 向量/混合评分、Token 级预算和效果反馈未完成 |
+| §4/§8 governance 候选与治理任务 | 已有独立治理任务、候选、来源、批量分类、用户决定和增量调度 | 冲突任务和提示词评估未完成 |
+| §14 Context Builder 检索注入 | 记忆已有作用域、关键词相关性、字符预算和使用记录；知识已有可解释混合词法排序 | 向量语义评分、Token 级预算和效果反馈未完成 |
 
 ---
 

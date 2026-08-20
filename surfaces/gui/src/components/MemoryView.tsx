@@ -3,13 +3,21 @@ import {
   decideMemoryCandidate,
   decideMemoryCandidates,
   deleteSensoryRecords,
+  getGovernanceTask,
+  getGovernanceSchedule,
+  getGovernanceTasks,
   getMemory,
   getMemoryCandidate,
   getMemoryCandidates,
   getSensoryRecord,
   getSensoryRecords,
   getSensoryStats,
+  retypeMemoryCandidates,
   runMemoryPipeline,
+  setMemoryArchived,
+  updateGovernanceSchedule,
+  type GovernanceSchedule,
+  type GovernanceTask,
   type MemoryCandidate,
   type MemoryRecord,
   type SensoryRecord,
@@ -36,18 +44,22 @@ const MEMORY_TYPES = [
 
 type MemoryType = (typeof MEMORY_TYPES)[number][0];
 const KNOWN_TYPES = new Set<string>(MEMORY_TYPES.map(([key]) => key));
-type MemorySurface = "home" | "pending" | "sources" | "type" | "prompts";
+type MemorySurface = "home" | "pending" | "sources" | "type" | "prompts" | "tasks" | "archived";
 
 export function MemoryView() {
   const { tr } = useI18n();
   const [memories, setMemories] = useState<MemoryRecord[]>([]);
+  const [archivedMemories, setArchivedMemories] = useState<MemoryRecord[]>([]);
   const [pending, setPending] = useState<MemoryCandidate[]>([]);
+  const [governanceTasks, setGovernanceTasks] = useState<GovernanceTask[]>([]);
+  const [governanceSchedule, setGovernanceSchedule] = useState<GovernanceSchedule | null>(null);
   const [surface, setSurface] = useState<MemorySurface>("home");
   const [selectedType, setSelectedType] = useState<MemoryType | null>(null);
   const [selectedMemory, setSelectedMemory] = useState<MemoryRecord | null>(null);
   const [selectedCandidate, setSelectedCandidate] = useState<MemoryCandidate | null>(null);
   const [selectedCandidateIds, setSelectedCandidateIds] = useState<Set<string>>(new Set());
   const [batchBusy, setBatchBusy] = useState(false);
+  const [batchType, setBatchType] = useState<MemoryType>("project_context");
   const [batchFeedback, setBatchFeedback] = useState<{
     tone: "success" | "warning";
     body: string;
@@ -66,9 +78,18 @@ export function MemoryView() {
     setLoading(true);
     setError("");
     try {
-      const [active, awaiting] = await Promise.all([getMemory(), getMemoryCandidates()]);
+      const [active, archived, awaiting, tasks, schedule] = await Promise.all([
+        getMemory(),
+        getMemory("archived"),
+        getMemoryCandidates(),
+        getGovernanceTasks(),
+        getGovernanceSchedule(),
+      ]);
       setMemories(active);
+      setArchivedMemories(archived);
       setPending(awaiting);
+      setGovernanceTasks(tasks);
+      setGovernanceSchedule(schedule);
       const pendingIds = new Set(awaiting.map((candidate) => candidate.candidate_id));
       setSelectedCandidateIds((current) =>
         new Set([...current].filter((candidateId) => pendingIds.has(candidateId))),
@@ -104,6 +125,35 @@ export function MemoryView() {
     setSelectedCandidate(null);
     setSelectedCandidateIds(new Set());
     setBatchFeedback(null);
+  };
+
+  const retypeSelected = async () => {
+    const candidateIds = [...selectedCandidateIds];
+    if (!candidateIds.length) return;
+    setBatchBusy(true);
+    setBatchFeedback(null);
+    try {
+      const result = await retypeMemoryCandidates(candidateIds, batchType);
+      setBatchFeedback({
+        tone: result.failed.length ? "warning" : "success",
+        body: tr("Updated {processed} candidates; {failed} failed.", {
+          processed: result.processed.length,
+          failed: result.failed.length,
+        }),
+      });
+      const currentCandidateId = selectedCandidate?.candidate_id;
+      await load();
+      if (currentCandidateId) {
+        void getMemoryCandidate(currentCandidateId).then(setSelectedCandidate).catch(() => undefined);
+      }
+    } catch (reason) {
+      setBatchFeedback({
+        tone: "warning",
+        body: reason instanceof Error ? reason.message : tr("Could not update candidate types"),
+      });
+    } finally {
+      setBatchBusy(false);
+    }
   };
 
   const decideSelected = async (action: "accept" | "ignore") => {
@@ -195,6 +245,55 @@ export function MemoryView() {
     return <SourceRecordsView onBack={openHome} />;
   }
 
+  if (surface === "tasks") {
+    return (
+      <GovernanceTasksView
+        tasks={governanceTasks}
+        schedule={governanceSchedule}
+        onScheduleChange={async (changes) => {
+          const updated = await updateGovernanceSchedule(changes);
+          setGovernanceSchedule(updated);
+        }}
+        onBack={openHome}
+        onReview={() => {
+          setSurface("pending");
+          setSelectedCandidate(null);
+        }}
+      />
+    );
+  }
+
+  if (surface === "archived") {
+    return (
+      <main className="flex-1 min-w-0 min-h-0 overflow-y-auto hairline-scroll bg-paper" data-testid="memory-view">
+        <div className="max-w-6xl mx-auto px-5 sm:px-8 py-6">
+          <button className="inline-flex items-center gap-1.5 text-[12px] text-muted hover:text-ink mb-4" onClick={openHome}>
+            <Icon name="arrowLeft" size={14} /> {tr("Back to memory types")}
+          </button>
+          <div className="mb-5">
+            <h1 className="text-[24px] font-semibold text-heading">{tr("Archived memories")}</h1>
+            <p className="text-[12.5px] text-muted mt-0.5">{tr("Kept for history and provenance, but excluded from agent context.")}</p>
+          </div>
+          <div className="grid grid-cols-1 min-[1080px]:grid-cols-[minmax(0,1fr)_360px] gap-4 items-start">
+            <section className="border border-line rounded-lg bg-panel overflow-hidden min-w-0">
+              {archivedMemories.length === 0 ? (
+                <div className="px-4 py-10 text-center"><div className="text-[13px] font-medium text-ink">{tr("No archived memories")}</div></div>
+              ) : archivedMemories.map((item) => (
+                <button key={item.id} className={`w-full text-left px-4 py-3 border-b border-line last:border-b-0 hover:bg-paper/70 ${selectedMemory?.id === item.id ? "bg-accentSoft/35" : ""}`} onClick={() => setSelectedMemory(item)}>
+                  <div className="text-[13px] text-ink line-clamp-2">{item.content}</div>
+                  <div className="text-[11px] text-muted mt-1.5">{typeLabel(item, tr)} · {scopeLabel(item, tr)} · {formatTime(item.updated_at || item.created_at, tr)}</div>
+                </button>
+              ))}
+            </section>
+            <section className="border border-line rounded-lg bg-panel min-w-0 min-[1080px]:sticky min-[1080px]:top-6">
+              {selectedMemory ? <MemoryDetail memory={selectedMemory} archived onChanged={async () => { setSelectedMemory(null); await load(); }} /> : <div className="px-4 py-8 text-[12.5px] text-muted">{tr("Select a memory to view its details.")}</div>}
+            </section>
+          </div>
+        </div>
+      </main>
+    );
+  }
+
   if (surface === "pending") {
     return (
       <main className="flex-1 min-w-0 min-h-0 overflow-y-auto hairline-scroll bg-paper" data-testid="memory-view">
@@ -249,6 +348,23 @@ export function MemoryView() {
                 className="rounded-lg bg-accent px-3 py-1.5 text-[12px] text-onAccent disabled:opacity-40"
               >
                 {tr(batchBusy ? "Processing…" : "Accept selected")}
+              </button>
+              <select
+                value={batchType}
+                onChange={(event) => setBatchType(event.target.value as MemoryType)}
+                disabled={batchBusy || selectedCandidateIds.size === 0}
+                aria-label={tr("Memory type for selected candidates")}
+                className="h-8 rounded-lg border border-line bg-paper px-2 text-[11.5px] text-ink disabled:opacity-40"
+              >
+                {MEMORY_TYPES.map(([key, label]) => <option key={key} value={key}>{tr(label)}</option>)}
+              </select>
+              <button
+                type="button"
+                disabled={batchBusy || selectedCandidateIds.size === 0}
+                onClick={() => void retypeSelected()}
+                className="rounded-lg border border-line px-3 py-1.5 text-[12px] text-ink disabled:opacity-40"
+              >
+                {tr("Apply type")}
               </button>
             </div>
           )}
@@ -342,7 +458,7 @@ export function MemoryView() {
               ))}
             </section>
             <section className="border border-line rounded-lg bg-panel min-w-0 min-[1080px]:sticky min-[1080px]:top-6">
-              {selectedMemory ? <MemoryDetail memory={selectedMemory} /> : <div className="px-4 py-8 text-[12.5px] text-muted">{tr("Select a memory to view its details.")}</div>}
+              {selectedMemory ? <MemoryDetail memory={selectedMemory} onChanged={async () => { setSelectedMemory(null); await load(); }} /> : <div className="px-4 py-8 text-[12.5px] text-muted">{tr("Select a memory to view its details.")}</div>}
             </section>
           </div>
         </div>
@@ -363,10 +479,12 @@ export function MemoryView() {
           </button>
         </div>
 
-        <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-5">
+        <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6 gap-3 mb-5">
           <SummaryCard label={tr("Confirmed memories")} value={memories.length} />
           <SummaryCard label={tr("Global memories")} value={memories.filter((m) => m.scope === "global").length} />
           <SummaryCard label={tr("Project memories")} value={memories.filter((m) => m.scope === "workspace").length} />
+          <SummaryCard label={tr("Governance tasks")} value={governanceTasks.length} action={tr("View tasks")} onClick={() => setSurface("tasks")} />
+          <SummaryCard label={tr("Archived memories")} value={archivedMemories.length} action={tr("View archive")} onClick={() => { setSelectedMemory(null); setSurface("archived"); }} />
           <SummaryCard
             label={tr("Source records")}
             value={sourceStats?.total ?? "—"}
@@ -473,6 +591,124 @@ function MemoryShell({ children }: { children: React.ReactNode }) {
   return (
     <main className="flex-1 min-w-0 min-h-0 overflow-y-auto hairline-scroll bg-paper" data-testid="memory-view">
       <div className="max-w-6xl mx-auto px-5 sm:px-8 py-6">{children}</div>
+    </main>
+  );
+}
+
+function GovernanceTasksView({
+  tasks,
+  schedule,
+  onScheduleChange,
+  onBack,
+  onReview,
+}: {
+  tasks: GovernanceTask[];
+  schedule: GovernanceSchedule | null;
+  onScheduleChange: (changes: Partial<Pick<GovernanceSchedule, "enabled" | "interval_minutes" | "batch_limit">>) => Promise<void>;
+  onBack: () => void;
+  onReview: () => void;
+}) {
+  const { tr } = useI18n();
+  const [selected, setSelected] = useState<GovernanceTask | null>(null);
+  const [loadingDetail, setLoadingDetail] = useState(false);
+  const [detailError, setDetailError] = useState("");
+  const [scheduleBusy, setScheduleBusy] = useState(false);
+  const [scheduleError, setScheduleError] = useState("");
+
+  const changeSchedule = async (
+    changes: Partial<Pick<GovernanceSchedule, "enabled" | "interval_minutes" | "batch_limit">>,
+  ) => {
+    setScheduleBusy(true);
+    setScheduleError("");
+    try {
+      await onScheduleChange(changes);
+    } catch (reason) {
+      setScheduleError(reason instanceof Error ? reason.message : tr("Could not update governance schedule"));
+    } finally {
+      setScheduleBusy(false);
+    }
+  };
+
+  const openTask = async (task: GovernanceTask) => {
+    setSelected(task);
+    setLoadingDetail(true);
+    setDetailError("");
+    try {
+      setSelected(await getGovernanceTask(task.task_id));
+    } catch (reason) {
+      setDetailError(reason instanceof Error ? reason.message : tr("Could not load governance task"));
+    } finally {
+      setLoadingDetail(false);
+    }
+  };
+
+  return (
+    <main className="flex-1 min-w-0 min-h-0 overflow-y-auto hairline-scroll bg-paper" data-testid="memory-view">
+      <div className="max-w-6xl mx-auto px-5 sm:px-8 py-6">
+        <button className="inline-flex items-center gap-1.5 text-[12px] text-muted hover:text-ink mb-4" onClick={onBack}>
+          <Icon name="arrowLeft" size={14} /> {tr("Back to memory types")}
+        </button>
+        <div className="mb-5">
+          <h1 className="text-[24px] font-semibold text-heading">{tr("Governance tasks")}</h1>
+          <p className="text-[12.5px] text-muted mt-0.5">{tr("Each AI analysis run has a fixed source range and remains in review until every candidate is handled.")}</p>
+        </div>
+        {schedule && (
+          <section className="mb-5 flex flex-wrap items-center gap-3 border-y border-line bg-panel/35 px-3 py-3">
+            <span className="min-w-0 flex-1"><span className="block text-[12px] font-medium text-ink">{tr("Automatic AI governance")}</span><span className="block text-[10.5px] text-muted mt-0.5">{schedule.enabled ? tr("Only newly pending source records are processed on this schedule.") : tr("Manual mode: source records wait until you generate candidates.")}</span></span>
+            <select aria-label={tr("Governance interval")} value={schedule.interval_minutes} disabled={!schedule.enabled || scheduleBusy} onChange={(event) => void changeSchedule({ interval_minutes: Number(event.target.value) })} className="h-8 rounded-lg border border-line bg-panel px-2.5 text-[11.5px] text-ink disabled:opacity-50">
+              <option value={60}>{tr("Every hour")}</option>
+              <option value={1440}>{tr("Every day")}</option>
+              <option value={10080}>{tr("Every week")}</option>
+            </select>
+            <button type="button" disabled={scheduleBusy} className={`h-8 px-3 rounded-lg text-[11.5px] disabled:opacity-50 ${schedule.enabled ? "border border-line text-ink" : "bg-accent text-onAccent"}`} onClick={() => void changeSchedule({ enabled: !schedule.enabled })}>{tr(schedule.enabled ? "Use manual mode" : "Enable automatic governance")}</button>
+          </section>
+        )}
+        {scheduleError && <div className="mb-4"><InlineFeedback tone="danger" title={tr("Schedule update failed")} body={scheduleError} /></div>}
+        {tasks.length === 0 ? (
+          <PageState icon="branch" title={tr("No governance tasks yet")} body={tr("A task is created when AI analyzes new source records.")} />
+        ) : (
+          <div className="grid grid-cols-1 min-[1080px]:grid-cols-[minmax(0,1fr)_420px] gap-4 items-start">
+            <section className="border border-line rounded-lg bg-panel overflow-hidden min-w-0">
+              {tasks.map((task) => (
+                <button key={task.task_id} className={`w-full text-left grid grid-cols-[minmax(0,1fr)_110px_18px] items-center gap-3 px-4 py-3 border-b border-line last:border-b-0 hover:bg-paper/70 ${selected?.task_id === task.task_id ? "bg-accentSoft/35" : ""}`} onClick={() => void openTask(task)}>
+                  <span className="min-w-0">
+                    <span className="block text-[12.5px] font-medium text-ink">{tr("Governance task")} #{shortId(task.task_id)}</span>
+                    <span className="block text-[10.5px] text-muted mt-1">{tr("{records} records · {candidates} candidates", { records: task.total_records, candidates: task.candidate_total })}</span>
+                  </span>
+                  <span className={`text-[10.5px] text-right ${task.status === "reviewing" ? "text-accent" : "text-muted"}`}>{tr(task.status)}</span>
+                  <Icon name="chevronRight" size={13} className="text-faint" />
+                </button>
+              ))}
+            </section>
+            <section className="border border-line rounded-lg bg-panel min-w-0 min-[1080px]:sticky min-[1080px]:top-6">
+              {!selected ? <div className="px-4 py-8 text-[12.5px] text-muted">{tr("Select a governance task to view its details.")}</div> : (
+                <div>
+                  <div className="px-4 py-3 border-b border-line flex items-start justify-between gap-3">
+                    <div><div className="text-[13px] font-semibold text-ink">{tr("Governance task details")}</div><div className="text-[10.5px] text-faint mt-0.5">#{shortId(selected.task_id)}</div></div>
+                    <span className="text-[10.5px] text-accent">{tr(selected.status)}</span>
+                  </div>
+                  {loadingDetail ? <div className="px-4 py-8 text-[12px] text-muted">{tr("Loading task details...")}</div> : (
+                    <>
+                      <dl className="grid grid-cols-[120px_minmax(0,1fr)] gap-x-3 gap-y-2 px-4 py-3 text-[11.5px]">
+                        <dt className="text-faint">{tr("Source records")}</dt><dd className="text-ink">{selected.total_records}</dd>
+                        <dt className="text-faint">{tr("Pending candidates")}</dt><dd className="text-ink">{selected.pending_candidates}</dd>
+                        <dt className="text-faint">{tr("Accepted")}</dt><dd className="text-ink">{selected.accepted_candidates}</dd>
+                        <dt className="text-faint">{tr("Ignored")}</dt><dd className="text-ink">{selected.ignored_candidates}</dd>
+                        <dt className="text-faint">{tr("Model")}</dt><dd className="text-ink break-all">{selected.model}</dd>
+                        <dt className="text-faint">{tr("Prompt version")}</dt><dd className="text-ink">{selected.prompt_version}</dd>
+                        <dt className="text-faint">{tr("Created")}</dt><dd className="text-ink">{formatTime(selected.created_at, tr)}</dd>
+                      </dl>
+                      {(selected.candidates?.length ?? 0) > 0 && <div className="border-t border-line px-4 py-3"><div className="text-[11px] font-medium text-muted mb-2">{tr("Candidate results")}</div><div className="space-y-2 max-h-56 overflow-y-auto hairline-scroll">{selected.candidates!.map((candidate) => <div key={candidate.candidate_id} className="bg-paper px-2.5 py-2 rounded-lg"><div className="text-[10px] text-muted">{candidateTypeLabel(candidate, tr)} · {tr(candidate.status)}</div><div className="text-[11.5px] text-ink mt-1 line-clamp-3">{candidate.content}</div></div>)}</div></div>}
+                      {selected.pending_candidates > 0 && <div className="border-t border-line px-4 py-3"><button type="button" className="h-8 px-3 rounded-lg bg-accent text-onAccent text-[11.5px]" onClick={onReview}>{tr("Review pending candidates")}</button></div>}
+                    </>
+                  )}
+                  {detailError && <div className="px-4 pb-3"><InlineFeedback tone="danger" title={tr("Task details unavailable")} body={detailError} /></div>}
+                </div>
+              )}
+            </section>
+          </div>
+        )}
+      </div>
     </main>
   );
 }
@@ -926,17 +1162,43 @@ function CandidateDetail({
   );
 }
 
-function MemoryDetail({ memory }: { memory: MemoryRecord }) {
+function MemoryDetail({
+  memory,
+  archived = false,
+  onChanged,
+}: {
+  memory: MemoryRecord;
+  archived?: boolean;
+  onChanged: () => Promise<void>;
+}) {
   const { tr } = useI18n();
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const changeStatus = async () => {
+    setBusy(true);
+    setError("");
+    try {
+      await setMemoryArchived(memory.id, !archived);
+      await onChanged();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : tr("Could not update memory status"));
+    } finally {
+      setBusy(false);
+    }
+  };
   return <div>
     <div className="px-4 py-3 border-b border-line"><div className="text-[13px] font-semibold text-ink">{tr("Memory details")}</div><div className="text-[10.5px] text-faint mt-0.5">#{memory.id}</div></div>
     <div className="px-4 py-4 text-[13px] leading-relaxed text-ink whitespace-pre-wrap">{memory.content}</div>
     <dl className="grid grid-cols-[92px_minmax(0,1fr)] gap-x-3 gap-y-2 px-4 py-3 border-t border-line text-[11.5px]">
       <dt className="text-faint">{tr("Type")}</dt><dd className="text-ink">{typeLabel(memory, tr)}</dd>
       <dt className="text-faint">{tr("Scope")}</dt><dd className="text-ink">{scopeLabel(memory, tr)}</dd>
-      {memory.status === "pending" && <><dt className="text-faint">{tr("Status")}</dt><dd className="text-ink">{tr("Awaiting confirmation")}</dd></>}
+      <dt className="text-faint">{tr("Status")}</dt><dd className="text-ink">{tr(archived ? "archived" : "active")}</dd>
       <dt className="text-faint">{tr("Created")}</dt><dd className="text-ink">{formatTime(memory.created_at, tr)}</dd>
     </dl>
+    {error && <div className="px-4 pb-3"><InlineFeedback tone="danger" title={tr("Memory update failed")} body={error} /></div>}
+    <div className="border-t border-line px-4 py-3">
+      <button type="button" disabled={busy} onClick={() => void changeStatus()} className="h-8 px-3 rounded-lg border border-line text-[11.5px] text-ink hover:border-accent/40 disabled:opacity-50">{tr(archived ? "Restore memory" : "Archive memory")}</button>
+    </div>
   </div>;
 }
 

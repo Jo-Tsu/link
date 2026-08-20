@@ -94,6 +94,10 @@ class ConversationStore:
                 default_model TEXT,
                 pinned INTEGER DEFAULT 0,
                 sort_order INTEGER DEFAULT 0,
+                project_type TEXT NOT NULL DEFAULT 'folder',
+                owner_app_id TEXT,
+                system_key TEXT,
+                disabled_at TEXT,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT DEFAULT CURRENT_TIMESTAMP
             );
@@ -114,6 +118,11 @@ class ConversationStore:
             "CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project_id)",
             "CREATE INDEX IF NOT EXISTS idx_projects_status ON projects(status)",
             "CREATE INDEX IF NOT EXISTS idx_projects_workspace ON projects(workspace_path)",
+            "ALTER TABLE projects ADD COLUMN project_type TEXT NOT NULL DEFAULT 'folder'",
+            "ALTER TABLE projects ADD COLUMN owner_app_id TEXT",
+            "ALTER TABLE projects ADD COLUMN system_key TEXT",
+            "ALTER TABLE projects ADD COLUMN disabled_at TEXT",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_system_key ON projects(system_key) WHERE system_key IS NOT NULL",
         ):
             try:
                 self._conn.execute(ddl)
@@ -476,8 +485,9 @@ class ConversationStore:
         with self._lock:
             self._conn.execute(
                 """INSERT INTO projects (project_id, name, icon, workspace_path, description,
-                   status, default_agent, default_model, pinned, sort_order, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)""",
+                   status, default_agent, default_model, pinned, sort_order, project_type,
+                   owner_app_id, system_key, disabled_at, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)""",
                 (
                     record.project_id,
                     record.name,
@@ -489,6 +499,10 @@ class ConversationStore:
                     record.default_model,
                     1 if record.pinned else 0,
                     record.sort_order,
+                    record.project_type,
+                    record.owner_app_id,
+                    record.system_key,
+                    record.disabled_at,
                 ),
             )
             self._conn.commit()
@@ -516,6 +530,10 @@ class ConversationStore:
                 default_model=r["default_model"],
                 pinned=bool(r["pinned"]),
                 sort_order=r["sort_order"],
+                project_type=r["project_type"],
+                owner_app_id=r["owner_app_id"],
+                system_key=r["system_key"],
+                disabled_at=r["disabled_at"],
                 created_at=r["created_at"],
                 updated_at=r["updated_at"],
             )
@@ -540,6 +558,10 @@ class ConversationStore:
             default_model=row["default_model"],
             pinned=bool(row["pinned"]),
             sort_order=row["sort_order"],
+            project_type=row["project_type"],
+            owner_app_id=row["owner_app_id"],
+            system_key=row["system_key"],
+            disabled_at=row["disabled_at"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
@@ -562,6 +584,36 @@ class ConversationStore:
             default_model=row["default_model"],
             pinned=bool(row["pinned"]),
             sort_order=row["sort_order"],
+            project_type=row["project_type"],
+            owner_app_id=row["owner_app_id"],
+            system_key=row["system_key"],
+            disabled_at=row["disabled_at"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    def get_project_by_system_key(self, system_key: str) -> Optional[ProjectRecord]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM projects WHERE system_key = ?", (system_key,)
+            ).fetchone()
+        if not row:
+            return None
+        return ProjectRecord(
+            project_id=row["project_id"],
+            name=row["name"],
+            icon=row["icon"],
+            workspace_path=row["workspace_path"],
+            description=row["description"],
+            status=row["status"],
+            default_agent=row["default_agent"],
+            default_model=row["default_model"],
+            pinned=bool(row["pinned"]),
+            sort_order=row["sort_order"],
+            project_type=row["project_type"],
+            owner_app_id=row["owner_app_id"],
+            system_key=row["system_key"],
+            disabled_at=row["disabled_at"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )

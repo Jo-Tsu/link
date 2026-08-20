@@ -72,6 +72,77 @@ async function mockApi(page, state: State) {
     if (path === "/v1/projects") {
       return route.fulfill({ json: { projects: state.projects } });
     }
+    if (path === "/v1/apps") {
+      const now = new Date().toISOString();
+      return route.fulfill({
+        json: {
+          apps: [
+            {
+              schema_version: "smallink.app/v1",
+              app_id: "minem",
+              name: "MineM",
+              description: "Search, create, and manage the local MineM material library.",
+              icon: "minem",
+              runtime_kind: "local_cli",
+              connector_id: "minem",
+              system_project_id: "system:minem",
+              system_project_name: "MineM material library",
+              default_agent: "link",
+              capabilities: ["asset.list", "asset.search", "asset.get", "import.page"],
+              memory_types: ["artifact_summary", "document_insight"],
+              instance: {
+                app_id: "minem",
+                enabled: true,
+                install_state: "installed",
+                runtime_state: "available",
+                app_version: "0.5.0-beta.9",
+                protocol_version: 1,
+                status: {},
+              },
+              runtime: {
+                health: "running",
+                cli_available: true,
+                app_version: "0.5.0-beta.9",
+              },
+              project: {
+                project_id: "system:minem",
+                name: "MineM material library",
+                icon: "M",
+                workspace_path: "",
+                description: "",
+                status: "active",
+                default_agent: "link",
+                default_model: "gpt-test",
+                pinned: true,
+                sort_order: -100,
+                project_type: "system_app",
+                owner_app_id: "minem",
+                system_key: "minem",
+                session_count: 0,
+                created_at: now,
+                updated_at: now,
+              },
+            },
+          ],
+        },
+      });
+    }
+    if (path === "/v1/apps/minem/assets") {
+      return route.fulfill({
+        json: {
+          ok: true,
+          project_id: "system:minem",
+          items: [
+            {
+              id: "page-1",
+              code: "CTRL-APPTEST-001",
+              type: "page",
+              title: "Smallink architecture",
+            },
+          ],
+        },
+      });
+    }
     if (path === "/v1/sessions") {
       return route.fulfill({ json: { sessions: state.sessions } });
     }

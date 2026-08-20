@@ -21,10 +21,16 @@ _ASSET_TYPES = {"all", "report", "page", "resource"}
 
 
 class MineMClient:
-    """Invoke the installed MineM CLI with a small, read-only command surface."""
+    """Invoke the installed MineM CLI through a versioned, capability allowlist."""
 
-    def __init__(self, command: Optional[Iterable[str]] = None):
+    def __init__(
+        self,
+        command: Optional[Iterable[str]] = None,
+        *,
+        base_url: Optional[str] = None,
+    ):
         self._command = list(command) if command else None
+        self._base_url = _loopback_url(base_url)
 
     def command(self) -> list[str] | None:
         if self._command:
@@ -49,12 +55,16 @@ class MineMClient:
         app_installed = Path("/Applications/MineM.app").is_dir()
         manifest = self._read_manifest()
         pid = _safe_int(manifest.get("pid"))
-        running = bool(pid and _pid_alive(pid))
+        runtime_url = _loopback_url(manifest.get("baseUrl"))
+        running = bool(
+            (pid and _pid_alive(pid))
+            or (manifest.get("status") == "running" and runtime_url)
+        )
         return {
             "app_installed": app_installed,
             "cli_available": bool(command),
             "health": "running" if running else "offline",
-            "runtime_url": _loopback_url(manifest.get("baseUrl")),
+            "runtime_url": runtime_url,
             "runtime_pid": pid if running else None,
         }
 
@@ -100,6 +110,16 @@ class MineMClient:
         )
         return _normalise_collection(payload, "results", limit=count)
 
+    def list_assets(
+        self, asset_type: str = "all", limit: int = 30, *, query: str = ""
+    ) -> dict[str, Any]:
+        kind = asset_type if asset_type in _ASSET_TYPES else "all"
+        count = _clamp(limit, default=30, ceiling=200)
+        args = ["asset", "list", "--type", kind, "--limit", str(count)]
+        if str(query or "").strip():
+            args.extend(["--query", str(query).strip()])
+        return _normalise_collection(self._run(args), "assets", limit=count)
+
     def get_asset(self, reference: str) -> dict[str, Any]:
         return self._resource(["asset", "get", _reference(reference)])
 
@@ -117,6 +137,14 @@ class MineMClient:
 
     def get_lineage(self, reference: str) -> dict[str, Any]:
         return self._resource(["asset", "lineage", _reference(reference)])
+
+    def invoke(self, capability: str, arguments: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+        """Execute one declared MineM capability without accepting arbitrary CLI arguments."""
+        try:
+            args = _capability_args(str(capability or "").strip(), arguments or {})
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc), "error_code": "INVALID_ARGUMENT"}
+        return _bounded(self._run(args, timeout=_capability_timeout(capability)))
 
     def _resource(self, args: list[str]) -> dict[str, Any]:
         payload = self._run(args)
@@ -137,6 +165,17 @@ class MineMClient:
         if not command:
             return {"ok": False, "error": {"code": "CLI_NOT_FOUND", "message": "MineM CLI not found"}}
         try:
+            environment = {**os.environ, "NO_COLOR": "1"}
+            # A locally started MineM development service intentionally writes
+            # managedByClient=false. MineM's own discovery ignores that manifest and otherwise
+            # waits for the desktop app even though the public CLI server is already healthy.
+            # Supplying the manifest's validated loopback URL through MineM's documented
+            # MINEM_BASE_URL override preserves the CLI boundary and avoids a fixed port.
+            runtime_url = self._base_url or _loopback_url(
+                self._read_manifest().get("baseUrl")
+            )
+            if runtime_url and not environment.get("MINEM_BASE_URL"):
+                environment["MINEM_BASE_URL"] = runtime_url
             completed = subprocess.run(
                 [
                     *command,
@@ -149,7 +188,7 @@ class MineMClient:
                 text=True,
                 timeout=timeout,
                 check=False,
-                env={**os.environ, "NO_COLOR": "1"},
+                env=environment,
             )
         except subprocess.TimeoutExpired:
             return {
@@ -354,6 +393,164 @@ def _error_message(payload: dict[str, Any]) -> str:
 def _error_code(payload: dict[str, Any]) -> str:
     error = payload.get("error")
     return str(error.get("code") or "") if isinstance(error, dict) else ""
+
+
+_MINEM_CAPABILITIES = {
+    "asset.list",
+    "asset.search",
+    "asset.get",
+    "asset.versions",
+    "asset.lineage",
+    "asset.rename",
+    "asset.delete",
+    "import.report",
+    "import.page",
+    "page.build",
+    "case.brief",
+    "case.import",
+    "task.list",
+    "task.get",
+    "task.wait",
+    "report.create",
+    "report.get",
+    "report.pages",
+    "report.page.add",
+    "report.page.replace",
+    "report.page.move",
+    "report.page.hide",
+    "report.page.show",
+    "report.page.remove",
+    "report.export",
+}
+
+
+def _required(arguments: dict[str, Any], key: str) -> str:
+    value = str(arguments.get(key) or "").strip()
+    if not value:
+        raise ValueError(f"{key} is required")
+    return value
+
+
+def _optional(args: list[str], arguments: dict[str, Any], key: str, flag: str) -> None:
+    value = str(arguments.get(key) or "").strip()
+    if value:
+        args.extend([flag, value])
+
+
+def _wait_flag(arguments: dict[str, Any]) -> str:
+    return "--wait" if arguments.get("wait", True) else "--no-wait"
+
+
+def _mutation_flags(arguments: dict[str, Any]) -> list[str]:
+    if arguments.get("dry_run"):
+        return ["--dry-run"]
+    if not arguments.get("confirm"):
+        raise ValueError("confirm=true is required for this MineM operation")
+    return ["--confirm"]
+
+
+def _capability_args(capability: str, arguments: dict[str, Any]) -> list[str]:
+    if capability not in _MINEM_CAPABILITIES:
+        raise ValueError(f"unsupported MineM capability: {capability}")
+    kind = str(arguments.get("type") or "all")
+    if kind not in _ASSET_TYPES:
+        raise ValueError("type must be all, report, page, or resource")
+    limit = str(_clamp(arguments.get("limit"), default=30, ceiling=200))
+
+    if capability == "asset.list":
+        args = ["asset", "list", "--type", kind, "--limit", limit]
+        _optional(args, arguments, "query", "--query")
+        if arguments.get("include_versions"):
+            args.append("--include-versions")
+        return args
+    if capability == "asset.search":
+        args = ["asset", "search", _required(arguments, "query"), "--type", kind, "--limit", limit]
+        if arguments.get("include_versions"):
+            args.append("--include-versions")
+        return args
+    if capability in {"asset.get", "asset.versions", "asset.lineage"}:
+        args = ["asset", capability.split(".")[1], _required(arguments, "reference")]
+        explicit_type = str(arguments.get("type") or "").strip()
+        if explicit_type:
+            if explicit_type not in _ASSET_TYPES - {"all"}:
+                raise ValueError("type must be report, page, or resource")
+            args.extend(["--type", explicit_type])
+        return args
+    if capability == "asset.rename":
+        args = ["asset", "rename", _required(arguments, "reference"), "--name", _required(arguments, "name")]
+        _optional(args, arguments, "type", "--type")
+        return args
+    if capability == "asset.delete":
+        args = ["asset", "delete", _required(arguments, "reference")]
+        _optional(args, arguments, "type", "--type")
+        return [*args, *_mutation_flags(arguments)]
+    if capability in {"import.report", "import.page"}:
+        args = ["import", capability.split(".")[1], _required(arguments, "source"), _wait_flag(arguments)]
+        _optional(args, arguments, "name", "--name")
+        _optional(args, arguments, "description", "--description")
+        return args
+    if capability == "page.build":
+        args = ["page", "build", "--spec", _required(arguments, "spec"), _wait_flag(arguments)]
+        _optional(args, arguments, "file", "--file")
+        _optional(args, arguments, "name", "--name")
+        _optional(args, arguments, "description", "--description")
+        if arguments.get("publish"):
+            args.append("--publish")
+        return args
+    if capability == "case.brief":
+        args = ["case", "brief", _required(arguments, "source")]
+        _optional(args, arguments, "audience", "--audience")
+        _optional(args, arguments, "focus", "--focus")
+        args.extend(["--max-cases", str(_clamp(arguments.get("max_cases"), default=3, ceiling=12))])
+        if arguments.get("prompt_only"):
+            args.append("--prompt-only")
+        return args
+    if capability == "case.import":
+        args = ["case", "import", _required(arguments, "source"), _wait_flag(arguments)]
+        _optional(args, arguments, "name", "--name")
+        _optional(args, arguments, "industry", "--industry")
+        return args
+    if capability == "task.list":
+        return ["task", "list"]
+    if capability in {"task.get", "task.wait"}:
+        return ["task", capability.split(".")[1], _required(arguments, "task_id")]
+    if capability == "report.create":
+        pages = arguments.get("pages") or arguments.get("page") or []
+        if isinstance(pages, str):
+            pages = [pages]
+        if not isinstance(pages, list) or not pages:
+            raise ValueError("pages must contain at least one page reference")
+        args = ["report", "create"]
+        _optional(args, arguments, "name", "--name")
+        _optional(args, arguments, "note", "--note")
+        for page in pages:
+            args.extend(["--page", str(page)])
+        return args
+    if capability in {"report.get", "report.pages"}:
+        return ["report", capability.split(".")[1], _required(arguments, "report")]
+    if capability == "report.export":
+        fmt = str(arguments.get("format") or "html")
+        if fmt not in {"html", "pdf"}:
+            raise ValueError("format must be html or pdf")
+        args = ["report", "export", _required(arguments, "report"), "--format", fmt, _wait_flag(arguments)]
+        _optional(args, arguments, "destination", "--destination")
+        return args
+
+    action = capability.rsplit(".", 1)[1]
+    args = ["report", "page", action, _required(arguments, "report"), "--page", _required(arguments, "page")]
+    if action == "replace":
+        args.extend(["--with", _required(arguments, "with")])
+    elif action in {"add", "move"}:
+        anchor_key = "after" if arguments.get("after") else "before" if arguments.get("before") else ""
+        if action == "move" and not anchor_key:
+            raise ValueError("after or before is required")
+        if anchor_key:
+            args.extend([f"--{anchor_key}", _required(arguments, anchor_key)])
+    return [*args, *_mutation_flags(arguments)]
+
+
+def _capability_timeout(capability: str) -> float:
+    return 180.0 if capability.startswith(("import.", "page.build", "report.export", "task.wait")) else 40.0
 
 
 def _reference(value: str) -> str:

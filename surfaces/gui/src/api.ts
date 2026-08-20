@@ -217,6 +217,261 @@ export async function getProjectSessions(projectId: string): Promise<SessionInfo
   return (await res.json()).sessions ?? [];
 }
 
+// -- application center -------------------------------------------------------
+
+export interface AppInstance {
+  app_id: string;
+  enabled: boolean;
+  install_state: "unknown" | "not_installed" | "installed";
+  runtime_state: "offline" | "available" | "error" | "disabled";
+  app_version?: string | null;
+  protocol_version?: string | number | null;
+  status: Record<string, any>;
+  last_checked_at?: string | null;
+  last_error?: string | null;
+}
+
+export interface SmallinkApp {
+  schema_version: string;
+  app_id: string;
+  name: string;
+  description: string;
+  icon: string;
+  runtime_kind: string;
+  connector_id: string;
+  system_project_id: string;
+  system_project_name: string;
+  default_agent: string;
+  capabilities: string[];
+  memory_types: string[];
+  instance: AppInstance;
+  runtime: Record<string, any>;
+  project: Project;
+}
+
+export interface AppAsset {
+  id?: string;
+  code?: string;
+  type?: string;
+  assetType?: string;
+  title?: string;
+  name?: string;
+  description?: string;
+  preview?: string;
+  previewUrl?: string;
+  url?: string;
+  updatedAt?: string;
+  createdAt?: string;
+  [key: string]: any;
+}
+
+export interface AppCapabilityResult {
+  ok: boolean;
+  error?: string | { code?: string; message?: string };
+  error_code?: string;
+  resource?: AppAsset;
+  data?: any;
+  links?: Record<string, string>;
+  smallink?: {
+    capability_run_id: string;
+    sensory_record_id: string;
+    status: string;
+  };
+  [key: string]: any;
+}
+
+export interface ProjectAssetRef {
+  asset_ref_id: string;
+  app_id: string;
+  project_id: string | null;
+  external_asset_id: string;
+  external_code: string | null;
+  asset_type: string | null;
+  version_id: string;
+  title: string | null;
+  preview_ref: string | null;
+  sensory_record_id: string | null;
+  first_seen_at: string;
+  last_seen_at: string;
+}
+
+export interface KnowledgeItem {
+  item_id: string;
+  project_id: string | null;
+  source_record_id: string | null;
+  source_type: string;
+  external_id: string;
+  title: string;
+  content: string;
+  content_hash: string;
+  status: "active" | "archived";
+  current_version: number;
+  chunk_count: number;
+  metadata: Record<string, any>;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface KnowledgeSearchResult {
+  item_id: string;
+  chunk_id: string;
+  project_id: string | null;
+  title: string;
+  content: string;
+  score: number;
+  score_components: {
+    full_text: number;
+    term_coverage: number;
+    exact_phrase: number;
+  };
+  matched_terms: string[];
+  explanation: string[];
+  citation: {
+    source_type: string;
+    external_id: string;
+    source_record_id: string | null;
+    source_locator: string | null;
+  };
+  updated_at: string;
+}
+
+export interface ProjectOverview {
+  project: Project;
+  metrics: {
+    sessions: number;
+    tasks: number;
+    source_records: number;
+    pending_governance: number;
+    memory_candidates: number;
+    memories: number;
+    app_assets: number;
+    knowledge: number;
+  };
+  sessions: SessionInfo[];
+  tasks: RuntimeTask[];
+  source_records: SensoryRecord[];
+  source_statuses: Record<string, number>;
+  candidates: MemoryCandidate[];
+  memories: MemoryRecord[];
+  memory_types: Record<string, number>;
+  app_assets: ProjectAssetRef[];
+  knowledge: KnowledgeItem[];
+}
+
+export interface SensoryProvenance {
+  record_id: string;
+  source: SensoryRecord;
+  candidates: Array<Record<string, any>>;
+  decisions: Array<Record<string, any>>;
+  memories: MemoryRecord[];
+  usages: Array<Record<string, any>>;
+}
+
+export async function getApps(): Promise<SmallinkApp[]> {
+  const res = await fetch(`${httpBase()}/v1/apps`);
+  return (await res.json()).apps ?? [];
+}
+
+export async function getApp(appId: string): Promise<SmallinkApp> {
+  const res = await fetch(`${httpBase()}/v1/apps/${encodeURIComponent(appId)}`);
+  return res.json();
+}
+
+export async function changeAppState(
+  appId: string,
+  action: "enable" | "check" | "disable",
+): Promise<{ ok: boolean; app: SmallinkApp; result?: Record<string, any> }> {
+  const res = await fetch(`${httpBase()}/v1/apps/${encodeURIComponent(appId)}/${action}`, {
+    method: "POST",
+  });
+  return res.json();
+}
+
+export async function getAppAssets(
+  appId: string,
+  options: { query?: string; assetType?: string; limit?: number; sessionId?: string } = {},
+): Promise<AppCapabilityResult & { items: AppAsset[]; project_id: string }> {
+  const params = new URLSearchParams();
+  if (options.query) params.set("query", options.query);
+  if (options.assetType) params.set("asset_type", options.assetType);
+  if (options.limit) params.set("limit", String(options.limit));
+  if (options.sessionId) params.set("session_id", options.sessionId);
+  const suffix = params.size ? `?${params}` : "";
+  const res = await fetch(`${httpBase()}/v1/apps/${encodeURIComponent(appId)}/assets${suffix}`);
+  return res.json();
+}
+
+export async function invokeAppCapability(
+  appId: string,
+  capability: string,
+  arguments_: Record<string, any>,
+  sessionId?: string,
+): Promise<AppCapabilityResult> {
+  const res = await fetch(
+    `${httpBase()}/v1/apps/${encodeURIComponent(appId)}/capabilities/${encodeURIComponent(capability)}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ arguments: arguments_, session_id: sessionId }),
+    },
+  );
+  return res.json();
+}
+
+export async function getAppActivity(appId: string): Promise<Array<Record<string, any>>> {
+  const res = await fetch(`${httpBase()}/v1/apps/${encodeURIComponent(appId)}/activity`);
+  return (await res.json()).activity ?? [];
+}
+
+export async function pickAppImportFile(appId: string): Promise<string | null> {
+  const res = await fetch(`${httpBase()}/v1/apps/${encodeURIComponent(appId)}/pick-file`, {
+    method: "POST",
+  });
+  const data = await res.json();
+  return data.ok && typeof data.path === "string" ? data.path : null;
+}
+
+export async function getProjectOverview(projectId: string): Promise<ProjectOverview> {
+  const res = await fetch(`${httpBase()}/v1/projects/${encodeURIComponent(projectId)}/overview`);
+  if (!res.ok) throw new Error("Could not load project overview");
+  return res.json();
+}
+
+export async function searchKnowledge(
+  query: string,
+  options: { projectId?: string; limit?: number } = {},
+): Promise<{ query: string; results: KnowledgeSearchResult[]; strategy: string }> {
+  const params = new URLSearchParams({ q: query });
+  if (options.projectId) params.set("project_id", options.projectId);
+  if (options.limit) params.set("limit", String(options.limit));
+  const res = await fetch(`${httpBase()}/v1/knowledge/search?${params}`);
+  if (!res.ok) throw new Error("Could not search knowledge");
+  return res.json();
+}
+
+export async function indexProjectKnowledge(projectId: string): Promise<{
+  ok: boolean;
+  indexed: number;
+  skipped: number;
+}> {
+  const res = await fetch(
+    `${httpBase()}/v1/knowledge/projects/${encodeURIComponent(projectId)}/index`,
+    { method: "POST" },
+  );
+  if (!res.ok) throw new Error("Could not index project knowledge");
+  return res.json();
+}
+
+export async function setKnowledgeArchived(itemId: string, archived: boolean): Promise<KnowledgeItem> {
+  const res = await fetch(`${httpBase()}/v1/knowledge/${encodeURIComponent(itemId)}/archive`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ archived }),
+  });
+  if (!res.ok) throw new Error("Could not update knowledge item");
+  return (await res.json()).item;
+}
+
 export async function getSessions(workspace?: string): Promise<SessionInfo[]> {
   const q = workspace ? `?workspace=${encodeURIComponent(workspace)}` : "";
   const res = await fetch(`${httpBase()}/v1/sessions${q}`);
@@ -344,7 +599,7 @@ export interface MemoryRecord {
   source_record_id?: string | null;
 }
 
-export async function getMemory(status?: "active" | "pending" | "all"): Promise<MemoryRecord[]> {
+export async function getMemory(status?: "active" | "pending" | "archived" | "all"): Promise<MemoryRecord[]> {
   const query = status ? `?status=${status}` : "";
   const res = await fetch(`${httpBase()}/v1/memory${query}`);
   if (!res.ok) throw new Error("Could not load memories");
@@ -439,6 +694,43 @@ export interface BatchMemoryDecisionResult {
   failed: Array<{ candidate_id: string; error: string }>;
 }
 
+export interface GovernanceTask {
+  task_id: string;
+  status: "pending" | "running" | "reviewing" | "completed" | "failed" | "cancelled";
+  model: string;
+  prompt_version: string;
+  total_records: number;
+  processed_records: number;
+  candidates_created: number;
+  skipped_records: number;
+  failed_records: number;
+  candidate_total: number;
+  pending_candidates: number;
+  accepted_candidates: number;
+  ignored_candidates: number;
+  created_at: string;
+  updated_at: string;
+  error?: string | null;
+  records?: Array<{
+    record_id: string;
+    status: string;
+    attempts: number;
+    processed_at?: string | null;
+    error?: string | null;
+  }>;
+  candidates?: MemoryCandidate[];
+}
+
+export interface GovernanceSchedule {
+  enabled: boolean;
+  interval_minutes: number;
+  batch_limit: number;
+  last_run_at: string | null;
+  next_run_at: string | null;
+  last_result: Record<string, any> | null;
+  running: boolean;
+}
+
 export async function decideMemoryCandidates(
   candidateIds: string[],
   action: "accept" | "ignore",
@@ -451,6 +743,77 @@ export async function decideMemoryCandidates(
   const data = await res.json();
   if (!res.ok) throw new Error(data.detail || data.error || "Could not save memory decisions");
   return data;
+}
+
+export async function retypeMemoryCandidates(
+  candidateIds: string[],
+  memoryType: string,
+): Promise<{
+  ok: boolean;
+  memory_type: string;
+  requested: number;
+  processed: MemoryCandidate[];
+  failed: Array<{ candidate_id: string; error: string }>;
+}> {
+  const res = await fetch(`${httpBase()}/v1/memory/candidates/batch/type`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ candidate_ids: candidateIds, memory_type: memoryType }),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.detail || data.error || "Could not update candidate types");
+  return data;
+}
+
+export async function getGovernanceTasks(
+  status?: GovernanceTask["status"] | "all",
+): Promise<GovernanceTask[]> {
+  const query = status ? `?status=${encodeURIComponent(status)}` : "";
+  const res = await fetch(`${httpBase()}/v1/memory/governance/tasks${query}`);
+  if (!res.ok) throw new Error("Could not load governance tasks");
+  return (await res.json()).tasks ?? [];
+}
+
+export async function getGovernanceTask(taskId: string): Promise<GovernanceTask> {
+  const res = await fetch(
+    `${httpBase()}/v1/memory/governance/tasks/${encodeURIComponent(taskId)}`,
+  );
+  if (!res.ok) throw new Error("Could not load governance task");
+  return res.json();
+}
+
+export async function getGovernanceSchedule(): Promise<GovernanceSchedule> {
+  const res = await fetch(`${httpBase()}/v1/memory/governance/schedule`);
+  if (!res.ok) throw new Error("Could not load governance schedule");
+  return res.json();
+}
+
+export async function updateGovernanceSchedule(payload: {
+  enabled?: boolean;
+  interval_minutes?: number;
+  batch_limit?: number;
+}): Promise<GovernanceSchedule> {
+  const res = await fetch(`${httpBase()}/v1/memory/governance/schedule`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.detail || data.error || "Could not update governance schedule");
+  return data;
+}
+
+export async function setMemoryArchived(
+  memoryId: number,
+  archived: boolean,
+): Promise<MemoryRecord> {
+  const action = archived ? "archive" : "restore";
+  const res = await fetch(`${httpBase()}/v1/memory/${memoryId}/${action}`, {
+    method: "POST",
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.detail || data.error || "Could not update memory status");
+  return data.memory;
 }
 
 export async function getRuntimeTasks(limit = 100): Promise<RuntimeTask[]> {
@@ -471,6 +834,7 @@ export async function getSensoryRecords(params: {
   source_type?: string;
   governance_status?: string;
   conversation_id?: string;
+  project_path?: string;
   query?: string;
 } = {}): Promise<{ records: SensoryRecord[]; total: number; limit: number; offset: number }> {
   const query = new URLSearchParams();
@@ -505,6 +869,14 @@ export async function deleteSensoryRecords(payload: {
 export async function getSensoryRecord(recordId: string): Promise<SensoryRecord> {
   const res = await fetch(`${httpBase()}/v1/sensory-records/${encodeURIComponent(recordId)}`);
   if (!res.ok) throw new Error("Could not load source record");
+  return res.json();
+}
+
+export async function getSensoryProvenance(recordId: string): Promise<SensoryProvenance> {
+  const res = await fetch(
+    `${httpBase()}/v1/sensory-records/${encodeURIComponent(recordId)}/provenance`,
+  );
+  if (!res.ok) throw new Error("Could not load source provenance");
   return res.json();
 }
 

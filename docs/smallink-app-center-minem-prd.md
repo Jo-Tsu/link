@@ -1,8 +1,8 @@
 # Smallink 应用中心与 MineM 首个应用产品需求文档（PRD）
 
-文档版本：1.1  
-更新日期：2026-08-09  
-产品阶段：目标设计，进入开发前评审  
+文档版本：1.2
+更新日期：2026-08-21
+产品阶段：第一版主链已实现，完整嵌入工作台继续开发
 产品名称：Smallink  
 首个应用：MineM  
 关联文档：[技术设计](./smallink-app-center-minem-technical-design.md)、[测试计划](./smallink-app-center-minem-test-plan.md)、[Smallink 主 PRD](./link-product-prd.md)、[个人记忆 PRD](./link-memory-prd.md)
@@ -24,6 +24,8 @@ Smallink 新增“应用中心”，用于把具有独立领域能力的本地�
 产品定位：
 
 > Smallink 是个人 AI 工作系统；应用中心把外部优秀产品变成可对话、可执行、可沉淀、可记忆的 Smallink 应用。MineM 是首个应用，也是该框架的标准样板。
+
+> **当前实现说明（2026-08-21）**：应用清单、应用实例、唯一 `system:minem` 项目、应用中心、素材列表/筛选/搜索/详情、版本与来源读取、改名、删除、导入、活动记录、专属会话、稳定素材引用、SensoryRecord 沉淀和知识索引已经落地。Smallink 使用 `minem.cli/v1` 受控能力白名单；真实 MineM 0.5.0-beta.9 状态与素材列表已通过联调。完整 MineM Workspace Bridge、故事线、标签治理、复杂编排和高频无 CLI 子进程交互仍属于后续阶段。
 
 ## 1. 背景与问题
 

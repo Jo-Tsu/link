@@ -12,6 +12,7 @@ from typing import Any, Optional
 
 from ..sqlite import connect_sqlite
 from .base import MemoryStore, Scope
+from .types import MEMORY_TYPES
 
 
 def _now() -> str:
@@ -281,6 +282,73 @@ class SQLiteGovernanceStore:
             ).fetchone()
         return self._candidate(row) if row else None
 
+    def set_candidate_type(
+        self, candidate_id: str, memory_type: str
+    ) -> MemoryCandidate:
+        if memory_type not in MEMORY_TYPES:
+            raise ValueError("unsupported memory type")
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT status, memory_type FROM memory_candidates WHERE candidate_id=?",
+                (candidate_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(candidate_id)
+            if row["status"] != "pending":
+                raise ValueError("only pending candidates can change type")
+            if row["memory_type"] != memory_type:
+                self._conn.execute(
+                    "UPDATE memory_candidates SET memory_type=?, updated_at=? WHERE candidate_id=?",
+                    (memory_type, _now(), candidate_id),
+                )
+                self._conn.commit()
+        candidate = self.get_candidate(candidate_id)
+        assert candidate is not None
+        return candidate
+
+    def list_tasks(
+        self, *, status: Optional[str] = None, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        where = " WHERE t.status=?" if status else ""
+        params: list[Any] = [status] if status else []
+        params.append(max(1, min(int(limit), 500)))
+        with self._lock:
+            rows = self._conn.execute(
+                f"""
+                SELECT t.*,
+                    (SELECT COUNT(*) FROM memory_candidates c WHERE c.task_id=t.task_id)
+                        AS candidate_total,
+                    (SELECT COUNT(*) FROM memory_candidates c
+                     WHERE c.task_id=t.task_id AND c.status='pending') AS pending_candidates,
+                    (SELECT COUNT(*) FROM memory_candidates c
+                     WHERE c.task_id=t.task_id AND c.status='accepted') AS accepted_candidates,
+                    (SELECT COUNT(*) FROM memory_candidates c
+                     WHERE c.task_id=t.task_id AND c.status='ignored') AS ignored_candidates
+                FROM governance_tasks t{where}
+                ORDER BY t.created_at DESC, t.task_id DESC LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_task(self, task_id: str) -> Optional[dict[str, Any]]:
+        tasks = [task for task in self.list_tasks(limit=500) if task["task_id"] == task_id]
+        if not tasks:
+            return None
+        task = tasks[0]
+        with self._lock:
+            task["records"] = [
+                dict(row)
+                for row in self._conn.execute(
+                    """
+                    SELECT * FROM governance_task_records
+                    WHERE task_id=? ORDER BY record_id
+                    """,
+                    (task_id,),
+                ).fetchall()
+            ]
+        return task
+
     def source_references(self, record_ids: list[str]) -> dict[str, list[Any]]:
         """Return governance and formal-memory references for source records.
 
@@ -318,6 +386,141 @@ class SQLiteGovernanceStore:
             "memory_ids": sorted(memory_ids),
         }
 
+    def provenance_for_record(self, record_id: str) -> dict[str, Any]:
+        """Return the complete durable chain rooted at one immutable source record."""
+        with self._lock:
+            candidates = [
+                dict(row)
+                for row in self._conn.execute(
+                    """
+                    SELECT c.* FROM memory_candidates c
+                    JOIN candidate_sources cs ON cs.candidate_id=c.candidate_id
+                    WHERE cs.record_id=? ORDER BY c.created_at, c.candidate_id
+                    """,
+                    (record_id,),
+                ).fetchall()
+            ]
+            candidate_ids = [str(row["candidate_id"]) for row in candidates]
+            decisions: list[dict[str, Any]] = []
+            if candidate_ids:
+                placeholders = ",".join("?" for _ in candidate_ids)
+                decisions = [
+                    {
+                        **dict(row),
+                        "metadata": json.loads(row["metadata_json"] or "{}"),
+                    }
+                    for row in self._conn.execute(
+                        f"""
+                        SELECT * FROM governance_decisions
+                        WHERE candidate_id IN ({placeholders})
+                        ORDER BY created_at, decision_id
+                        """,
+                        candidate_ids,
+                    ).fetchall()
+                ]
+                for decision in decisions:
+                    decision.pop("metadata_json", None)
+            memories = [
+                dict(row)
+                for row in self._conn.execute(
+                    """
+                    SELECT m.*, ms.candidate_id, ms.created_at AS linked_at
+                    FROM memory_sources ms
+                    JOIN memories m ON m.id=ms.memory_id
+                    WHERE ms.record_id=? ORDER BY m.id
+                    """,
+                    (record_id,),
+                ).fetchall()
+            ]
+            memory_ids = [int(row["id"]) for row in memories]
+            usages: list[dict[str, Any]] = []
+            if memory_ids:
+                placeholders = ",".join("?" for _ in memory_ids)
+                usages = [
+                    dict(row)
+                    for row in self._conn.execute(
+                        f"""
+                        SELECT * FROM memory_usage WHERE memory_id IN ({placeholders})
+                        ORDER BY used_at DESC
+                        """,
+                        memory_ids,
+                    ).fetchall()
+                ]
+        return {
+            "record_id": record_id,
+            "candidates": candidates,
+            "decisions": decisions,
+            "memories": memories,
+            "usages": usages,
+        }
+
+    def source_summary(self, project_path: str) -> dict[str, Any]:
+        """Aggregate governance output for records captured inside one project."""
+        with self._lock:
+            candidate_rows = self._conn.execute(
+                """
+                SELECT c.status, COUNT(DISTINCT c.candidate_id) AS count
+                FROM memory_candidates c
+                JOIN candidate_sources cs ON cs.candidate_id=c.candidate_id
+                JOIN sensory_records sr ON sr.record_id=cs.record_id
+                WHERE sr.project_path=? GROUP BY c.status
+                """,
+                (project_path,),
+            ).fetchall()
+            memory_rows = self._conn.execute(
+                """
+                SELECT COALESCE(m.key, 'untyped') AS memory_type,
+                       COUNT(DISTINCT m.id) AS count
+                FROM memories m
+                JOIN memory_sources ms ON ms.memory_id=m.id
+                JOIN sensory_records sr ON sr.record_id=ms.record_id
+                WHERE sr.project_path=? AND m.status='active'
+                GROUP BY COALESCE(m.key, 'untyped')
+                """,
+                (project_path,),
+            ).fetchall()
+        candidates = {str(row["status"]): int(row["count"]) for row in candidate_rows}
+        memory_types = {
+            str(row["memory_type"]): int(row["count"]) for row in memory_rows
+        }
+        return {
+            "candidates": candidates,
+            "candidate_total": sum(candidates.values()),
+            "memory_types": memory_types,
+            "memory_total": sum(memory_types.values()),
+        }
+
+    def project_items(self, project_path: str, *, limit: int = 100) -> dict[str, Any]:
+        bounded = max(1, min(int(limit), 500))
+        with self._lock:
+            candidates = [
+                dict(row)
+                for row in self._conn.execute(
+                    """
+                    SELECT DISTINCT c.* FROM memory_candidates c
+                    JOIN candidate_sources cs ON cs.candidate_id=c.candidate_id
+                    JOIN sensory_records sr ON sr.record_id=cs.record_id
+                    WHERE sr.project_path=?
+                    ORDER BY c.created_at DESC, c.candidate_id DESC LIMIT ?
+                    """,
+                    (project_path, bounded),
+                ).fetchall()
+            ]
+            memories = [
+                dict(row)
+                for row in self._conn.execute(
+                    """
+                    SELECT DISTINCT m.* FROM memories m
+                    JOIN memory_sources ms ON ms.memory_id=m.id
+                    JOIN sensory_records sr ON sr.record_id=ms.record_id
+                    WHERE sr.project_path=? AND m.status='active'
+                    ORDER BY m.id DESC LIMIT ?
+                    """,
+                    (project_path, bounded),
+                ).fetchall()
+            ]
+        return {"candidates": candidates, "memories": memories}
+
     def decide(
         self,
         candidate_id: str,
@@ -331,7 +534,14 @@ class SQLiteGovernanceStore:
         if candidate is None:
             raise KeyError(candidate_id)
         if candidate.status != "pending":
-            return {"ok": True, "candidate": candidate.to_dict(), "idempotent": True}
+            task = self.get_task(candidate.task_id)
+            return {
+                "ok": True,
+                "candidate": candidate.to_dict(),
+                "idempotent": True,
+                "task_status": task["status"] if task else None,
+                "pending_count": task["pending_candidates"] if task else 0,
+            }
         if action not in {"accept", "edit_accept", "ignore", "merge"}:
             raise ValueError("unsupported governance action")
         final_content = (content or candidate.content).strip()
@@ -440,6 +650,9 @@ class SQLiteGovernanceStore:
                     "UPDATE memory_candidates SET status=?, updated_at=? WHERE candidate_id=?",
                     (status, now, candidate_id),
                 )
+                task_status, pending_count = self._refresh_task_status_locked(
+                    candidate.task_id
+                )
                 if memory_id is not None:
                     self._append_version_locked(
                         memory_store,
@@ -481,7 +694,82 @@ class SQLiteGovernanceStore:
             "candidate": updated.to_dict() if updated else None,
             "memory_id": memory_id,
             "decision_id": decision_id,
+            "task_status": task_status,
+            "pending_count": pending_count,
         }
+
+    def set_memory_status(
+        self, memory_store: MemoryStore, memory_id: int, status: str
+    ) -> dict[str, Any]:
+        if status not in {"active", "archived"}:
+            raise ValueError("memory status must be active or archived")
+        same_database = (
+            getattr(memory_store, "path", None) is not None
+            and str(getattr(memory_store, "path")) == self.path
+        )
+        if not same_database:
+            item = memory_store.set_status(memory_id, status)
+            if item is None:
+                raise KeyError(memory_id)
+            with self._lock:
+                self._conn.execute("BEGIN IMMEDIATE")
+                try:
+                    self._append_version_locked(
+                        memory_store, memory_id, decision_id=None
+                    )
+                    self._conn.commit()
+                except Exception:
+                    self._conn.rollback()
+                    raise
+            return {"memory": item, "idempotent": False}
+
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM memories WHERE id=?", (memory_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(memory_id)
+            if row["status"] == status:
+                item = memory_store.get(memory_id)
+                return {"memory": item, "idempotent": True}
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._conn.execute(
+                    "UPDATE memories SET status=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                    (status, memory_id),
+                )
+                self._conn.execute(
+                    """
+                    INSERT INTO memory_history (
+                        memory_id, old_content, new_content, event
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        memory_id,
+                        row["content"],
+                        row["content"],
+                        "ARCHIVE" if status == "archived" else "RESTORE",
+                    ),
+                )
+                self._append_version_locked(
+                    memory_store,
+                    memory_id,
+                    decision_id=None,
+                    memory_override={
+                        "content": row["content"],
+                        "key": row["key"],
+                        "scope": row["scope"],
+                        "workspace": row["workspace"],
+                        "session_id": row["session_id"],
+                        "status": status,
+                    },
+                )
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+        item = memory_store.get(memory_id)
+        return {"memory": item, "idempotent": False}
 
     def record_usage(
         self,
@@ -532,9 +820,15 @@ class SQLiteGovernanceStore:
                     "SELECT COUNT(*) FROM memory_candidates WHERE task_id=?", (task_id,)
                 ).fetchone()[0]
             )
+            pending_candidates = int(
+                self._conn.execute(
+                    "SELECT COUNT(*) FROM memory_candidates WHERE task_id=? AND status='pending'",
+                    (task_id,),
+                ).fetchone()[0]
+            )
             status = "failed" if counts.get("failed", 0) and not (
                 counts.get("processed", 0) or counts.get("skipped", 0)
-            ) else "completed"
+            ) else ("reviewing" if pending_candidates else "completed")
             now = _now()
             self._conn.execute(
                 """
@@ -564,7 +858,7 @@ class SQLiteGovernanceStore:
         memory_store: MemoryStore,
         memory_id: int,
         *,
-        decision_id: str,
+        decision_id: Optional[str],
         memory_override: Optional[dict[str, Any]] = None,
     ) -> None:
         memory = memory_store.get(memory_id) if memory_override is None else None
@@ -597,6 +891,20 @@ class SQLiteGovernanceStore:
                 decision_id,
             ),
         )
+
+    def _refresh_task_status_locked(self, task_id: str) -> tuple[str, int]:
+        pending = int(
+            self._conn.execute(
+                "SELECT COUNT(*) FROM memory_candidates WHERE task_id=? AND status='pending'",
+                (task_id,),
+            ).fetchone()[0]
+        )
+        status = "reviewing" if pending else "completed"
+        self._conn.execute(
+            "UPDATE governance_tasks SET status=?, updated_at=? WHERE task_id=?",
+            (status, _now(), task_id),
+        )
+        return status, pending
 
     def _candidate(self, row) -> MemoryCandidate:
         with self._lock:

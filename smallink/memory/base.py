@@ -69,6 +69,9 @@ class MemoryStore(ABC):
     def update(self, item_id: int, content: str) -> Optional[MemoryItem]: ...
 
     @abstractmethod
+    def set_status(self, item_id: int, status: str) -> Optional[MemoryItem]: ...
+
+    @abstractmethod
     def delete(self, item_id: int) -> bool: ...
 
 

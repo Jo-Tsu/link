@@ -1,6 +1,7 @@
 from .base import MemoryItem, MemoryStore, Scope, format_memories
 from .governance import MemoryCandidate, SQLiteGovernanceStore
-from .pipeline import MEMORY_TYPES, MemoryPipeline
+from .types import MEMORY_TYPES
+from .pipeline import MemoryPipeline
 from .retrieval import query_text, select_memories
 from .sqlite_store import SQLiteMemoryStore
 from .tools import memory_tools
