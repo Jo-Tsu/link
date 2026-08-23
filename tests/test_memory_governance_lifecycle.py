@@ -131,6 +131,44 @@ def test_memory_lifecycle_and_batch_type_apis(tmp_path):
     assert restored.json()["memory"]["status"] == "active"
 
 
+def test_auto_accept_requires_explicit_confirmation(tmp_path):
+    manager = SessionManager(data_dir=tmp_path / "data", provider=NoopProvider())
+    task_id = manager.governance_store.create_task(
+        ["source-1"], model="test", prompt_version="v1"
+    )
+    candidate = manager.governance_store.add_candidate(
+        task_id=task_id,
+        content="Uses concise product interfaces.",
+        memory_type="user_preference",
+        scope=Scope.GLOBAL,
+        workspace=None,
+        session_id=None,
+        model="test",
+        prompt_version="v1",
+        source_ids=["source-1"],
+        confidence=0.95,
+    )
+    manager.governance_store.mark_record(task_id, "source-1", "processed")
+    manager.governance_store.finish_task(task_id)
+    client = TestClient(create_app(manager))
+
+    blocked = client.post(
+        "/v1/memory/candidates/auto-accept", json={"threshold": 0.9}
+    )
+    assert blocked.status_code == 409
+    assert blocked.json()["error"] == "confirmation_required"
+    assert manager.memory_store.list() == []
+    assert manager.memory_candidate(candidate.candidate_id)["status"] == "pending"
+
+    accepted = client.post(
+        "/v1/memory/candidates/auto-accept",
+        json={"threshold": 0.9, "confirmed": True},
+    )
+    assert accepted.status_code == 200
+    assert accepted.json()["auto_accepted"] == 1
+    assert len(manager.memory_store.list()) == 1
+
+
 def test_scheduled_governance_processes_only_pending_incremental_records(tmp_path):
     manager = SessionManager(data_dir=tmp_path / "data", provider=TypedProvider())
     manager.sensory_store.add(
@@ -147,7 +185,10 @@ def test_scheduled_governance_processes_only_pending_incremental_records(tmp_pat
     first = asyncio.run(manager.run_scheduled_governance_once(force=True))
     assert first["status"] == "ran"
     assert first["result"]["status"] == "reviewing"
+    assert first["result"]["auto_accepted"] == 0
     assert manager.governance_tasks()[0]["pending_candidates"] == 1
+    assert manager.memory_candidates()[0]["status"] == "pending"
+    assert manager.memory_store.list() == []
     assert manager.governance_schedule()["last_result"]["task_id"] == first["result"][
         "task_id"
     ]

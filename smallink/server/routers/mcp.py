@@ -7,10 +7,10 @@ from typing import Any
 
 from fastapi import APIRouter
 
+from ..loopback_pages import _browser_page
+
 
 def mcp_router(manager: Any) -> APIRouter:
-    from ..app import _browser_page
-
     router = APIRouter()
 
     @router.get("/v1/mcp")

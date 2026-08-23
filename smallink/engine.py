@@ -19,11 +19,11 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, AsyncIterator, Awaitable, Callable, Optional
 
+from .capabilities import LLMProvider, PermissionProvider, ToolProvider
 from .events import Event, EventType
-from .permissions import Mode, PermissionEngine
-from .providers import AssistantTurn, ProviderClient, ToolCall
+from .permissions import Mode
+from .providers import AssistantTurn, ToolCall
 from .providers.errors import friendly_model_error
-from .tools import ToolRegistry
 
 
 class ApprovalOutcome(str, Enum):
@@ -53,9 +53,9 @@ class TurnEngine:
     def __init__(
         self,
         *,
-        provider: ProviderClient,
-        registry: ToolRegistry,
-        permissions: PermissionEngine,
+        provider: LLMProvider,
+        registry: ToolProvider,
+        permissions: PermissionProvider,
         model: str,
         instructions: Optional[str] = None,
         approver: Optional[Approver] = None,

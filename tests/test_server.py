@@ -436,7 +436,8 @@ def test_ws_client_message_id_is_acknowledged_and_deduplicated(tmp_path):
         assert duplicate["data"]["duplicate"] is True
 
     manager = client.app.state.manager
-    engine = manager._engines["idempotent"]
+    engine = manager._runtimes.engine("idempotent")
+    assert engine is not None
     user_messages = [message for message in engine.messages if message.get("role") == "user"]
     assert len(user_messages) == 1
     assert user_messages[0]["client_message_id"] == "client-message-1"
@@ -540,7 +541,8 @@ def test_ws_allows_only_one_inflight_turn_per_session(tmp_path):
 
     assert "input_rejected" in types
     assert provider.max_active == 1
-    engine = manager._engines["serialized"]
+    engine = manager._runtimes.engine("serialized")
+    assert engine is not None
     user_messages = [m for m in engine.messages if m.get("role") == "user"]
     assert [m["content"] for m in user_messages] == ["first"]
 
@@ -814,7 +816,8 @@ def test_workspace_command_trust_controls_live_engine(tmp_path):
         assert policy["required"] is True
         assert policy["requested_commands"] == ["pytest"]
 
-        engine = manager._engines["trust"]
+        engine = manager._runtimes.engine("trust")
+        assert engine is not None
         before = engine.permissions.evaluate(
             "run_shell", {"command": "pytest -q"}, None
         )
@@ -954,6 +957,38 @@ def test_ws_with_workspace_query(tmp_path):
         assert "turn_end" in _drain(ws)
 
 
+def test_ws_ready_carries_busy_phase_for_running_session_reconnect(tmp_path):
+    from urllib.parse import quote
+
+    from smallink.lifecycle import AgentPhase
+
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    manager = SessionManager(
+        workspace=None,
+        data_dir=tmp_path,
+        provider=ScriptedProvider([]),
+    )
+    session_id = "busy-reconnect"
+    engine = manager.get_engine(session_id, workspace=str(proj))
+    assert engine is not None
+    manager.mark_running(session_id)
+    manager._get_tracker(session_id).transition(AgentPhase.STARTING)
+    manager._get_tracker(session_id).transition(AgentPhase.THINKING)
+    client = TestClient(create_app(manager))
+    try:
+        with client.websocket_connect(
+            f"/ws/session/{session_id}?workspace={quote(str(proj))}"
+        ) as ws:
+            ready = ws.receive_json()
+            assert ready["type"] == "ready"
+            assert ready["data"]["busy"] is True
+            assert ready["data"]["phase"] == "thinking"
+            assert ready["data"]["phase"] != "idle"
+    finally:
+        manager.mark_idle(session_id)
+
+
 def test_ws_chat_agent_needs_no_workspace(tmp_path):
     manager = SessionManager(
         workspace=None,
@@ -1029,7 +1064,8 @@ def test_ws_first_message_binds_then_midsession_switch_persists_notice(tmp_path)
         ws.send_json({"type": "user_message", "text": "switched now"})
         _drain(ws)
     mgr = client.app.state.manager
-    engine = mgr._engines["model-per-msg"]
+    engine = mgr._runtimes.engine("model-per-msg")
+    assert engine is not None
     assert engine.model == "kimi:kimi-k2.6"
     # The marker is persisted between the turns; the provider never sees it.
     messages = client.get("/v1/sessions/model-per-msg/messages").json()["messages"]

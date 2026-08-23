@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   autoAcceptHighConfidence,
@@ -253,6 +253,52 @@ describe("MemoryView", () => {
       ["candidate-42"],
       "product_decision",
     ));
+  });
+
+  it("requires confirmation before auto-accepting high-confidence memories", async () => {
+    const candidate = {
+      candidate_id: "candidate-42",
+      task_id: "governance-1",
+      scope: "global" as const,
+      content: "Keep product decisions concise.",
+      memory_type: "user_preference",
+      workspace: null,
+      session_id: null,
+      created_at: "2026-07-31T09:00:00Z",
+      updated_at: "2026-07-31T09:00:00Z",
+      status: "pending" as const,
+      confidence: 0.9,
+      model: "test",
+      prompt_version: "v2",
+      sources: ["sensory-abc"],
+    };
+    vi.mocked(getMemory).mockResolvedValue([]);
+    vi.mocked(getMemoryCandidates).mockResolvedValue([candidate]);
+    vi.mocked(autoAcceptHighConfidence).mockResolvedValue({
+      auto_accepted: 2,
+      failed: 0,
+      threshold: 0.9,
+    });
+
+    render(<LanguageProvider><MemoryView /></LanguageProvider>);
+
+    fireEvent.click(await screen.findByTestId("memory-pending-banner"));
+    fireEvent.click(screen.getByRole("button", { name: "Auto-accept all" }));
+
+    expect(autoAcceptHighConfidence).not.toHaveBeenCalled();
+    const dialog = await screen.findByRole("alertdialog");
+    expect(dialog).toBeTruthy();
+    expect(screen.getByText("This will immediately turn all high-confidence candidates into formal memories that agents can use.")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+    expect(autoAcceptHighConfidence).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Auto-accept all" }));
+    fireEvent.click(within(await screen.findByRole("alertdialog")).getByRole("button", { name: "Auto-accept all" }));
+
+    await waitFor(() => expect(autoAcceptHighConfidence).toHaveBeenCalledWith(0.9));
+    await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
   });
 
   it("archives confirmed memory from its detail view", async () => {

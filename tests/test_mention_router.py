@@ -126,7 +126,9 @@ def test_mention_spawns_visible_session_with_thread_grant(tmp_path, monkeypatch)
     # A top-level tag threads on its OWN ts — mapping + grant use that target verbatim.
     target = "slack:C1:1700000010.000100"
     assert mgr.mention_sessions.get(target) == sid
-    assert target in mgr._engines[sid].permissions.task_rules["send_message"]
+    engine = mgr._runtimes.engine(sid)
+    assert engine is not None
+    assert target in engine.permissions.task_rules["send_message"]
 
     # The opening turn carries the reply contract and went to the new session.
     got_sid, opening, source = captured[-1]
@@ -199,7 +201,8 @@ def test_grant_reseeds_on_engine_rebuild(tmp_path, monkeypatch):
     sid = mgr.list_sessions()[0]["session_id"]
     target = "slack:C1:1700000010.000100"
 
-    mgr._engines.pop(sid)  # simulate restart/rebuild
+    stale = mgr._runtimes.discard(sid)  # simulate restart/rebuild
+    assert stale is not None
     engine = mgr.get_engine(sid)
     assert target in engine.permissions.task_rules["send_message"]
 

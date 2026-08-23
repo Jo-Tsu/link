@@ -7,10 +7,10 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, Request
 
+from ..loopback_pages import _browser_page, _CONNECT_FAILED_DETAIL, _connector_title
+
 
 def cloud_router(manager: Any) -> APIRouter:
-    from ..app import _browser_page, _CONNECT_FAILED_DETAIL, _connector_title
-
     router = APIRouter()
 
     @router.get("/v1/cloud/status")

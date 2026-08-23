@@ -32,6 +32,15 @@ from .memory import (
 )
 from .permissions import Mode, PermissionEngine
 from .project import load_agents_md
+from .prompts import (
+    _DELEGATION_GUIDANCE,
+    _DISCUSS_MODE_CONTEXT,
+    _MEMORY_CONTEXT_GUIDANCE,
+    _NARRATION_GUIDANCE,
+    _PLAN_MODE_CONTEXT,
+    session_prompt_registry,
+    turn_prompt_registry,
+)
 from .roots import RootDir, normalize_roots, render_context
 from .providers import ProviderClient, ProviderRouter
 from .overrides import RiskOverrideStore
@@ -55,51 +64,7 @@ from .workspace_trust import WorkspaceTrustStore
 from .tools.shell import LocalExecutor
 from .tools.todo import TodoList
 from .capabilities import CapabilityContainer
-
-# Appended each turn while discuss mode is active: enforcement-only read-only, with no
-# pressure toward a plan proposal (that's what distinguishes it from plan mode).
-_DISCUSS_MODE_CONTEXT = """\
-Discuss mode is active: write and shell tools are disabled. Explore and answer freely; if
-the user asks for a change, describe it in chat instead of attempting it (they can switch
-to plan or approval mode to have you make it)."""
-
-# Appended to the latest user message every turn while plan mode is active. The mode can
-# flip mid-session (plan approval), so this can't live in the static instructions.
-_PLAN_MODE_CONTEXT = """\
-Plan mode is active: write and shell tools are blocked. Explore read-only and design an
-approach. When you've committed to one, present it with `propose_plan` (what you'll change,
-in which files, how you'll verify) — don't describe edits as if you were making them. If
-the plan is approved, this same session switches to execution and you implement it; if
-rejected, revise the plan using the feedback."""
-
-# Formal Smallink memory can only be created by the governance pipeline. Existing records may be
-# supplied as read-only context while the candidate-review-storage flow is introduced.
-_MEMORY_CONTEXT_GUIDANCE = """\
-Memory context:
-- The known memories below are read-only context. Do not claim to create, update, or delete \
-formal memories from this session.
-- New durable facts must be proposed through Smallink data governance, traced to source records, \
-and confirmed by the user before they enter the formal memory store.
-- If a memory names a file, flag, or URL, verify it still exists before relying on it."""
-
-# UX-015 (§33): the GUI interleaves these status lines with humanized tool rows inside a
-# collapsed "turn" — they're what the user reads while the agent works. Universal (appended
-# for every persona); models that ignore it degrade gracefully to a turn with no narration.
-_NARRATION_GUIDANCE = """\
-Narration: before each batch of tool calls, write ONE short plain sentence saying what \
-you're doing and why (e.g. "Checking what merged since yesterday's digest."). It is shown \
-to the user as live progress. Don't narrate trivial single-call follow-ups, don't repeat \
-the previous line, and never let narration replace your final answer."""
-
-_DELEGATION_GUIDANCE = """\
-Multi-agent delegation:
-- You own the user's task and final answer. A specialist returns evidence or critique to you; it \
-does not replace your judgment.
-- Use `delegate_to_agent` when a meaningful subtask benefits from an isolated context: \
-`researcher` gathers cited evidence, `analyst` compares and synthesizes it, and `reviewer` checks \
-an artifact or proposal for defects and gaps. Keep trivial work in the main context.
-- Give the specialist a self-contained assignment and expected output. Independent delegations \
-may be requested together. Specialists are read-only and cannot delegate again."""
+from .runtime import RuntimeScope
 
 
 def _enabled_connector_tools(secrets: SecretStore) -> tuple[set[str], set[str]]:
@@ -157,9 +122,10 @@ def build_engine(
     subagent_read_tools: Optional[list[Any]] = None,
     skill_state_root: Optional[str | Path] = None,
     capabilities: Optional[CapabilityContainer] = None,
+    runtime_scope: Optional[RuntimeScope] = None,
 ) -> TurnEngine:
-    # CapabilityContainer overrides — forward-compatible entry point for callers that
-    # assemble capabilities before calling build_engine. Falls back to explicit kwargs.
+    # An explicit argument remains the compatibility override. Otherwise resolve the
+    # capability supplied by the composition root.
     if capabilities is not None:
         provider = provider or capabilities.provider  # type: ignore[assignment]
         memory_store = memory_store or capabilities.memory  # type: ignore[assignment]
@@ -183,12 +149,19 @@ def build_engine(
     executor = (
         LocalExecutor(cwd=ws) if (agent.needs_workspace and ws is not None) else None
     )
+    if runtime_scope is not None and executor is not None:
+        runtime_scope.add_effect(executor.close)
     todo = TodoList()
     context = AgentContext(
         workspace=ws, executor=executor, todo=todo, roots=root_list or None
     )
 
-    registry = ToolRegistry()
+    registry = (
+        capabilities.tools if capabilities is not None and capabilities.tools is not None
+        else ToolRegistry()
+    )
+    if runtime_scope is not None:
+        runtime_scope.add_effect(registry.clear)
     registry.register_all(agent.build_tools(context))
     # MCP / connector tools (supplied by the manager) carry their own metadata + schema.
     if extra_tools:
@@ -292,39 +265,41 @@ def build_engine(
     if wake_store is not None and session_id and agent.family == "knowledge":
         registry.register_all(selfwake_tools(wake_store, session_id))
 
-    instructions = f"{agent.system_prompt}\n\n{_NARRATION_GUIDANCE}"
-    if delegation_enabled:
-        instructions = f"{instructions}\n\n{_DELEGATION_GUIDANCE}"
-    if ws is not None:
-        instructions = f"{instructions}\n\n{environment_context(ws)}"
-        conventions = load_agents_md(ws)
-        if conventions:
-            instructions = f"{instructions}\n\n{conventions}"
-
-    if memory_store is not None:
-        instructions = f"{instructions}\n\n{_MEMORY_CONTEXT_GUIDANCE}"
-
+    environment = environment_context(ws) if ws is not None else None
+    conventions = load_agents_md(ws) if ws is not None else ""
     resolved_skill_root = Path(skill_state_root or state_dir()).expanduser()
     skill_loader = SkillLoader(_skill_dirs(ws, resolved_skill_root))
     skill_store = SkillStore(resolved_skill_root, workspace=ws)
     registry.register_all(skill_tools(skill_loader, skill_store))
     catalog = skill_catalog_text(skill_loader)
-    if catalog:
-        instructions = f"{instructions}\n\n{catalog}"
+    prompt_registry = session_prompt_registry(
+        agent_id=agent.name,
+        agent_prompt=agent.system_prompt,
+        delegation=delegation_enabled,
+        environment=environment,
+        agents_md=conventions,
+        memory=memory_store is not None,
+        skill_catalog=catalog,
+    )
+    instructions = prompt_registry.render()
 
     # User-local risk overrides (mainly to relax MCP's conservative default). Empty store →
     # no-op; never written by persona loading (the no-self-grant rule).
     risk_overrides = RiskOverrideStore(state_dir() / "risk_overrides.json").resolver()
-    permissions = PermissionEngine(
-        workspace_root=ws or (root_list[0].path if root_list else Path.cwd()),
-        mode=mode,
-        # `[]` is an explicit deny-by-default override, not a request to fall back to config.
-        allowed_commands=(
-            allowed_commands if allowed_commands is not None else config.allowed_commands
-        ),
-        auto_allow_tools=set(config.auto_allow),
-        roots=root_list or None,
-        risk_overrides=risk_overrides,
+    permissions = (
+        capabilities.permissions
+        if capabilities is not None and capabilities.permissions is not None
+        else PermissionEngine(
+            workspace_root=ws or (root_list[0].path if root_list else Path.cwd()),
+            mode=mode,
+            # `[]` is an explicit deny-by-default override, not a request to fall back to config.
+            allowed_commands=(
+                allowed_commands if allowed_commands is not None else config.allowed_commands
+            ),
+            auto_allow_tools=set(config.auto_allow),
+            roots=root_list or None,
+            risk_overrides=risk_overrides,
+        )
     )
     # The plan-mode exit door. Always registered (surfaces can flip a live session into
     # plan mode via set_mode, and the registry is fixed at build); the engine rejects the
@@ -347,15 +322,8 @@ def build_engine(
         current_messages: Optional[list[dict[str, Any]]] = None,
     ) -> str:
         _cited_memories.clear()
-        parts = []
-        if permissions.mode is Mode.PLAN:
-            parts.append(_PLAN_MODE_CONTEXT)
-        elif permissions.mode is Mode.DISCUSS:
-            parts.append(_DISCUSS_MODE_CONTEXT)
-        if roots_context is not None:
-            ctx = roots_context()
-            if ctx:
-                parts.append(ctx)
+        roots_block = roots_context() if roots_context is not None else ""
+        memory_block = ""
         if memory_store is not None:
             remembered = memory_store.list(scope=Scope.GLOBAL)
             if ws is not None:
@@ -374,7 +342,7 @@ def build_engine(
             )
             block = format_memories(selected)
             if block:
-                parts.append(block)
+                memory_block = block
                 for memory in selected:
                     _cited_memories.append({
                         "memory_id": memory.id,
@@ -389,7 +357,18 @@ def build_engine(
                             session_id=session_id,
                             workspace=str(ws) if ws else None,
                         )
-        return "\n\n".join(parts)
+        active_mode = (
+            Mode.PLAN.value
+            if permissions.mode is Mode.PLAN
+            else Mode.DISCUSS.value
+            if permissions.mode is Mode.DISCUSS
+            else None
+        )
+        return turn_prompt_registry(
+            mode=active_mode,
+            roots=roots_block,
+            memories=memory_block,
+        ).render()
 
     engine = TurnEngine(
         provider=provider,

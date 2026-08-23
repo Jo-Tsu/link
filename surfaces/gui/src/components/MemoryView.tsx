@@ -31,6 +31,7 @@ import {
 import { baseName } from "../paths";
 import { useI18n } from "../i18n";
 import { InlineFeedback, PageState } from "./AsyncFeedback";
+import { ConfirmDialog } from "./ConfirmDialog";
 import { Icon } from "./Icon";
 import { PromptsView } from "./PromptsView";
 
@@ -64,6 +65,7 @@ export function MemoryView() {
   const [selectedCandidate, setSelectedCandidate] = useState<MemoryCandidate | null>(null);
   const [selectedCandidateIds, setSelectedCandidateIds] = useState<Set<string>>(new Set());
   const [batchBusy, setBatchBusy] = useState(false);
+  const [confirmAutoAcceptOpen, setConfirmAutoAcceptOpen] = useState(false);
   const [batchType, setBatchType] = useState<MemoryType>("project_context");
   const [batchFeedback, setBatchFeedback] = useState<{
     tone: "success" | "warning";
@@ -218,6 +220,23 @@ export function MemoryView() {
     }
   };
 
+  const confirmAutoAccept = async () => {
+    setBatchBusy(true);
+    try {
+      const result = await autoAcceptHighConfidence(0.9);
+      setBatchFeedback({
+        tone: "success",
+        body: tr("Auto-accepted {count} high-confidence memories.", { count: result.auto_accepted }),
+      });
+      setConfirmAutoAcceptOpen(false);
+      await load();
+    } catch {
+      setBatchFeedback({ tone: "warning", body: tr("Could not auto-accept memories") });
+    } finally {
+      setBatchBusy(false);
+    }
+  };
+
   if (loading && surface === "home") {
     return (
       <MemoryShell>
@@ -332,21 +351,7 @@ export function MemoryView() {
               <button
                 type="button"
                 disabled={batchBusy}
-                onClick={async () => {
-                  setBatchBusy(true);
-                  try {
-                    const result = await autoAcceptHighConfidence(0.9);
-                    setBatchFeedback({
-                      tone: "success",
-                      body: tr("Auto-accepted {count} high-confidence memories.", { count: result.auto_accepted }),
-                    });
-                    await load();
-                  } catch {
-                    setBatchFeedback({ tone: "warning", body: tr("Could not auto-accept memories") });
-                  } finally {
-                    setBatchBusy(false);
-                  }
-                }}
+                onClick={() => setConfirmAutoAcceptOpen(true)}
                 className="rounded-lg bg-accent px-3 py-1.5 text-[12px] text-onAccent disabled:opacity-40"
               >
                 {tr("Auto-accept all")}
@@ -468,6 +473,16 @@ export function MemoryView() {
               ) : <div className="px-4 py-8 text-[12.5px] text-muted">{tr("Select a candidate to review its details.")}</div>}
             </section>
           </div>
+          {confirmAutoAcceptOpen && (
+            <ConfirmDialog
+              title={tr("Auto-accept all high-confidence memories?")}
+              body={tr("This will immediately turn all high-confidence candidates into formal memories that agents can use.")}
+              confirmLabel={tr("Auto-accept all")}
+              busy={batchBusy}
+              onCancel={() => setConfirmAutoAcceptOpen(false)}
+              onConfirm={() => void confirmAutoAccept()}
+            />
+          )}
         </div>
       </main>
     );

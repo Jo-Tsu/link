@@ -660,7 +660,7 @@ export async function autoAcceptHighConfidence(
   const res = await fetch(`${httpBase()}/v1/memory/candidates/auto-accept`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ threshold }),
+    body: JSON.stringify({ threshold, confirmed: true }),
   });
   if (!res.ok) throw new Error("Could not auto-accept candidates");
   return res.json();
@@ -2958,6 +2958,7 @@ export interface PromptLayer {
   name: string;
   description: string;
   source: string;
+  scope: "session" | "turn";
   editable: boolean | "caution";
   safety: "safe" | "caution" | "system";
   safety_note: string;

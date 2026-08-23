@@ -32,7 +32,6 @@ import {
   setUnattended,
   Session,
   type InboxItem,
-  type MessageSource,
   type ModelSettings,
   type Persona,
   type SurfaceVisibility,
@@ -64,6 +63,7 @@ import { PageState } from "./components/AsyncFeedback";
 import { useI18n } from "./i18n";
 import { shouldStartWindowDrag } from "./windowDrag";
 import { useAgentLifecycle } from "./useAgentLifecycle";
+import { projectSessionEvent } from "./sessionEventProjector";
 
 const ScheduledView = lazy(() =>
   import("./components/ScheduledView").then((module) => ({ default: module.ScheduledView })),
@@ -110,26 +110,6 @@ const SUGGESTIONS = [
   { ico: "✦", text: "Read the project and give me a 5-bullet overview." },
   { ico: "↻", text: "Find and fix the failing build." },
 ];
-
-// Tools whose success means a new/changed file should show up under Artifacts right away.
-const FILE_WRITE_TOOLS = new Set(["write_file", "apply_patch", "apply_unified_diff", "replace_in_file"]);
-
-// Models sometimes pass todo items as bare strings instead of {content, status} objects (the
-// backend tool normalizes them the same way; the GUI reads the raw proposal args, so mirror it).
-function normalizeTodos(raw: unknown): TodoItem[] {
-  if (!Array.isArray(raw)) return [];
-  const statuses = new Set(["pending", "in_progress", "done"]);
-  return raw.map((entry: any) => {
-    if (entry && typeof entry === "object") {
-      const status = entry.status === "completed" ? "done" : entry.status; // common model alias
-      return {
-        content: String(entry.content ?? ""),
-        status: statuses.has(status) ? status : "pending",
-      };
-    }
-    return { content: String(entry ?? ""), status: "pending" as const };
-  });
-}
 
 // Fallbacks used only before the persona list loads (the in-component, family-aware
 // needsWorkspace/gatesWorkspace consult the real persona once available).
@@ -222,26 +202,12 @@ export function App() {
   const [modelLabels, setModelLabels] = useState<Record<string, string>>({});
   const [surfaces, setSurfaces] = useState<SurfaceVisibility>({ link: true, chat: false, code: false });
   const [mode, setMode] = useState("interactive");
-  const [connected, setConnected] = useState(false);
-  const [running, setRunning] = useState(false);
   const [items, setItems] = useState<Item[]>([]);
   const [historyLoading, setHistoryLoading] = useState(false);
-  const [streaming, setStreamingState] = useState("");
-  // Ref mirror of `streaming`: the WS handler closure is built once per socket and can't read
-  // fresh state — the interrupted/error flush below needs the live buffer at event time.
-  const streamingRef = useRef("");
-  const setStreaming = (value: string | ((s: string) => string)) => {
-    streamingRef.current = typeof value === "function" ? value(streamingRef.current) : value;
-    setStreamingState(streamingRef.current);
-  };
-  // The turn's live thinking text (reasoning_delta events) — same ref-mirror pattern.
-  // Folded onto the assistant item when the message finalizes; cleared on turn_start.
-  const [reasoningStream, setReasoningStreamState] = useState("");
-  const reasoningRef = useRef("");
-  const setReasoningStream = (value: string) => {
-    reasoningRef.current = value;
-    setReasoningStreamState(value);
-  };
+  const connected = lifecycle.connected;
+  const running = lifecycle.busy;
+  const streaming = lifecycle.streamBuffer;
+  const reasoningStream = lifecycle.reasoningBuffer;
   const [todo, setTodo] = useState<TodoItem[]>([]);
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const [projects, setProjects] = useState<Project[]>([]);
@@ -390,13 +356,10 @@ export function App() {
     transcriptRevisionRef.current += 1;
     sessionRef.current?.close();
     sessionRef.current = null;
-    setConnected(false);
+    lifecycleActions.reset();
     setSessionInbox([]);
     setItems([]);
-    setStreaming("");
-    setReasoningStream("");
     setTodo([]);
-    setRunning(false);
     setHistoryLoading(loadingHistory);
     setSessionId(nextSessionId);
   };
@@ -717,215 +680,46 @@ export function App() {
     const connectedSessionId = sessionId;
     const handleEvent = (ev: WsEvent) => {
       if (activeSessionIdRef.current !== connectedSessionId) return;
-      // Feed all events to the lifecycle state machine
+      // Project from the pre-event buffers: terminal lifecycle events clear them, while
+      // interrupted/error transcript entries must preserve any partial answer first.
+      const projection = projectSessionEvent(ev, {
+        unattended: unattendedRef.current,
+        streamBuffer: lifecycleActions.getStreamBuffer(),
+        reasoningBuffer: lifecycleActions.getReasoningBuffer(),
+        now: () => Date.now() / 1000,
+        newId,
+        tr,
+      });
       lifecycleActions.handleEvent(ev);
-      const d = ev.data || {};
-      // An interrupted/errored turn never emits assistant_message, so its streamed partial
-      // would otherwise live only in the ephemeral buffer until the next turn_start wipes it
-      // (owner-hit 2026-07-22). Promote it to a durable transcript item — the engine persists
-      // the same text server-side, so the live view and a session reload now agree.
-      const flushPartialStream = () => {
-        const partial = streamingRef.current;
-        const thinking = reasoningRef.current;
-        if (!partial && !thinking) return;
-        setStreaming("");
-        setReasoningStream("");
-        updateItems((p) => [
-          ...p,
-          {
-            kind: "assistant",
-            text: partial,
-            ts: Date.now() / 1000,
-            ...(thinking ? { reasoning: thinking } : {}),
-          },
-        ]);
-      };
-      switch (ev.type) {
-        case "ready":
-          setConnected(true);
-          if (d.model) setModel(d.model);
-          if (d.mode) setMode(d.mode);
-          if (d.command_trust?.required) setWorkspaceTrustRequest(d.command_trust);
-          // Link: adopt the server-provisioned scratch dir (only when we don't already have one).
-          if (d.workspace) setWorkspace((cur) => cur || d.workspace);
-          break;
-        case "turn_start":
-          setRunning(true);
-          setStreaming("");
-          setReasoningStream("");
-          // Background-delivered turns (channel message, self-wake, durable resume) have no local
-          // send(), so the triggering message isn't in `items` yet — surface it. A connector message
-          // carries a structured `source` (§3.1) → render the rich card; otherwise a plain user item.
-          // Foreground turns already appended it in send(); skip the duplicate.
-          if (d.source?.connector) {
-            const src = d.source as MessageSource;
-            updateItems((p) => {
-              const last = p[p.length - 1];
-              return last && last.kind === "connector" && last.source.ts === src.ts && last.source.text === src.text
-                ? p
-                : [...p, { kind: "connector", source: src }];
-            });
-          } else if (typeof d.input === "string" && d.input) {
-            updateItems((p) => {
-              const last = p[p.length - 1];
-              return last && last.kind === "user" && last.text === d.input
-                ? p
-                : [...p, { kind: "user", text: d.input as string, ts: Date.now() / 1000 }];
-            });
-          }
-          break;
-        case "assistant_delta":
-          setStreaming((s) => s + (d.text || ""));
-          break;
-        case "reasoning_delta":
-          setReasoningStream(reasoningRef.current + (d.text || ""));
-          break;
-        case "assistant_message": {
-          // The event's reasoning is authoritative (covers background-delivered turns);
-          // the local buffer is the fallback for older servers.
-          const reasoning = d.reasoning || reasoningRef.current;
-          if (d.text || reasoning)
-            updateItems((p) => [
-              ...p,
-              {
-                kind: "assistant",
-                text: d.text || "",
-                ts: Date.now() / 1000,
-                ...(reasoning ? { reasoning } : {}),
-              },
-            ]);
-          setStreaming(""); // finalized into items (or empty tool-only turn)
-          setReasoningStream("");
-          break;
-        }
-        case "tool_proposed":
-          if (d.name === "todo_write" && (d.arguments?.todos || d.arguments?.items))
-            setTodo(normalizeTodos(d.arguments.todos ?? d.arguments.items));
-          updateItems((p) => [
-            ...p,
-            { kind: "tool", id: newId(), name: d.name, args: d.arguments, status: "…" },
-          ]);
-          break;
-        case "permission_required":
-          // Unattended → the backend parked it in the Inbox; don't also surface a live card.
-          if (unattendedRef.current) break;
-          updateItems((p) => [
-            ...p,
-            {
-              kind: "approval",
-              name: d.name,
-              args: d.arguments,
-              reason: d.reason,
-              category: d.category,
-              standingTarget: d.standing_target || undefined,
-            },
-          ]);
-          break;
-        case "directory_requested":
-          if (unattendedRef.current) break;
-          updateItems((p) => [
-            ...p,
-            { kind: "dirreq", reason: d.reason || "", path: d.path || "", writable: !!d.writable },
-          ]);
-          break;
-        case "plan_proposed":
-          if (unattendedRef.current) break;
-          updateItems((p) => [...p, { kind: "planreq", plan: d.plan || "" }]);
-          break;
-        case "question_requested":
-          // ask_user in an attended session — answered inline (not routed to the Inbox).
-          updateItems((p) => [
-            ...p,
-            {
-              kind: "question",
-              question: d.question || "",
-              options: d.options || [],
-              allow_text: d.allow_text !== false,
-              multi: !!d.multi,
-            },
-          ]);
-          break;
-        case "tool_finished":
-          updateItems((p) =>
-            updateLastTool(
-              p,
-              d.name,
-              d.status,
-              d.result_preview || d.reason,
-              d.display?.hidden_by_filters,
-              d.standing_rule,
-            ),
-          );
-          // Refresh the right rail when something it shows may have changed: browser state, or a
-          // file write that should appear under Artifacts immediately (not only after the turn).
-          if (String(d.name || "").startsWith("browser_") || FILE_WRITE_TOOLS.has(d.name)) {
-            setBrowserRefreshKey((k) => k + 1);
-          }
-          break;
-        case "memory_cited":
-          if (d.memories && d.memories.length > 0)
-            updateItems((p) => [...p, { kind: "memory_cited", memories: d.memories }]);
-          break;
-        case "turn_end":
-          if (d.status === "max_iterations_exceeded")
-            updateItems((p) => [...p, { kind: "notice", tone: "warn", text: tr("Stopped: max iterations reached.") }]);
-          break;
-        case "model_changed":
-          // Mid-session switch (server-applied): update the header fact and drop the
-          // persisted marker into the live transcript (replay renders it from history).
-          if (d.model) setModel(d.model);
-          updateItems((p) => [...p, { kind: "notice", tone: "info", text: d.text || tr("Model switched") }]);
-          break;
-        case "interrupted":
-          flushPartialStream();
-          updateItems((p) => [...p, { kind: "notice", tone: "warn", text: tr("Interrupted.") }]);
-          break;
-        case "error":
-          flushPartialStream();
-          updateItems((p) => [
-            ...p,
-            {
-              kind: "notice",
-              tone: "warn",
-              text: tr("Error: {error}", { error: d.error || tr("unknown") }),
-              retriable: true,
-            },
-          ]);
-          break;
-        case "input_rejected":
-          updateItems((p) => [
-            ...p,
-            { kind: "notice", tone: "warn", text: d.error || tr("That message was rejected.") },
-          ]);
-          break;
-        case "turn_done":
-          setRunning(false);
-          refreshSessions();
-          setBrowserRefreshKey((k) => k + 1);
-          break;
-        case "phase_changed":
-          // Already handled by lifecycleActions.handleEvent above
-          break;
-      }
+      if (projection.updateItems) updateItems(projection.updateItems);
+      if (projection.todo) setTodo(projection.todo);
+
+      const effects = projection.effects;
+      if (effects.model) setModel(effects.model);
+      if (effects.mode) setMode(effects.mode);
+      if (effects.workspaceTrust) setWorkspaceTrustRequest(effects.workspaceTrust);
+      // Link adopts the server-provisioned scratch dir only when it has no workspace yet.
+      if (effects.workspace) setWorkspace((current) => current || effects.workspace!);
+      if (effects.refreshBrowser) setBrowserRefreshKey((key) => key + 1);
+      if (effects.refreshSessions) refreshSessions();
     };
 
     const session = new Session(sessionId, workspace || "", agent, {
       onEvent: handleEvent,
       onOpen: () => {
         if (activeSessionIdRef.current !== connectedSessionId) return;
-        setConnected(true);
         lifecycleActions.onConnected();
         // Auto-send the task prompt once a "Run now" session connects.
         const p = pendingPromptRef.current;
         if (p) {
           pendingPromptRef.current = null;
           updateItems((prev) => [...prev, { kind: "user", text: p, ts: Date.now() / 1000 }]);
+          lifecycleActions.onTurnRequested();
           sessionRef.current?.userMessage(p);
         }
       },
       onReconnect: () => {
         if (activeSessionIdRef.current !== connectedSessionId) return;
-        setConnected(true);
         lifecycleActions.onConnected();
         window.setTimeout(() => {
           if (activeSessionIdRef.current === connectedSessionId) {
@@ -935,7 +729,6 @@ export function App() {
       },
       onClose: () => {
         if (activeSessionIdRef.current === connectedSessionId) {
-          setConnected(false);
           lifecycleActions.onDisconnected();
         }
       },
@@ -1060,6 +853,7 @@ export function App() {
     updateItems((p) => [...p, { kind: "user", text, attachments, ts: Date.now() / 1000 }]);
     // The visible model rides along with the message (single source of truth per turn).
     sessionRef.current?.userMessage(text, attachments, model);
+    lifecycleActions.onTurnRequested();
     followLatest(); // sending always re-engages stream-following, wherever the user had scrolled
   };
   // Resolving a LIVE prompt also resolves its parked Inbox mirror server-side, but the polled
@@ -1095,8 +889,8 @@ export function App() {
   const interrupt = () => sessionRef.current?.interrupt();
   const retry = () => {
     // Optimistic running: turn_start confirms; a rejected retry still ends in turn_done.
-    setRunning(true);
     sessionRef.current?.retry();
+    lifecycleActions.onTurnRequested();
   };
   const changeMode = (m: string) => {
     setMode(m);
@@ -2007,31 +1801,6 @@ function ExecutionProgress({ items, running }: { items: Item[]; running: boolean
       </span>
     </div>
   );
-}
-
-function updateLastTool(
-  items: Item[],
-  name: string,
-  status: string,
-  preview?: string,
-  hidden?: number,
-  standingRule?: string,
-): Item[] {
-  const copy = [...items];
-  for (let i = copy.length - 1; i >= 0; i--) {
-    const it = copy[i];
-    if (it.kind === "tool" && it.name === name && it.status === "…") {
-      copy[i] = {
-        ...it,
-        status,
-        preview,
-        ...(hidden ? { hidden } : {}),
-        ...(standingRule ? { standingRule } : {}),
-      };
-      break;
-    }
-  }
-  return copy;
 }
 
 function resolveLastApproval(items: Item[], decision: ApprovalDecision): Item[] {

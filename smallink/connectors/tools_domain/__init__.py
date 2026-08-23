@@ -10,8 +10,10 @@ final filtering by enabled_connectors/enabled_tools.
 
 from .github import make_github_tools
 from .minem import make_minem_tools
+from .registry import MIGRATED_TOOL_FACTORIES
 
 __all__ = [
     "make_github_tools",
     "make_minem_tools",
+    "MIGRATED_TOOL_FACTORIES",
 ]

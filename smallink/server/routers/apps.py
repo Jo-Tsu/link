@@ -10,22 +10,23 @@ from fastapi import APIRouter, HTTPException
 
 def apps_router(manager: Any) -> APIRouter:
     router = APIRouter()
+    service = manager.app_projects
 
     @router.get("/v1/apps")
     def list_apps() -> dict[str, Any]:
-        return {"apps": manager.list_apps()}
+        return {"apps": service.list_apps()}
 
     @router.get("/v1/apps/{app_id}")
     def get_app(app_id: str) -> Any:
         try:
-            return manager.app_descriptor(app_id)
+            return service.app_descriptor(app_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="application not found") from exc
 
     @router.post("/v1/apps/{app_id}/enable")
     def enable_app(app_id: str) -> Any:
         try:
-            return manager.enable_app(app_id)
+            return service.enable_app(app_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="application not found") from exc
         except ValueError as exc:
@@ -34,14 +35,14 @@ def apps_router(manager: Any) -> APIRouter:
     @router.post("/v1/apps/{app_id}/check")
     def check_app(app_id: str) -> Any:
         try:
-            return manager.check_app(app_id)
+            return service.check_app(app_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="application not found") from exc
 
     @router.post("/v1/apps/{app_id}/disable")
     def disable_app(app_id: str) -> Any:
         try:
-            return manager.disable_app(app_id)
+            return service.disable_app(app_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="application not found") from exc
 
@@ -54,7 +55,7 @@ def apps_router(manager: Any) -> APIRouter:
         session_id: str | None = None,
     ) -> Any:
         try:
-            return manager.app_assets(
+            return service.app_assets(
                 app_id,
                 query=query,
                 asset_type=asset_type,
@@ -77,7 +78,7 @@ def apps_router(manager: Any) -> APIRouter:
     def invoke_app_capability(app_id: str, capability: str, body: dict) -> Any:
         payload = body or {}
         try:
-            return manager.invoke_app_capability(
+            return service.invoke_app_capability(
                 app_id,
                 capability,
                 payload.get("arguments") if isinstance(payload.get("arguments"), dict) else payload,
@@ -91,7 +92,7 @@ def apps_router(manager: Any) -> APIRouter:
     @router.get("/v1/apps/{app_id}/activity")
     def app_activity(app_id: str, limit: int = 50) -> Any:
         try:
-            return {"activity": manager.app_activity(app_id, limit=limit)}
+            return {"activity": service.app_activity(app_id, limit=limit)}
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="application not found") from exc
 

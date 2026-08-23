@@ -178,6 +178,7 @@ function PromptCard({
             <div className="text-[11px] text-muted mt-1">
               <span className="font-medium text-ink">Source: </span>
               <code className="bg-paper px-1 py-0.5 rounded text-[10.5px]">{layer.source}</code>
+              <span className="ml-2">Scope: {layer.scope}</span>
             </div>
           </div>
 

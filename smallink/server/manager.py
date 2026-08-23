@@ -8,7 +8,6 @@ sessions span folders.
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import logging
 import os
@@ -17,13 +16,13 @@ import shutil
 import subprocess
 import time
 from collections.abc import AsyncIterator
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
 from ..agent import build_engine
 from ..agents import get_agent
-from ..apps import AppManifest, SQLiteAppStore, builtin_app_registry
+from ..apps import SQLiteAppStore, builtin_app_registry
+from ..capabilities import CapabilityContainer
 from ..connections import (
     PersonaConnectionStore,
     SessionConnectionStore,
@@ -42,9 +41,12 @@ from ..audit import AuditStore
 from ..config import load_config, workspace_allowed_commands
 from ..conversations import ConversationStore, title_from
 from ..engine import ApprovalOutcome, Approver, TurnEngine
-from ..events import Event, EventType
+from ..events import Event
 from ..lifecycle import AgentPhase, LifecycleTracker
-from ..projects import ProjectRecord
+from ..runtime import (
+    RuntimeRegistry,
+    SessionRuntimeService,
+)
 from ..roots import RootDir
 from ..workspace_trust import WorkspaceTrustStore
 from ..automation import Schedule, ScheduledTask, Scheduler, TaskRun, TaskStore
@@ -54,10 +56,8 @@ from ..connectors import (
     connect_connector,
     connector_list,
     disconnect_connector,
-    experimental_enabled,
     load_settings,
     make_adapter,
-    set_experimental_enabled,
     slack_split,
     update_connector_tools,
 )
@@ -78,75 +78,24 @@ from ..mcp import (
     put_global_server,
     read_global,
 )
-from ..memory import (
-    MemoryPipeline,
-    MemoryStore,
-    Scope,
-    SQLiteGovernanceStore,
-    SQLiteMemoryStore,
-)
+from ..memory import MemoryStore, Scope, SQLiteGovernanceStore, SQLiteMemoryStore
 from ..knowledge import SQLiteKnowledgeStore, knowledge_tools
 from ..permissions import Mode
 from ..agents import list_agents as _list_agents
 from ..providers import (
     ProviderClient,
     ProviderRouter,
-    get_descriptor,
-    provider_descriptors,
-    verify_provider_key,
 )
 from ..secrets import SecretStore, state_dir
 from ..sessions import SessionRecord
 from ..sensory import SQLiteSensoryStore
 from ..skills import SkillLoader, SkillStore, default_skill_sources, skill_result
 from ..task import AgentRunObserver, SQLiteTaskRuntimeStore
+from ..tools import ToolRegistry
+from .services import AppProjectService, MemoryService, SettingsService
 
 _SCOPES = {s.value for s in Scope}
-
-# Model purposes: a model can be tagged for one or more uses. This phase only wires "memory"
-# (the pipeline reads it); "chat"/"title" tags persist but aren't routed yet (conversation main
-# path unchanged). See model_for_purpose / set_model_purposes.
-MODEL_PURPOSES = ("chat", "memory", "title")
-
 logger = logging.getLogger("smallink.manager")
-
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _sensory_safe(value: Any) -> Any:
-    """Remove embedded binary payloads while preserving useful attachment provenance."""
-    if isinstance(value, str) and value.lstrip().lower().startswith("data:"):
-        return {
-            "omitted": True,
-            "characters": len(value),
-            "sha256": hashlib.sha256(value.encode("utf-8")).hexdigest(),
-        }
-    if isinstance(value, list):
-        return [_sensory_safe(item) for item in value]
-    if isinstance(value, dict):
-        out: dict[str, Any] = {}
-        for key, item in value.items():
-            out[key] = _sensory_safe(item)
-        return out
-    return value
-
-
-_SENSORY_SECRET_PATTERN = re.compile(
-    r"(?i)(password|passwd|secret|api[_ -]?key|access[_ -]?token|refresh[_ -]?token)"
-    r"\s*[:=]\s*[^\s,;]+"
-)
-
-
-def _sensory_sensitivity(value: Any) -> str:
-    """Classify first-party captures before they enter the immutable source pool."""
-    try:
-        text = json.dumps(value, ensure_ascii=False) if not isinstance(value, str) else value
-    except (TypeError, ValueError):
-        text = str(value)
-    return "secret" if _SENSORY_SECRET_PATTERN.search(text) else "private"
-
 
 def _grants_of(engine) -> dict[str, Any]:
     """The engine's session-scoped "Always allow" approvals, in persistable shape."""
@@ -202,29 +151,61 @@ class SessionManager:
         self.connector_sync_store = ConnectorSyncStore(base / "link.db")
         self.app_registry = builtin_app_registry()
         self.app_store = SQLiteAppStore(base / "link.db")
+        self.secrets = SecretStore()
+        self.settings_service = SettingsService(
+            secrets=self.secrets,
+            state_path=base,
+            refresh_provider=self._refresh_provider,
+            model=model,
+            on_model_change=self._sync_settings_model,
+            suggested_models=lambda name: self._suggested_models(name),
+            ollama_alive=lambda: self._ollama_alive(),
+        )
+        self._prefs = self.settings_service.prefs
+        self.app_projects = AppProjectService(
+            data_base=base,
+            app_registry=self.app_registry,
+            app_store=self.app_store,
+            session_store=self.session_store,
+            sensory_store=self.sensory_store,
+            knowledge_store=self.knowledge_store,
+            governance_store=self.governance_store,
+            app_adapter_resolver=lambda app_id: (
+                get_minem_client() if app_id == "minem" else None
+            ),
+            connect_app=lambda connector_id: connect_connector(
+                self.secrets, connector_id, {}
+            ),
+            disconnect_app=lambda connector_id: disconnect_connector(
+                self.secrets, connector_id
+            ),
+            list_sessions=self.list_sessions,
+            list_runtime_tasks=self.list_runtime_tasks,
+        )
         self._ensure_builtin_app_projects()
         self.session_store.canonicalize_workspaces()  # collapse /tmp vs /private/tmp etc.
         if self.default_workspace:
             self.session_store.touch_workspace(self.default_workspace)
-        self._engines: dict[str, TurnEngine] = {}
-        self._trackers: dict[str, LifecycleTracker] = {}
-        self._running_sessions: set[str] = (
-            set()
-        )  # sessions with an in-flight turn (busy)
+        self._runtimes = RuntimeRegistry()
+        self._session_runtime = SessionRuntimeService(
+            runtime_store=self.runtime_store,
+            sensory_store=self.sensory_store,
+            session_store=self.session_store,
+            lifecycle_for=self._get_tracker,
+        )
         # Sessions with an auto-title LLM call in flight (FB-010) — one call at a time.
         self._autotitle_inflight: set[str] = set()
         self._autotitle_tasks: set[asyncio.Task] = set()
         self._autotitle_attempts: dict[str, int] = {}
-        self._governance_scheduler_task: Optional[asyncio.Task] = None
-        self._governance_schedule_running = False
         self.workspace_trust = WorkspaceTrustStore()
-        self.secrets = SecretStore()
         # No explicit provider injected → route by the model's `provider:` prefix (OpenAI default,
         # Ollama, …). Tests inject a provider directly and bypass the router. The same router is
         # shared by every engine and the `/v1/chat/completions` proxy.
         if self.provider is None:
             self.provider = ProviderRouter(
-                self.secrets, default_provider="openai", on_use=self._note_provider_use
+                self.secrets,
+                default_provider="openai",
+                on_use=self.settings_service.note_provider_use,
             )
         self.mcp = MCPManager(secrets=self.secrets)
         # OAuth MCP servers with a sign-in in flight / their last connect error —
@@ -232,15 +213,6 @@ class SessionManager:
         self._mcp_authorizing: set[str] = set()
         self._mcp_errors: dict[str, str] = {}
         self.gateway: Optional[Gateway] = None
-        # Desktop/UI prefs (default model, onboarding state) — not secrets; a plain JSON file.
-        self._prefs = self._load_prefs()
-        if self._prefs.get("default_model"):
-            self.model = self._prefs["default_model"]
-        # Seed the PDF-fallback module global from prefs so engines see the user's
-        # choice from the first turn (set_pdf_settings keeps it in sync after).
-        from ..pdf_support import set_fallback_mode
-
-        set_fallback_mode(self.pdf_settings()["pdf_fallback"])
         # Per-session live-view registry: every socket open on a session id gets the turn's events,
         # whoever drives the turn (foreground user_message, channel delivery, self-wake, resume).
         # Delivery itself is socket-independent — this only governs *live visibility*.
@@ -248,6 +220,21 @@ class SessionManager:
         # App-wide event sockets (/ws/events): session-independent pushes — today the
         # automation-run-started toast (UX-026); badges could ride it later.
         self._event_clients: set[Any] = set()
+        self.memory_service = MemoryService(
+            sensory_store=self.sensory_store,
+            memory_store=self.memory_store,
+            governance_store=self.governance_store,
+            knowledge_store=self.knowledge_store,
+            provider=self.provider,
+            model_for_purpose=self.settings_service.model_for_purpose,
+            get_project=self.session_store.get_project,
+            get_project_by_workspace=self.session_store.get_project_by_workspace,
+            preferences=self.settings_service.prefs,
+            save_preferences=self.settings_service._save_prefs,
+            broadcast_event=self.broadcast_event,
+            connector_sync_store=self.connector_sync_store,
+            secret_lookup=self.secrets.get,
+        )
         # Automation: scheduled tasks store + the tick scheduler (started in the lifespan).
         # The scheduler also resumes self-wake'd sessions each tick (extra_tick).
         self.task_store = TaskStore(base / "automation.db")
@@ -307,6 +294,9 @@ class SessionManager:
         # Dead-letter: inbound messages with no destination + background-turn failures, so neither
         # vanishes silently (a debugging/visibility surface, not a redelivery queue).
         self.unrouted = UnroutedStore(base / "unrouted.json")
+
+    def _sync_settings_model(self, model: str) -> None:
+        self.model = model
 
     # -- workspaces -------------------------------------------------------------
     def open_workspace(self, path: str, *, create: bool = False) -> dict[str, Any]:
@@ -368,7 +358,7 @@ class SessionManager:
             canonical, workspace_trusted=trusted
         ).allowed_commands
         # Apply trust/revocation immediately to live sessions rooted at this exact path.
-        for engine in self._engines.values():
+        for engine in self._runtimes.engines():
             engine_workspace = str(
                 (getattr(engine, "audit_context", {}) or {}).get("workspace", "")
             )
@@ -406,12 +396,10 @@ class SessionManager:
             out.append({"path": path, "name": p.name, "exists": p.is_dir()})
         return out
 
-    DEFAULT_SCRATCH_BASE = "~/Smallink"
+    DEFAULT_SCRATCH_BASE = SettingsService.DEFAULT_SCRATCH_BASE
 
     def scratch_base(self) -> Path:
-        """Common area for per-conversation scratch directories. Configurable via prefs."""
-        base = self._prefs.get("scratch_base") or self.DEFAULT_SCRATCH_BASE
-        return Path(base).expanduser()
+        return self.settings_service.scratch_base()
 
     def _provision_scratch(self, session_id: str) -> str:
         """Create (idempotently) and return this conversation's scratch directory."""
@@ -450,7 +438,7 @@ class SessionManager:
         plan_approver: Optional[Any] = None,
         question_asker: Optional[Any] = None,
     ) -> Optional[TurnEngine]:
-        engine = self._engines.get(session_id)
+        engine = self._runtimes.engine(session_id)
         if engine is not None:
             if approver is not None:
                 engine.approver = approver
@@ -505,55 +493,62 @@ class SessionManager:
                 self.knowledge_store, project_id=project_id
             )
             runtime_tools.extend(specialist_read_tools)
-        engine = build_engine(
-            agent=ag,
-            workspace=ws,
-            model=model,
-            mode=mode,
-            provider=self.provider,
-            memory_store=self.memory_store,
-            governance_store=self.governance_store,
-            messages=messages,
-            extra_tools=runtime_tools,
-            secrets=self.secrets,
-            task_store=self.task_store,
-            wake_store=self.wakes,
-            session_id=session_id,
-            audit_sink=self.audit_store.append,
-            roots=roots,
-            # WS sessions pass mode-aware callbacks (attended → live prompt, unattended → Inbox).
-            # Background / self-wake / durable-resume runs have no live socket → default to the
-            # Inbox-based callbacks so a rebuilt engine can still get approvals/answers (and, on
-            # resume, the already-resolved item returns immediately).
-            approver=approver or self.inbox_approver(session_id, agent),
-            directory_requester=directory_requester
-            or self.inbox_directory_requester(session_id, agent),
-            plan_approver=plan_approver or self.inbox_plan_approver(session_id, agent),
-            question_asker=question_asker
-            or self.inbox_question_asker(session_id, agent),
-            subscription_store=self.subscriptions,
-            channel_buffer=self.channel_buffer,
-            routing_targets=self._routing_targets(session_id, agent),
-            # Per-session connection hierarchy: expose only effective-enabled connectors' tools.
-            connector_filter=self.effective_connectors(session_id, agent_name),
-            subagent_observer=AgentRunObserver(self.runtime_store, session_id),
-            subagent_read_tools=specialist_read_tools,
-            skill_state_root=self._data_base,
-        )
-        # An automation run rebuilt here (manual "Run now" over WS, durable resume) still
-        # carries its task's standing allowances — the rules live on the task record.
-        owning_task = self.task_store.task_for_run_session(session_id)
-        if owning_task is not None:
-            self._seed_task_permissions(engine, owning_task)
-        # A mention-spawned session (§31) keeps its in-thread reply pre-approved across
-        # rebuilds/restarts — the grant is re-derived from the durable thread map.
-        for thread_target in self.mention_sessions.targets_for(session_id):
-            engine.permissions.task_rules.setdefault("send_message", set()).add(
-                thread_target
+        scope = self._runtimes.prepare(session_id)
+        try:
+            engine = build_engine(
+                agent=ag,
+                workspace=ws,
+                model=model,
+                mode=mode,
+                capabilities=CapabilityContainer(
+                    provider=self.provider,
+                    tools=ToolRegistry(),
+                    memory=self.memory_store,
+                ),
+                governance_store=self.governance_store,
+                messages=messages,
+                extra_tools=runtime_tools,
+                secrets=self.secrets,
+                task_store=self.task_store,
+                wake_store=self.wakes,
+                session_id=session_id,
+                audit_sink=self.audit_store.append,
+                roots=roots,
+                # WS sessions pass mode-aware callbacks (attended → live prompt, unattended → Inbox).
+                # Background / self-wake / durable-resume runs have no live socket → default to the
+                # Inbox-based callbacks so a rebuilt engine can still get approvals/answers (and, on
+                # resume, the already-resolved item returns immediately).
+                approver=approver or self.inbox_approver(session_id, agent),
+                directory_requester=directory_requester
+                or self.inbox_directory_requester(session_id, agent),
+                plan_approver=plan_approver or self.inbox_plan_approver(session_id, agent),
+                question_asker=question_asker
+                or self.inbox_question_asker(session_id, agent),
+                subscription_store=self.subscriptions,
+                channel_buffer=self.channel_buffer,
+                routing_targets=self._routing_targets(session_id, agent),
+                # Per-session connection hierarchy: expose only effective-enabled connectors' tools.
+                connector_filter=self.effective_connectors(session_id, agent_name),
+                subagent_observer=AgentRunObserver(self.runtime_store, session_id),
+                subagent_read_tools=specialist_read_tools,
+                skill_state_root=self._data_base,
+                runtime_scope=scope,
             )
-        if record is not None and record.grants:
-            self._apply_grants(engine, record.grants)
-        self._engines[session_id] = engine
+            # Restore durable permissions before publication: no caller can observe a
+            # partially configured runtime, and any failure unwinds owned resources.
+            owning_task = self.task_store.task_for_run_session(session_id)
+            if owning_task is not None:
+                self._seed_task_permissions(engine, owning_task)
+            for thread_target in self.mention_sessions.targets_for(session_id):
+                engine.permissions.task_rules.setdefault("send_message", set()).add(
+                    thread_target
+                )
+            if record is not None and record.grants:
+                self._apply_grants(engine, record.grants)
+            self._runtimes.publish(session_id, engine, scope=scope)
+        except Exception:
+            scope.close()
+            raise
         if is_new_session:
             self._emit_session_created(session_id, agent_name)
         elif ws and record is not None and not record.project_id:
@@ -923,7 +918,7 @@ class SessionManager:
 
     def persist_session(self, session_id: str) -> None:
         """Save the cached engine's thread (so a prompt's pending tool call survives a crash)."""
-        engine = self._engines.get(session_id)
+        engine = self._runtimes.engine(session_id)
         if engine is not None:
             self.save(session_id, engine)
 
@@ -968,7 +963,7 @@ class SessionManager:
         Called from the async WS handler before `get_engine`; no-op if the engine is already
         built (its MCP tools are attached). Servers that fail to connect are skipped.
         """
-        if session_id in self._engines:
+        if self._runtimes.engine(session_id) is not None:
             return []
         from ..connectors.descriptors import get_descriptor
         from ..connectors.tool_defs import (
@@ -1259,7 +1254,7 @@ class SessionManager:
         return connect_connector(self.secrets, name, fields, acknowledged=acknowledged)
 
     def set_experimental_connectors(self, value: bool) -> dict[str, Any]:
-        return set_experimental_enabled(self.secrets, value)
+        return self.settings_service.set_experimental_connectors(value)
 
     def disconnect_connector(self, name: str) -> dict[str, Any]:
         # MCP-backed profile: drop the live server connection before the tokens go.
@@ -1482,69 +1477,16 @@ class SessionManager:
 
     # -- web search -------------------------------------------------------------
     def get_web_search(self) -> dict[str, Any]:
-        from ..config import load_config
-        from ..web import provider_names
-
-        profile = self.secrets.get("web_search:default") or {}
-        provider = (
-            profile.get("provider") or load_config().web_search_provider or "duckduckgo"
-        )
-        return {
-            "provider": provider,
-            "has_key": bool(profile.get("api_key")),
-            "providers": provider_names(),
-        }
+        return self.settings_service.get_web_search()
 
     def set_web_search(
         self, provider: str, api_key: Optional[str] = None
     ) -> dict[str, Any]:
-        from ..web import provider_names
-
-        if provider not in provider_names():
-            return {"ok": False, "error": f"unknown provider: {provider}"}
-        profile: dict[str, Any] = {"provider": provider}
-        if api_key:
-            profile["api_key"] = api_key
-        self.secrets.put("web_search:default", profile)
-        return {"ok": True, "provider": provider}
+        return self.settings_service.set_web_search(provider, api_key)
 
     # -- model providers (OpenAI, Ollama, …) ------------------------------------
     def get_providers(self) -> list[dict[str, Any]]:
-        """Descriptor + per-provider status for the Settings UI. Never returns secret values;
-        non-secret field values (e.g. the Ollama base URL) ARE returned so the form can prefill.
-        """
-        import os
-
-        out: list[dict[str, Any]] = []
-        for d in provider_descriptors():
-            profile = self.secrets.get(f"provider:{d.name}") or {}
-            if d.needs_key:
-                configured = bool(profile.get("api_key")) or bool(
-                    d.env_key and os.environ.get(d.env_key)
-                )
-            else:
-                configured = True  # keyless (Ollama) — usable out of the box
-            values = {
-                f.key: profile.get(f.key)
-                for f in d.fields
-                if not f.secret and profile.get(f.key)
-            }
-            out.append(
-                {
-                    **d.to_dict(),
-                    "configured": configured,
-                    "values": values,
-                    "suggested_models": self._suggested_models(d.name),
-                    # Key hygiene for the Settings pane: when the key was saved (date, stamped
-                    # by set_provider) and when the provider last served a completion (epoch,
-                    # stamped by the router's on_use hook). Absent for env-only config.
-                    "key_set_at": profile.get("key_set_at"),
-                    "last_used_at": (self._prefs.get("provider_last_used") or {}).get(
-                        d.name
-                    ),
-                }
-            )
-        return out
+        return self.settings_service.get_providers()
 
     def pick_native_folder(self) -> dict[str, Any]:
         """Open the OS folder picker FROM THE SIDECAR — the browser GUI can't obtain absolute
@@ -1664,434 +1606,100 @@ class SessionManager:
         return {"ok": True, "path": str(selected.resolve())}
 
     def _note_provider_use(self, name: str) -> None:
-        """Router on_use hook: remember when a provider last served a completion. Persisted
-        THROTTLED (once per provider per minute) — this fires on every model call, from engine
-        threads, and prefs.json isn't a place for a write-per-token-of-work."""
-        import time
-
-        now = time.time()
-        used = self._prefs.setdefault("provider_last_used", {})
-        if now - float(used.get(name) or 0) < 60:
-            return
-        used[name] = now
-        try:
-            self._save_prefs()
-        except OSError:
-            pass
+        return self.settings_service.note_provider_use(name)
 
     # Suggestions for the OpenAI-compatible vendor providers (checked against vendor docs
     # 2026-07-04; refresh alongside `recommended_model` in providers/registry.py).
-    COMPAT_MODELS = {
-        "zai": ["glm-5.2", "glm-4.6"],
-        "deepseek": ["deepseek-v4-flash", "deepseek-v4-pro"],
-        "kimi": ["kimi-k2.6", "kimi-k2.5"],
-        "minimax": ["MiniMax-M2.5", "MiniMax-M2.5-highspeed", "MiniMax-M3"],
-        "qwen": ["qwen3-max", "qwen3-coder-plus", "qwen-plus"],
-        "xai": ["grok-4.3", "grok-4"],
-        "mistral": ["mistral-large-latest", "mistral-small-latest"],
-    }
+    COMPAT_MODELS = SettingsService.COMPAT_MODELS
 
     def _suggested_models(self, name: str) -> list[str]:
-        """Bare model-name suggestions for the 'add model' form (datalist), per provider.
-        Ollama → live `/api/tags` (best-effort); TRAE → models_cache.json discovery;
-        everyone else → the curated matrix, topped up with the compat-vendor extras the
-        matrix doesn't vouch for."""
-        if name == "ollama":
-            return [m.split(":", 1)[-1] for m in self._ollama_models()]
-        if name == "trae":
-            from ..providers.trae_provider import trae_model_ids
-            return trae_model_ids()
-        from ..providers.matrix import models_for_provider
-
-        return list(
-            dict.fromkeys(
-                [*models_for_provider(name), *self.COMPAT_MODELS.get(name, [])]
-            )
-        )
+        return self.settings_service._default_suggested_models(name)
 
     def set_provider(
         self, name: str, fields: Optional[dict[str, Any]]
     ) -> dict[str, Any]:
-        """Store a provider's config in its `provider:<name>` SecretStore profile and rebuild
-        its cached client. Merges provided fields into any existing profile."""
-        d = get_descriptor(name)
-        if d is None:
-            return {"ok": False, "error": f"unknown provider: {name}"}
-        fields = fields or {}
-        profile = dict(self.secrets.get(f"provider:{name}") or {})
-        for f in d.fields:
-            if f.key not in fields:
-                continue
-            val = fields.get(f.key)
-            if isinstance(val, str):
-                val = val.strip()
-            if val:
-                profile[f.key] = val
-            elif not f.required:
-                profile.pop(f.key, None)
-        missing = [f.label for f in d.fields if f.required and not profile.get(f.key)]
-        if missing:
-            return {"ok": False, "error": "missing: " + ", ".join(missing)}
-        # A (re)pasted key stamps its save date — Settings shows "key added <date>" so stale
-        # keys are visible. Endpoint-only saves keep the original stamp.
-        if isinstance(fields.get("api_key"), str) and fields["api_key"].strip():
-            from datetime import date
-
-            profile["key_set_at"] = date.today().isoformat()
-        if not d.needs_key:
-            # Installation discovery is not consent. Persist an explicit marker so keyless local
-            # providers become active only after the user configures them in Settings.
-            profile["_enabled"] = True
-        self.secrets.put(f"provider:{name}", profile)
-        self._refresh_provider(name)
-        # Convenience: if the provider recommends a model and it's actually available, add it to
-        # the curated list so it shows up in the composer right after configuring the provider.
-        rec = d.recommended_model
-        added: Optional[str] = None
-        if rec and rec in self._suggested_models(name):
-            # OpenAI models stay bare (the router's default); others carry their prefix.
-            added = rec if name == "openai" else f"{name}:{rec}"
-            self.add_model(added)
-        # First working provider wins the default: if the current default model belongs to a
-        # provider with no usable config (the fresh-install gpt-5.6-sol case), switch the default to
-        # this provider's model. A default that already works is never stolen.
-        if added and not self._provider_configured(self._model_provider(self.model)):
-            self.set_default_model(added)
-        return {"ok": True, "provider": name, "recommended_model": rec}
+        return self.settings_service.set_provider(name, fields)
 
     def remove_provider(self, name: str) -> dict[str, Any]:
-        """Forget a provider's stored config (Settings ▸ Models "Remove key"). The whole
-        `provider:<name>` profile goes — key, endpoint, key_set_at — so the provider reads
-        as never configured. Curated models stay; they just gray out until a new key."""
-        d = get_descriptor(name)
-        if d is None:
-            return {"ok": False, "error": f"unknown provider: {name}"}
-        self.secrets.delete(f"provider:{name}")
-        self._refresh_provider(name)
-        return {"ok": True, "provider": name}
+        return self.settings_service.remove_provider(name)
 
     def verify_provider(
         self, name: str, fields: Optional[dict[str, Any]]
     ) -> dict[str, Any]:
-        """Test a provider's credentials with a live read-only call, WITHOUT persisting them, so
-        onboarding can offer a "Test" button. Falls back to the stored/env key when the form left
-        the key blank (e.g. testing an already-configured provider)."""
-        import os
-
-        d = get_descriptor(name)
-        if d is None:
-            return {"ok": False, "error": f"unknown provider: {name}"}
-        fields = fields or {}
-        profile = self.secrets.get(f"provider:{name}") or {}
-        api_key = (fields.get("api_key") or profile.get("api_key") or "").strip()
-        if not api_key and d.env_key:
-            api_key = os.environ.get(d.env_key, "").strip()
-        base_url = (fields.get("base_url") or profile.get("base_url") or "").strip()
-        if d.needs_key and not api_key:
-            return {"ok": False, "error": "Enter an API key to test."}
-        return verify_provider_key(name, api_key=api_key, base_url=base_url)
+        return self.settings_service.verify_provider(name, fields)
 
     def _model_provider(self, model: str) -> str:
-        """The provider a model string routes to (known `prefix:` or the OpenAI default)."""
-        if ":" in (model or ""):
-            prefix = model.split(":", 1)[0]
-            if get_descriptor(prefix) is not None:
-                return prefix
-        return "openai"
+        return self.settings_service._model_provider(model)
 
     def _provider_configured(self, name: str) -> bool:
-        d = get_descriptor(name)
-        if d is None:
-            return False
-        profile = self.secrets.get(f"provider:{name}") or {}
-        if not d.needs_key:
-            return bool(profile.get("_enabled") or profile)
-        return bool(profile.get("api_key")) or bool(
-            d.env_key and os.environ.get(d.env_key)
-        )
+        return self.settings_service._provider_configured(name)
 
     def _trae_enabled(self) -> bool:
-        """Whether TRAE was explicitly selected/configured, independent of machine discovery."""
-        user_models = self._prefs.get("models")
-        user_models = user_models if isinstance(user_models, list) else []
-        return (
-            self.model.startswith("trae:")
-            or any(str(model).startswith("trae:") for model in user_models)
-            or self._provider_configured("trae")
-        )
+        return self.settings_service._trae_enabled()
 
     # -- settings / prefs (model API key, default model, onboarding) -------------
     def _prefs_path(self) -> Path:
-        return self._data_base / "prefs.json"
+        return self.settings_service._prefs_path()
 
     def _load_prefs(self) -> dict[str, Any]:
-        try:
-            return json.loads(self._prefs_path().read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return {}
+        return self.settings_service._load_prefs()
 
     def _save_prefs(self) -> None:
-        self._prefs_path().write_text(
-            json.dumps(self._prefs, indent=2), encoding="utf-8"
-        )
+        return self.settings_service._save_prefs()
 
     # -- direct-message routing -------------------------------------------------
     def dm_session(self) -> Optional[str]:
-        """The session a DM to the bot is routed to (user-designated). None → DMs are parked."""
-        sid = self._prefs.get("dm_session")
-        return sid or None
+        return self.settings_service.dm_session()
 
     def set_dm_session(self, session_id: Optional[str]) -> dict[str, Any]:
-        """Designate (or clear, with a falsy id) the session that handles incoming DMs."""
-        sid = (session_id or "").strip()
-        if sid:
-            self._prefs["dm_session"] = sid
-        else:
-            self._prefs.pop("dm_session", None)
-        self._save_prefs()
-        return {"ok": True, "dm_session": self.dm_session()}
+        return self.settings_service.set_dm_session(session_id)
 
     def _ollama_alive(self) -> bool:
-        """Best-effort local-Ollama liveness, cached 30s (get_settings runs on every GUI
-        fetch — no 2s probe inline). Keyless is not the same as PRESENT: `ollama:*` picker
-        entries render only when an Ollama actually answers, so a machine with no Ollama
-        never shows phantom local models (e.g. a stray pasted string saved as a model id,
-        caught 2026-07-21)."""
-        import time
-
-        now = time.monotonic()
-        cached = getattr(self, "_ollama_alive_cache", None)
-        if cached and now - cached[0] < 30:
-            return cached[1]
-        profile = self.secrets.get("provider:ollama") or {}
-        base = (profile.get("base_url") or "http://localhost:11434").strip().rstrip("/")
-        if base.endswith("/v1"):
-            base = base[: -len("/v1")]
-        try:
-            import httpx
-
-            alive = httpx.get(base + "/api/tags", timeout=0.8).status_code == 200
-        except Exception:
-            alive = False
-        self._ollama_alive_cache = (now, alive)
-        return alive
+        return self.settings_service._probe_ollama_alive()
 
     def _ollama_models(self) -> list[str]:
-        """Live list of models pulled into the configured Ollama server (via its native
-        `/api/tags`), as `ollama:<name>` so they're directly selectable. Empty if Ollama isn't
-        configured or unreachable — best-effort, never raises."""
-        profile = self.secrets.get("provider:ollama")
-        if not profile:
-            return []
-        base = (profile.get("base_url") or "http://localhost:11434").strip().rstrip("/")
-        if base.endswith("/v1"):
-            base = base[: -len("/v1")]
-        try:
-            import httpx
-
-            data = httpx.get(base + "/api/tags", timeout=2.0).json()
-            return [
-                f"ollama:{m['name']}" for m in data.get("models", []) if m.get("name")
-            ]
-        except Exception:
-            return []
+        return self.settings_service._ollama_models()
 
     def _curated_models(self) -> list[str]:
-        """The models offered in the composer's selector: every curated-matrix model
-        (`get_settings` culls the ones whose provider has no key) plus custom ids the user
-        added, minus matrix models they removed. Deliberately NO built-in seed list — a
-        fresh install offers nothing until a provider key exists, and then exactly that
-        provider's matrix models appear. The active default is always kept selectable.
-        """
-        from ..providers.matrix import MATRIX
-        from ..providers.trae_provider import probe_trae_status, trae_model_ids
-
-        trae_models = (
-            [f"trae:{slug}" for slug in trae_model_ids()]
-            if self._trae_enabled() and probe_trae_status().get("ok")
-            else []
-        )
-        user = self._prefs.get("models")
-        user = user if isinstance(user, list) else []
-        hidden = set(self._prefs.get("hidden_models") or [])
-        models = [m for m in [*MATRIX, *trae_models, *user] if m not in hidden]
-        return list(dict.fromkeys([self.model, *models]))
+        return self.settings_service._curated_models()
 
     def add_model(self, model: str) -> dict[str, Any]:
-        """Add a model id (e.g. `gpt-4o`, `ollama:qwen2.5-coder:32b`) to the picker.
-        Custom ids persist in prefs; a previously removed matrix model is just unhidden
-        (storing it too would shadow future matrix updates)."""
-        from ..providers.matrix import MATRIX
-
-        model = (model or "").strip()
-        if not model:
-            return {"ok": False, "error": "empty model"}
-        hidden = [m for m in self._prefs.get("hidden_models") or [] if m != model]
-        if hidden:
-            self._prefs["hidden_models"] = hidden
-        else:
-            self._prefs.pop("hidden_models", None)
-        models = self._prefs.get("models")
-        models = models if isinstance(models, list) else []
-        if model not in models and model not in MATRIX:
-            models.append(model)
-        self._prefs["models"] = models
-        self._save_prefs()
-        return {"ok": True, **self.get_settings()}
+        return self.settings_service.add_model(model)
 
     def remove_model(self, model: str) -> dict[str, Any]:
-        """Remove a model id from the picker. Custom ids are dropped; matrix models are
-        hidden by id (the matrix is derived, not stored, so a bare drop would resurrect
-        them on the next read)."""
-        from ..providers.matrix import MATRIX
-
-        models = self._prefs.get("models")
-        models = models if isinstance(models, list) else []
-        self._prefs["models"] = [m for m in models if m != model]
-        if model in MATRIX:
-            hidden = self._prefs.get("hidden_models") or []
-            if model not in hidden:
-                self._prefs["hidden_models"] = [*hidden, model]
-        self._save_prefs()
-        return {"ok": True, **self.get_settings()}
+        return self.settings_service.remove_model(model)
 
     def get_settings(self) -> dict[str, Any]:
-        """Model-access + UI status. Never returns the key; `source` says where it comes from."""
-        import os
-
-        env_key = bool(os.environ.get("OPENAI_API_KEY"))
-        stored = bool((self.secrets.get("provider:openai") or {}).get("api_key"))
-        # Only surface models whose provider is actually configured — the composer picker
-        # reflects exactly what's connected. The active default is always kept selectable
-        # (it's hidden behind the "No model" state until a provider is connected anyway).
-        # Ollama is keyless, so "configured" is meaningless there — its models show only
-        # while a local Ollama answers (cached liveness probe).
-        def _selectable(m: str) -> bool:
-            provider = self._model_provider(m)
-            if provider == "ollama":
-                return self._ollama_alive()
-            if provider == "trae":
-                return _trae_ok
-            return self._provider_configured(provider)
-
-        from ..providers.trae_provider import probe_trae_status as _probe_trae
-        trae_enabled = self._trae_enabled()
-        _trae_ok = _probe_trae().get("ok", False) if trae_enabled else False
-
-        selectable = [m for m in self._curated_models() if _selectable(m)]
-        if self.model not in selectable:
-            selectable.insert(0, self.model)
-        from ..providers.matrix import model_labels
-        from ..providers.trae_provider import discover_trae_models
-
-        labels = model_labels()
-        if trae_enabled:
-            for m in discover_trae_models():
-                labels[f"trae:{m['slug']}"] = m["label"]
-
-        return {
-            "provider": "openai",
-            "model": self.model,
-            "models": selectable,
-            # Per-model purpose tags (chat/memory/title) and the full option list, so the model
-            # manager can render a multi-select per row.
-            "model_purposes": self._prefs.get("model_purposes") or {},
-            "purposes": list(MODEL_PURPOSES),
-            # Curated-matrix display names ({full id → "GLM-5.2 · via Together"}) so every
-            # picker shows human labels; custom models absent here render their raw id.
-            "model_labels": labels,
-            "has_key": env_key or stored,
-            # Provider-agnostic "can this default model actually run?" — true when the default
-            # model's provider is configured (any provider, not just OpenAI). Drives the GUI's
-            # "No model connected" composer chip and the onboarding Skip warning.
-            "model_ready": self._provider_configured(self._model_provider(self.model)),
-            "source": "env" if env_key else ("store" if stored else None),
-            "onboarded": bool(self._prefs.get("onboarded")),
-            "experimental_connectors": experimental_enabled(self.secrets),
-            "surfaces": self._surfaces(),
-            "nav_layout": self._nav_layout(),
-            "sessions_peek": self.sessions_peek(),
-            "scratch_base": self._prefs.get("scratch_base")
-            or self.DEFAULT_SCRATCH_BASE,
-            # Real on-disk secrets location, so the UI shows the OS-native path instead of a
-            # hardcoded POSIX one (Windows -> %APPDATA%\link, macOS/Linux -> ~/.config).
-            "secrets_path": str(self.secrets.path),
-            **self.pdf_settings(),
-        }
+        return self.settings_service.get_settings()
 
     def _surfaces(self) -> dict[str, bool]:
-        """Which session surfaces are shown in the sidebar. Smallink is always on; Chat and Code
-        are opt-in (default off) so a new user sees Smallink only."""
-        return {
-            "link": True,
-            "chat": bool(self._prefs.get("show_chat", False)),
-            "code": bool(self._prefs.get("show_code", False)),
-        }
+        return self.settings_service._surfaces()
 
     def set_surfaces(
         self, chat: Optional[bool] = None, code: Optional[bool] = None
     ) -> dict[str, Any]:
-        """Toggle Chat/Code visibility (Smallink is always shown). Persisted in prefs."""
-        if chat is not None:
-            self._prefs["show_chat"] = bool(chat)
-        if code is not None:
-            self._prefs["show_code"] = bool(code)
-        self._save_prefs()
-        return {"ok": True, "surfaces": self._surfaces()}
+        return self.settings_service.set_surfaces(chat, code)
 
     def _nav_layout(self) -> str:
-        """Sidebar layout: ``"flat"`` (default) or ``"grouped"`` (by persona). Persisted in
-        prefs (UI-REFRESH §7)."""
-        return "grouped" if self._prefs.get("nav_layout") == "grouped" else "flat"
+        return self.settings_service._nav_layout()
 
     def set_nav_layout(self, nav_layout: str) -> dict[str, Any]:
-        """Set + persist the sidebar layout. Unknown values fall back to ``"flat"``."""
-        value = "grouped" if (nav_layout or "").strip() == "grouped" else "flat"
-        self._prefs["nav_layout"] = value
-        self._save_prefs()
-        return {"ok": True, "nav_layout": value}
+        return self.settings_service.set_nav_layout(nav_layout)
 
-    DEFAULT_SESSIONS_PEEK = 5
+    DEFAULT_SESSIONS_PEEK = SettingsService.DEFAULT_SESSIONS_PEEK
 
     def sessions_peek(self) -> int:
-        """How many sessions a sidebar group shows before "Show more" (owner ask, 2026-07-03)."""
-        try:
-            n = int(self._prefs.get("sessions_peek", self.DEFAULT_SESSIONS_PEEK))
-        except (TypeError, ValueError):
-            n = self.DEFAULT_SESSIONS_PEEK
-        return max(1, min(n, 50))
+        return self.settings_service.sessions_peek()
 
     def set_sessions_peek(self, n: int) -> dict[str, Any]:
-        try:
-            self._prefs["sessions_peek"] = max(1, min(int(n), 50))
-        except (TypeError, ValueError):
-            return {"ok": False, "error": "sessions_peek must be a number"}
-        self._save_prefs()
-        return {"ok": True, "sessions_peek": self.sessions_peek()}
+        return self.settings_service.set_sessions_peek(n)
 
     # -- PDF attachments / token savings (owner ask, 2026-07-17) ----------------
-    DEFAULT_PDF_MAX_PAGES = 20
-    DEFAULT_PDF_MAX_MB = 10
+    DEFAULT_PDF_MAX_PAGES = SettingsService.DEFAULT_PDF_MAX_PAGES
+    DEFAULT_PDF_MAX_MB = SettingsService.DEFAULT_PDF_MAX_MB
 
     def pdf_settings(self) -> dict[str, Any]:
-        """Fallback mode for models without native PDF support + the attach-time
-        thresholds (Settings → Token savings: big PDFs quietly eat tokens)."""
-        from ..pdf_support import FALLBACK_MODES
-
-        mode = self._prefs.get("pdf_fallback")
-        try:
-            pages = int(self._prefs.get("pdf_max_pages", self.DEFAULT_PDF_MAX_PAGES))
-        except (TypeError, ValueError):
-            pages = self.DEFAULT_PDF_MAX_PAGES
-        try:
-            mb = int(self._prefs.get("pdf_max_mb", self.DEFAULT_PDF_MAX_MB))
-        except (TypeError, ValueError):
-            mb = self.DEFAULT_PDF_MAX_MB
-        return {
-            "pdf_fallback": mode if mode in FALLBACK_MODES else "text",
-            "pdf_max_pages": max(1, min(pages, 100)),
-            "pdf_max_mb": max(1, min(mb, 10)),
-        }
+        return self.settings_service.pdf_settings()
 
     def set_pdf_settings(
         self,
@@ -2099,105 +1707,27 @@ class SessionManager:
         max_pages: Any = None,
         max_mb: Any = None,
     ) -> dict[str, Any]:
-        from ..pdf_support import FALLBACK_MODES, set_fallback_mode
-
-        if fallback is not None:
-            if fallback not in FALLBACK_MODES:
-                return {"ok": False, "error": "pdf_fallback must be 'text' or 'images'"}
-            self._prefs["pdf_fallback"] = fallback
-        for key, value, ceiling in (
-            ("pdf_max_pages", max_pages, 100),
-            ("pdf_max_mb", max_mb, 10),
-        ):
-            if value is None:
-                continue
-            try:
-                self._prefs[key] = max(1, min(int(value), ceiling))
-            except (TypeError, ValueError):
-                return {"ok": False, "error": f"{key} must be a number"}
-        self._save_prefs()
-        settings = self.pdf_settings()
-        set_fallback_mode(settings["pdf_fallback"])  # engines read the module global
-        return {"ok": True, **settings}
+        return self.settings_service.set_pdf_settings(fallback, max_pages, max_mb)
 
     def set_model_key(self, api_key: str) -> dict[str, Any]:
-        """Persist the model API key to the SecretStore (0600). The new provider client is
-        built lazily on the next turn, so it picks the key up without a restart."""
-        api_key = (api_key or "").strip()
-        if not api_key:
-            return {"ok": False, "error": "empty api key"}
-        # Merge, don't replace: the profile may also hold a custom endpoint (base_url).
-        profile = dict(self.secrets.get("provider:openai") or {})
-        profile.update({"type": "api_key", "api_key": api_key})
-        self.secrets.put("provider:openai", profile)
-        self._refresh_provider("openai")  # rebuild the OpenAI client with the new key
-        return {"ok": True, **self.get_settings()}
+        return self.settings_service.set_model_key(api_key)
 
     def set_default_model(self, model: str) -> dict[str, Any]:
-        """Set + persist the default model for new sessions (the UI pre-selects it)."""
-        model = (model or "").strip()
-        if not model:
-            return {"ok": False, "error": "empty model"}
-        self.model = model
-        self._prefs["default_model"] = model
-        self._save_prefs()
-        return {"ok": True, **self.get_settings()}
+        return self.settings_service.set_default_model(model)
 
     def set_model_purposes(
         self, model: str, purposes: list[str]
     ) -> dict[str, Any]:
-        """Tag a model with zero or more uses (chat/memory/title). Multi-select: a model can
-        serve several purposes, and a purpose can be claimed by several models. Persisted in
-        prefs under `model_purposes`. Unknown purposes are rejected."""
-        model = (model or "").strip()
-        if not model:
-            return {"ok": False, "error": "empty model"}
-        wanted = [p for p in (purposes or []) if p in MODEL_PURPOSES]
-        table = self._prefs.get("model_purposes")
-        table = table if isinstance(table, dict) else {}
-        if wanted:
-            table[model] = wanted
-        else:
-            table.pop(model, None)  # clearing all tags removes the entry
-        self._prefs["model_purposes"] = table
-        self._save_prefs()
-        return {"ok": True, **self.get_settings()}
+        return self.settings_service.set_model_purposes(model, purposes)
 
     def model_for_purpose(self, purpose: str) -> str:
-        """Resolve which model to use for a given purpose. Prefers a tagged model (if several,
-        the default model when it's among them, else the first tagged); falls back to the global
-        default `self.model` when nothing is tagged. This is how the pipeline picks its model
-        without a hardcoded global dependency."""
-        table = self._prefs.get("model_purposes")
-        table = table if isinstance(table, dict) else {}
-        tagged = [m for m, ps in table.items() if purpose in (ps or [])]
-        if not tagged:
-            return self.model
-        if self.model in tagged:
-            return self.model
-        return tagged[0]
+        return self.settings_service.model_for_purpose(purpose)
 
     def set_onboarded(self, value: bool = True) -> dict[str, Any]:
-        """Record that first-run setup is complete (so it isn't shown again)."""
-        self._prefs["onboarded"] = bool(value)
-        self._save_prefs()
-        return {"ok": True, "onboarded": bool(value)}
+        return self.settings_service.set_onboarded(value)
 
     def set_scratch_base(self, path: str) -> dict[str, Any]:
-        """Set + persist the common area where each Smallink conversation's scratch directory is
-        created (default ~/Smallink). The raw value is stored so the UI shows it as entered;
-        new conversations use it immediately (existing ones keep their provisioned dir).
-        """
-        path = (path or "").strip()
-        if not path:
-            return {"ok": False, "error": "empty path"}
-        try:
-            Path(path).expanduser().mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            return {"ok": False, "error": str(exc)}
-        self._prefs["scratch_base"] = path
-        self._save_prefs()
-        return {"ok": True, **self.get_settings()}
+        return self.settings_service.set_scratch_base(path)
 
     # -- gateway + connector allow-list (inbound messaging) ---------------------
     def allow_user(
@@ -2714,16 +2244,11 @@ class SessionManager:
                 self.unregister_session_client(session_id, cb)
 
     async def aclose(self) -> None:
-        if self._governance_scheduler_task is not None:
-            self._governance_scheduler_task.cancel()
-            try:
-                await self._governance_scheduler_task
-            except asyncio.CancelledError:
-                pass
-            self._governance_scheduler_task = None
+        await self.memory_service.stop_governance_scheduler()
         await self.scheduler.stop()
         await self.stop_gateway()
         await self.mcp.aclose()
+        self._runtimes.close_all()
         self.governance_store.close()
         self.connector_sync_store.close()
         self.app_store.close()
@@ -2779,7 +2304,7 @@ class SessionManager:
         if not target or not task.add_rule(tool_name, target):
             return False
         self.task_store.save(task)
-        engine = self._engines.get(session_id)
+        engine = self._runtimes.engine(session_id)
         if engine is not None:
             engine.permissions.task_rules.setdefault(tool_name, set()).add(target)
         try:
@@ -2864,28 +2389,38 @@ class SessionManager:
     def _build_task_engine(self, task, *, session_id: str) -> TurnEngine:
         ag = get_agent(task.agent)
         Path(task.workspace).mkdir(parents=True, exist_ok=True)
-        engine = build_engine(
-            agent=ag,
-            workspace=task.workspace,
-            model=task.model or self.model,
-            mode=Mode.INTERACTIVE,
-            approver=self._scheduled_approver(task, session_id),
-            provider=self.provider,
-            memory_store=self.memory_store,
-            governance_store=self.governance_store,
-            secrets=self.secrets,
-            # No scheduling tools inside a scheduled run: the executing agent's job is to DO the
-            # task, and instructions that mention timing ("every day at 5:32pm…") otherwise tempt
-            # it to create another automation instead of running this one.
-            task_store=None,
-            session_id=session_id,
-            audit_sink=self.audit_store.append,
-            # Scheduled runs respect the same per-session connection hierarchy as live sessions:
-            # expose only the persona's effective-enabled connectors' tools (§4.3).
-            connector_filter=self.effective_connectors(session_id, task.agent),
-            skill_state_root=self._data_base,
-        )
-        self._seed_task_permissions(engine, task)
+        scope = self._runtimes.prepare(session_id)
+        try:
+            engine = build_engine(
+                agent=ag,
+                workspace=task.workspace,
+                model=task.model or self.model,
+                mode=Mode.INTERACTIVE,
+                approver=self._scheduled_approver(task, session_id),
+                capabilities=CapabilityContainer(
+                    provider=self.provider,
+                    tools=ToolRegistry(),
+                    memory=self.memory_store,
+                ),
+                governance_store=self.governance_store,
+                secrets=self.secrets,
+                # No scheduling tools inside a scheduled run: the executing agent's job is to DO the
+                # task, and instructions that mention timing ("every day at 5:32pm…") otherwise tempt
+                # it to create another automation instead of running this one.
+                task_store=None,
+                session_id=session_id,
+                audit_sink=self.audit_store.append,
+                # Scheduled runs respect the same per-session connection hierarchy as live sessions:
+                # expose only the persona's effective-enabled connectors' tools (§4.3).
+                connector_filter=self.effective_connectors(session_id, task.agent),
+                skill_state_root=self._data_base,
+                runtime_scope=scope,
+            )
+            self._seed_task_permissions(engine, task)
+            self._runtimes.publish(session_id, engine, scope=scope)
+        except Exception:
+            scope.close()
+            raise
         return engine
 
     # -- mirroring inbox items to a bound channel -------------------------------
@@ -3013,84 +2548,32 @@ class SessionManager:
         return resumed
 
     def mark_running(self, session_id: str) -> None:
-        self._running_sessions.add(session_id)
-        tracker = self._get_tracker(session_id)
-        if tracker.phase == AgentPhase.IDLE:
-            tracker.transition(AgentPhase.STARTING)
+        scope = self._runtimes.ensure(session_id)
+        if not scope.claim():
+            raise RuntimeError(f"session {session_id!r} is already running")
 
     def try_mark_running(self, session_id: str) -> bool:
         """Atomically claim an idle session for one turn on the server event loop."""
-        if session_id in self._running_sessions:
+        scope = self._runtimes.ensure(session_id)
+        if not scope.claim():
             return False
-        self._running_sessions.add(session_id)
-        tracker = self._get_tracker(session_id)
-        if tracker.phase == AgentPhase.IDLE:
-            tracker.transition(AgentPhase.STARTING)
         return True
 
     def mark_idle(self, session_id: str) -> None:
-        self._running_sessions.discard(session_id)
-        tracker = self._trackers.get(session_id)
-        if tracker and tracker.phase != AgentPhase.IDLE:
-            if tracker.phase in (AgentPhase.ERRORED, AgentPhase.INTERRUPTED):
-                tracker.transition(AgentPhase.IDLE)
-            elif tracker.phase == AgentPhase.COMPLETING:
-                tracker.transition(AgentPhase.IDLE)
-            else:
-                tracker.reset()
+        scope = self._runtimes.scope(session_id)
+        if scope is not None:
+            scope.release()
         self._maybe_autotitle(session_id)
 
     def is_running(self, session_id: str) -> bool:
-        return session_id in self._running_sessions
+        scope = self._runtimes.scope(session_id)
+        return bool(scope and scope.claimed)
 
     def _get_tracker(self, session_id: str) -> LifecycleTracker:
-        tracker = self._trackers.get(session_id)
-        if tracker is None:
-            tracker = LifecycleTracker(session_id)
-            self._trackers[session_id] = tracker
-        return tracker
+        return self._runtimes.ensure(session_id).lifecycle
 
     def get_phase(self, session_id: str) -> AgentPhase:
-        return self._get_tracker(session_id).phase
-
-    _EVENT_PHASE_MAP: dict[str, AgentPhase] = {
-        "turn_start": AgentPhase.STARTING,
-        "assistant_delta": AgentPhase.THINKING,
-        "reasoning_delta": AgentPhase.THINKING,
-        "tool_proposed": AgentPhase.TOOL_PENDING,
-        "permission_required": AgentPhase.AWAITING_APPROVAL,
-        "directory_requested": AgentPhase.AWAITING_APPROVAL,
-        "question_requested": AgentPhase.AWAITING_APPROVAL,
-        "plan_proposed": AgentPhase.AWAITING_APPROVAL,
-        "tool_started": AgentPhase.EXECUTING,
-        "tool_finished": AgentPhase.THINKING,
-        "turn_end": AgentPhase.COMPLETING,
-        "error": AgentPhase.ERRORED,
-        "interrupted": AgentPhase.INTERRUPTED,
-    }
-
-    def _drive_phase(self, session_id: str, event_type: str) -> None:
-        target = self._EVENT_PHASE_MAP.get(event_type)
-        if target is None:
-            return
-        tracker = self._get_tracker(session_id)
-        if target == tracker.phase:
-            return
-        allowed = {AgentPhase.IDLE, AgentPhase.STARTING, AgentPhase.THINKING,
-                   AgentPhase.TOOL_PENDING, AgentPhase.AWAITING_APPROVAL,
-                   AgentPhase.EXECUTING, AgentPhase.COMPLETING,
-                   AgentPhase.ERRORED, AgentPhase.INTERRUPTED}
-        if target not in allowed:
-            return
-        try:
-            tracker.transition(target)
-        except Exception:
-            tracker.reset()
-            if target != AgentPhase.IDLE:
-                try:
-                    tracker.transition(target)
-                except Exception:
-                    pass
+        return self._session_runtime.get_phase(session_id)
 
     async def tracked_engine_events(
         self,
@@ -3103,199 +2586,19 @@ class SessionManager:
         retry: bool = False,
         resume: bool = False,
         client_message_id: Optional[str] = None,
-    ) -> AsyncIterator[Any]:
-        """Run one engine turn while durably recording its task, agent and event lifecycle."""
-        record = self.session_store.load(session_id)
-        title = (record.title if record else None) or title_from(engine.messages)
-        if title == "New session" and content is not None:
-            title = title_from([{"role": "user", "content": content}])
-        mode = getattr(getattr(engine, "permissions", None), "mode", None)
-        input_value: Any = content
-        if retry:
-            input_value = {"action": "retry"}
-        elif resume:
-            input_value = {"action": "resume"}
-        agent_run = (
-            await asyncio.to_thread(self.runtime_store.resume_waiting_root, session_id)
-            if resume
-            else None
-        )
-        if agent_run is None:
-            workspace = str(
-                getattr(getattr(engine, "executor", None), "cwd", "")
-            ) or None
-            project_id = record.project_id if record else None
-            if not project_id and workspace:
-                project = self.session_store.get_project_by_workspace(workspace)
-                project_id = project.project_id if project else None
-            _task_run, agent_run = await asyncio.to_thread(
-                self.runtime_store.start_root_run,
-                session_id=session_id,
-                title=title,
-                trigger=trigger,
-                agent_role=getattr(engine, "agent_name", "code"),
-                model=getattr(engine, "model", None),
-                mode=getattr(mode, "value", str(mode) if mode is not None else None),
-                input_value=input_value,
-                project_id=project_id,
-            )
-        source_name = str((source or {}).get("connector") or "smallink")
-        try:
-            await asyncio.to_thread(
-                self.sensory_store.add,
-                source_type=source_name,
-                connector_id=(source or {}).get("connector"),
-                account_id=(source or {}).get("account_id")
-                or (source or {}).get("team_id"),
-                external_id=f"{agent_run.agent_run_id}:input",
-                content_type="connector_input" if source else "user_input",
-                raw_content=_sensory_safe(input_value),
-                sensitivity=_sensory_sensitivity(input_value),
-                project_path=str(
-                    getattr(getattr(engine, "executor", None), "cwd", "")
-                )
-                or None,
-                conversation_id=session_id,
-                metadata={
-                    "agent_run_id": agent_run.agent_run_id,
-                    "trigger": trigger,
-                    "agent_role": getattr(engine, "agent_name", "code"),
-                    "model": getattr(engine, "model", None),
-                    "source": _sensory_safe(source or {}),
-                },
-                source_locator=f"/v1/sessions/{session_id}/messages",
-            )
-        except Exception:
-            logger.exception("could not capture sensory input for %s", session_id)
-        terminal_status: Optional[str] = None
-        terminal_error: Optional[str] = None
-        output: dict[str, Any] = {}
-        event_count = 0
-        try:
-            if resume:
-                events = engine.resume()
-            elif retry:
-                events = engine.retry()
-            else:
-                if client_message_id:
-                    events = engine.run(
-                        content,
-                        source=source,
-                        client_message_id=client_message_id,
-                    )
-                else:
-                    events = engine.run(content, source=source)
-            async for event in events:
-                event_count += 1
-                event_type = event.type.value
-                # Drive lifecycle FSM from engine events
-                self._drive_phase(session_id, event_type)
-                # Emit memory citations after the first assistant message (context was
-                # assembled for that model call, so cited_memories is populated).
-                if event_type == "assistant_message":
-                    cited = getattr(engine, "cited_memories", None)
-                    if cited:
-                        yield Event(EventType.MEMORY_CITED, {"memories": list(cited)})
-                # Token deltas are a live transport detail. Persist the completed message and
-                # semantic lifecycle events instead; one short answer can contain hundreds of
-                # deltas and made both the database and Runs UI grow without useful information.
-                if event_type not in {"assistant_delta", "reasoning_delta"}:
-                    await asyncio.to_thread(
-                        self.runtime_store.append_event,
-                        agent_run.agent_run_id,
-                        event_type,
-                        event.data,
-                    )
-                sensory_type = {
-                    "assistant_message": "assistant_output",
-                    "tool_proposed": "tool_call",
-                    "tool_finished": "tool_result",
-                    "error": "runtime_error",
-                    "interrupted": "runtime_error",
-                }.get(event_type)
-                if sensory_type:
-                    try:
-                        await asyncio.to_thread(
-                            self.sensory_store.add,
-                            source_type="smallink",
-                            external_id=(
-                                f"{agent_run.agent_run_id}:{event_count}:{event_type}"
-                            ),
-                            content_type=sensory_type,
-                            raw_content=_sensory_safe(event.data),
-                            sensitivity=_sensory_sensitivity(event.data),
-                            project_path=str(
-                                getattr(
-                                    getattr(engine, "executor", None), "cwd", ""
-                                )
-                            )
-                            or None,
-                            conversation_id=session_id,
-                            metadata={
-                                "agent_run_id": agent_run.agent_run_id,
-                                "event_type": event_type,
-                                "trigger": trigger,
-                                "agent_role": getattr(engine, "agent_name", "code"),
-                                "model": getattr(engine, "model", None),
-                            },
-                            source_locator=(
-                                f"/v1/agent-runs/{agent_run.agent_run_id}/events"
-                            ),
-                        )
-                    except Exception:
-                        logger.exception(
-                            "could not capture sensory event %s for %s",
-                            event_type,
-                            session_id,
-                        )
-                if event_type == "assistant_message" and event.data.get("text"):
-                    output["text"] = event.data["text"]
-                elif event_type == "turn_end":
-                    engine_status = event.data.get("status", "completed")
-                    terminal_status = (
-                        "completed" if engine_status == "completed" else "failed"
-                    )
-                    output["engine_status"] = engine_status
-                elif event_type == "error":
-                    terminal_status = "failed"
-                    terminal_error = str(event.data.get("error", "engine error"))
-                elif event_type == "interrupted":
-                    terminal_status = "cancelled"
-                    terminal_error = str(
-                        event.data.get("reason", "execution interrupted")
-                    )
-                yield event
-                # Emit phase_changed event after each engine event
-                tracker = self._trackers.get(session_id)
-                if tracker:
-                    yield Event(EventType.PHASE_CHANGED, {
-                        "phase": tracker.phase.value,
-                        "trigger": event_type,
-                        "session_id": session_id,
-                    })
-            if terminal_status is None:
-                if event_count == 0 and (retry or resume):
-                    terminal_status = "completed"
-                    output["engine_status"] = "no_op"
-                else:
-                    terminal_status = "failed"
-                    terminal_error = "engine event stream ended without a terminal event"
-        except asyncio.CancelledError:
-            terminal_status = "cancelled"
-            terminal_error = "execution cancelled"
-            raise
-        except Exception as exc:
-            terminal_status = "failed"
-            terminal_error = str(exc)
-            raise
-        finally:
-            await asyncio.to_thread(
-                self.runtime_store.finish_agent_run,
-                agent_run.agent_run_id,
-                status=terminal_status or "failed",
-                output=output or None,
-                error=terminal_error,
-            )
+    ) -> AsyncIterator[Event]:
+        """Compatibility facade for the session runtime service."""
+        async for event in self._session_runtime.tracked_engine_events(
+            session_id,
+            engine,
+            content=content,
+            source=source,
+            trigger=trigger,
+            retry=retry,
+            resume=resume,
+            client_message_id=client_message_id,
+        ):
+            yield event
 
     async def _resume_wake(self, wake) -> None:
         await self.deliver_to_session(wake.session_id, self._wake_message(wake))
@@ -3564,7 +2867,6 @@ class SessionManager:
         engine = self._build_task_engine(task, session_id=run.session_id)
         # Register the live engine up-front: a parked approval persists the session
         # mid-run (durable suspend), and resolving from the Inbox must find this engine.
-        self._engines[run.session_id] = engine
         # The first turn is the task itself. The framing matters: instructions often restate the
         # schedule ("every day at 5:32pm…"), so make explicit that the schedule already fired and
         # the job now is to execute, not to (re)schedule.
@@ -3600,7 +2902,6 @@ class SessionManager:
             # follow-up; record the run (now carrying its session_id).
             try:
                 self.save(run.session_id, engine)
-                self._engines[run.session_id] = engine
             except Exception:
                 pass
             self.task_store.add_run(run)
@@ -3748,7 +3049,7 @@ class SessionManager:
         self.task_store.save(task)
         if changes.get("revoke"):
             # A live run engine may still hold the revoked rule — reseed from the record.
-            for sid, engine in self._engines.items():
+            for sid, engine in self._runtimes.engine_items():
                 owner = self.task_store.task_for_run_session(sid)
                 if owner is not None and owner.id == task.id:
                     engine.permissions.task_rules = task.standing_rules()
@@ -3902,7 +3203,7 @@ class SessionManager:
         forgetting the counter is harmless: renamed/auto_title still gate re-titling."""
         if session_id.startswith("__"):
             return
-        engine = self._engines.get(session_id)
+        engine = self._runtimes.engine(session_id)
         if engine is None or session_id in self._autotitle_inflight:
             return
         if self.task_store.task_for_run_session(session_id) is not None:
@@ -3996,7 +3297,7 @@ class SessionManager:
         """The directories this session can touch: primary scratch first, then added folders.
         Reads the live engine when one is running; otherwise reconstructs from persisted state.
         """
-        engine = self._engines.get(session_id)
+        engine = self._runtimes.engine(session_id)
         if engine is not None and getattr(engine, "roots", None):
             return [
                 {
@@ -4047,7 +3348,7 @@ class SessionManager:
         if not p.is_dir():
             return {"ok": False, "error": f"not a directory: {path}"}
         resolved = p.resolve()
-        engine = self._engines.get(session_id)
+        engine = self._runtimes.engine(session_id)
         if engine is not None and getattr(engine, "roots", None) is not None:
             if any(r.path == resolved for r in engine.roots):
                 # already present: just update its access level
@@ -4097,7 +3398,7 @@ class SessionManager:
     def remove_root(self, session_id: str, path: str) -> dict[str, Any]:
         """Revoke a previously-added folder. The primary scratch cannot be removed."""
         resolved = Path(path).expanduser().resolve()
-        engine = self._engines.get(session_id)
+        engine = self._runtimes.engine(session_id)
         if engine is not None and getattr(engine, "roots", None):
             if engine.roots and engine.roots[0].path == resolved:
                 return {
@@ -4139,7 +3440,7 @@ class SessionManager:
         # A live engine's in-memory thread is authoritative: mid-turn it's ahead of the
         # persisted record — which may not even exist yet for a scheduled run's first turn
         # (opening a "running" automation showed a blank session; owner report 2026-07-04).
-        engine = self._engines.get(session_id)
+        engine = self._runtimes.engine(session_id)
         if engine is not None:
             return list(engine.messages)
         record = self.session_store.load(session_id)
@@ -4203,6 +3504,7 @@ class SessionManager:
             event.to_dict() for event in self.runtime_store.list_events(agent_run_id)
         ]
 
+    # -- memory-domain compatibility entry points ------------------------------
     def sensory_records(
         self,
         *,
@@ -4214,133 +3516,21 @@ class SessionManager:
         project_path: Optional[str] = None,
         query: Optional[str] = None,
     ) -> dict[str, Any]:
-        filters = {
-            "source_type": source_type,
-            "governance_status": governance_status,
-            "conversation_id": conversation_id,
-            "project_path": project_path,
-            "query": query,
-        }
-        records = self.sensory_store.list(limit=limit, offset=offset, **filters)
-        return {
-            "records": [record.to_dict() for record in records],
-            "total": self.sensory_store.count(**filters),
-            "limit": max(1, min(int(limit), 500)),
-            "offset": max(0, int(offset)),
-        }
+        return self.memory_service.sensory_records(
+            limit=limit,
+            offset=offset,
+            source_type=source_type,
+            governance_status=governance_status,
+            conversation_id=conversation_id,
+            project_path=project_path,
+            query=query,
+        )
 
     def sensory_record(self, record_id: str) -> Optional[dict[str, Any]]:
-        record = self.sensory_store.get(record_id)
-        return record.to_dict() if record else None
+        return self.memory_service.sensory_record(record_id)
 
     def sensory_provenance(self, record_id: str) -> Optional[dict[str, Any]]:
-        record = self.sensory_store.get(record_id)
-        if record is None:
-            return None
-        return {
-            "source": record.to_dict(),
-            **self.governance_store.provenance_for_record(record_id),
-        }
-
-    def knowledge_items(
-        self, *, project_id: Optional[str] = None, status: Optional[str] = "active"
-    ) -> list[dict[str, Any]]:
-        if project_id is not None and self.get_project(project_id) is None:
-            raise KeyError(project_id)
-        return self.knowledge_store.list(
-            project_id=project_id, status=status, limit=500
-        )
-
-    def knowledge_item(self, item_id: str) -> Optional[dict[str, Any]]:
-        return self.knowledge_store.get(item_id)
-
-    def index_knowledge_source(
-        self,
-        record_id: str,
-        *,
-        project_id: Optional[str] = None,
-        title: str = "",
-    ) -> dict[str, Any]:
-        record = self.sensory_store.get(record_id)
-        if record is None:
-            raise KeyError(record_id)
-        project = self.session_store.get_project(project_id) if project_id else None
-        if project_id and project is None:
-            raise KeyError(project_id)
-        if project is None and record.project_path:
-            project = self.session_store.get_project_by_workspace(record.project_path)
-        content = record.normalized_content or record.raw_content
-        inferred = " ".join(content.replace("\n", " ").split())[:120]
-        item = self.knowledge_store.upsert(
-            project_id=project.project_id if project else project_id,
-            source_type=f"sensory:{record.source_type}",
-            external_id=record.record_id,
-            title=title.strip() or inferred or record.content_type,
-            content=content,
-            source_record_id=record.record_id,
-            metadata={
-                "content_type": record.content_type,
-                "source_type": record.source_type,
-                "source_locator": record.source_locator,
-                "conversation_id": record.conversation_id,
-            },
-        )
-        return {"ok": True, "item": item}
-
-    def index_project_knowledge(self, project_id: str) -> dict[str, Any]:
-        project = self.session_store.get_project(project_id)
-        if project is None:
-            raise KeyError(project_id)
-        eligible = {
-            "app_capability_result",
-            "document",
-            "document_text",
-            "artifact",
-            "file_content",
-            "web_page",
-            "meeting_transcript",
-        }
-        records = self.sensory_store.list(
-            project_path=project.workspace_path, limit=500
-        )
-        indexed: list[str] = []
-        skipped = 0
-        for record in records:
-            if record.content_type not in eligible:
-                skipped += 1
-                continue
-            result = self.index_knowledge_source(
-                record.record_id, project_id=project_id
-            )
-            indexed.append(str(result["item"]["item_id"]))
-        return {
-            "ok": True,
-            "project_id": project_id,
-            "indexed": len(set(indexed)),
-            "skipped": skipped,
-            "item_ids": list(dict.fromkeys(indexed)),
-        }
-
-    def search_knowledge(
-        self,
-        query: str,
-        *,
-        project_id: Optional[str] = None,
-        limit: int = 20,
-    ) -> dict[str, Any]:
-        if project_id is not None and self.get_project(project_id) is None:
-            raise KeyError(project_id)
-        return self.knowledge_store.search(
-            query, project_id=project_id, limit=limit
-        )
-
-    def archive_knowledge_item(
-        self, item_id: str, archived: bool
-    ) -> dict[str, Any]:
-        if self.knowledge_store.get(item_id) is None:
-            raise KeyError(item_id)
-        self.knowledge_store.archive(item_id, archived=archived)
-        return {"ok": True, "item": self.knowledge_store.get(item_id)}
+        return self.memory_service.sensory_provenance(record_id)
 
     def delete_sensory_records(
         self,
@@ -4349,86 +3539,52 @@ class SessionManager:
         source_type: Optional[str] = None,
         before: Optional[str] = None,
     ) -> dict[str, Any]:
-        ids = list(dict.fromkeys(record_ids or []))
-        affected_candidates: set[str] = set()
-        affected_memories: set[int] = set()
-        selected_ids = self.sensory_store.matching_ids(
-            record_ids=ids,
-            source_type=source_type,
-            before=before,
+        return self.memory_service.delete_sensory_records(
+            record_ids=record_ids, source_type=source_type, before=before
         )
-        if selected_ids:
-            references = self.governance_store.source_references(selected_ids)
-            affected_candidates = set(references["candidate_ids"])
-            affected_memories = set(references["memory_ids"])
-            if affected_candidates or affected_memories:
-                raise ValueError(
-                    "source record is referenced by memory governance and cannot be deleted"
-                )
-        deleted = 0
-        if selected_ids:
-            if ids:
-                for start in range(0, len(ids), 500):
-                    deleted += self.sensory_store.delete(
-                        record_ids=ids[start : start + 500],
-                        source_type=source_type,
-                        before=before,
-                    )
-            else:
-                deleted = self.sensory_store.delete(
-                    source_type=source_type,
-                    before=before,
-                )
-        return {
-            "ok": True,
-            "deleted_records": deleted,
-            "affected_candidates": sorted(affected_candidates),
-            "affected_memories": sorted(affected_memories),
-        }
-
-    # Fields an external caller may set, mapped 1:1 onto SQLiteSensoryStore.add's kwargs.
-    _INGEST_OPTIONAL = (
-        "external_id",
-        "normalized_content",
-        "occurred_at",
-        "connector_id",
-        "account_id",
-        "project_path",
-        "conversation_id",
-        "sensitivity",
-        "source_locator",
-    )
 
     def ingest_sensory_record(self, body: dict[str, Any]) -> dict[str, Any]:
-        """Generic ingest entry point: an external collector (agent, connector, script) POSTs
-        raw data, which lands immutably in sensory_records. Idempotent — the store dedupes on
-        (source_type, external_id, content_hash), so re-POSTing identical content is a no-op
-        that returns the existing record. This does NOT create memories; the pipeline does that
-        as a separate step. Raises ValueError on missing required fields (route → HTTP 400)."""
-        for required in ("source_type", "content_type", "raw_content"):
-            if not body.get(required):
-                raise ValueError(f"missing required field: {required}")
-        kwargs: dict[str, Any] = {
-            "source_type": str(body["source_type"]),
-            "content_type": str(body["content_type"]),
-            # Strip embedded binary payloads (e.g. data URLs) exactly like turn capture does.
-            "raw_content": _sensory_safe(body["raw_content"]),
-            "sensitivity": _sensory_sensitivity(body["raw_content"]),
-        }
-        for field in self._INGEST_OPTIONAL:
-            if body.get(field) is not None:
-                kwargs[field] = body[field]
-        metadata = body.get("metadata")
-        if isinstance(metadata, dict):
-            kwargs["metadata"] = _sensory_safe(metadata)
-        record = self.sensory_store.add(**kwargs)
-        return {
-            "record_id": record.record_id,
-            "external_id": record.external_id,
-            "content_hash": record.content_hash,
-            "governance_status": record.governance_status,
-            "ingested_at": record.ingested_at,
-        }
+        return self.memory_service.ingest_sensory_record(body)
+
+    def knowledge_items(
+        self, *, project_id: Optional[str] = None, status: Optional[str] = "active"
+    ) -> list[dict[str, Any]]:
+        return self.memory_service.knowledge_items(
+            project_id=project_id, status=status
+        )
+
+    def knowledge_item(self, item_id: str) -> Optional[dict[str, Any]]:
+        return self.memory_service.knowledge_item(item_id)
+
+    def index_knowledge_source(
+        self,
+        record_id: str,
+        *,
+        project_id: Optional[str] = None,
+        title: str = "",
+    ) -> dict[str, Any]:
+        return self.memory_service.index_knowledge_source(
+            record_id, project_id=project_id, title=title
+        )
+
+    def index_project_knowledge(self, project_id: str) -> dict[str, Any]:
+        return self.memory_service.index_project_knowledge(project_id)
+
+    def search_knowledge(
+        self,
+        query: str,
+        *,
+        project_id: Optional[str] = None,
+        limit: int = 20,
+    ) -> dict[str, Any]:
+        return self.memory_service.search_knowledge(
+            query, project_id=project_id, limit=limit
+        )
+
+    def archive_knowledge_item(
+        self, item_id: str, archived: bool
+    ) -> dict[str, Any]:
+        return self.memory_service.archive_knowledge_item(item_id, archived)
 
     def run_memory_pipeline(
         self,
@@ -4437,132 +3593,23 @@ class SessionManager:
         retry_failed: bool = False,
         allow_sensitive_cloud: bool = False,
     ) -> dict[str, Any]:
-        """Run the durable governance pipeline and produce reviewable candidates."""
-        pipeline = MemoryPipeline(
-            self.sensory_store,
-            self.memory_store,
-            self.provider,
-            model=self.model_for_purpose("memory"),
-            governance_store=self.governance_store,
-            allow_sensitive_cloud=allow_sensitive_cloud,
-        )
-        return pipeline.process(
-            record_ids=record_ids,
-            limit=limit,
-            retry_failed=retry_failed,
+        return self.memory_service.run_memory_pipeline(
+            record_ids, limit, retry_failed, allow_sensitive_cloud
         )
 
     def governance_schedule(self) -> dict[str, Any]:
-        raw = self._prefs.get("governance_schedule")
-        config = raw if isinstance(raw, dict) else {}
-        interval = max(15, min(int(config.get("interval_minutes", 1440)), 10080))
-        last_run_at = config.get("last_run_at")
-        next_run_at: Optional[str] = None
-        if bool(config.get("enabled", False)):
-            try:
-                last = datetime.fromisoformat(str(last_run_at)) if last_run_at else datetime.now(timezone.utc)
-                if last.tzinfo is None:
-                    last = last.replace(tzinfo=timezone.utc)
-                from datetime import timedelta
-
-                next_run_at = (last + timedelta(minutes=interval)).isoformat()
-            except (TypeError, ValueError):
-                next_run_at = _now_iso()
-        return {
-            "enabled": bool(config.get("enabled", False)),
-            "interval_minutes": interval,
-            "batch_limit": max(1, min(int(config.get("batch_limit", 50)), 500)),
-            "last_run_at": last_run_at,
-            "next_run_at": next_run_at,
-            "last_result": config.get("last_result"),
-            "running": self._governance_schedule_running,
-        }
+        return self.memory_service.governance_schedule()
 
     def set_governance_schedule(self, body: dict[str, Any]) -> dict[str, Any]:
-        current = self.governance_schedule()
-        enabled = bool(body.get("enabled", current["enabled"]))
-        try:
-            interval = int(body.get("interval_minutes", current["interval_minutes"]))
-            batch_limit = int(body.get("batch_limit", current["batch_limit"]))
-        except (TypeError, ValueError) as exc:
-            raise ValueError("governance schedule values must be integers") from exc
-        if not 15 <= interval <= 10080:
-            raise ValueError("interval_minutes must be between 15 and 10080")
-        if not 1 <= batch_limit <= 500:
-            raise ValueError("batch_limit must be between 1 and 500")
-        previous = self._prefs.get("governance_schedule")
-        preserved = previous if isinstance(previous, dict) else {}
-        self._prefs["governance_schedule"] = {
-            **preserved,
-            "enabled": enabled,
-            "interval_minutes": interval,
-            "batch_limit": batch_limit,
-        }
-        self._save_prefs()
-        return self.governance_schedule()
+        return self.memory_service.set_governance_schedule(body)
 
     def start_governance_scheduler(self) -> None:
-        if self._governance_scheduler_task is None or self._governance_scheduler_task.done():
-            self._governance_scheduler_task = asyncio.create_task(
-                self._governance_scheduler_loop(),
-                name="smallink-governance-scheduler",
-            )
-
-    async def _governance_scheduler_loop(self) -> None:
-        while True:
-            try:
-                await self.run_scheduled_governance_once()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("scheduled memory governance failed")
-            await asyncio.sleep(15)
+        self.memory_service.start_governance_scheduler()
 
     async def run_scheduled_governance_once(
         self, *, force: bool = False
     ) -> dict[str, Any]:
-        config = self.governance_schedule()
-        if self._governance_schedule_running:
-            return {"status": "skipped", "reason": "already_running"}
-        if not force and not config["enabled"]:
-            return {"status": "skipped", "reason": "disabled"}
-        if not force and config["next_run_at"]:
-            try:
-                due = datetime.fromisoformat(str(config["next_run_at"]))
-                if due.tzinfo is None:
-                    due = due.replace(tzinfo=timezone.utc)
-                if due > datetime.now(timezone.utc):
-                    return {"status": "skipped", "reason": "not_due"}
-            except ValueError:
-                pass
-        pending = self.sensory_store.count(governance_status="pending")
-        if pending == 0:
-            return {"status": "skipped", "reason": "no_pending_records"}
-        self._governance_schedule_running = True
-        try:
-            result = await asyncio.to_thread(
-                self.run_memory_pipeline,
-                None,
-                int(config["batch_limit"]),
-                False,
-                False,
-            )
-            auto_result = await asyncio.to_thread(
-                self.auto_accept_high_confidence, 0.9
-            )
-            result["auto_accepted"] = auto_result.get("auto_accepted", 0)
-            stored = self._prefs.get("governance_schedule")
-            schedule = stored if isinstance(stored, dict) else {}
-            schedule["last_run_at"] = _now_iso()
-            schedule["last_result"] = result
-            self._prefs["governance_schedule"] = schedule
-            self._save_prefs()
-            await self.broadcast_event(
-                {"type": "governance_task_updated", "data": result}
-            )
-            return {"status": "ran", "result": result}
-        finally:
-            self._governance_schedule_running = False
+        return await self.memory_service.run_scheduled_governance_once(force=force)
 
     def memory_candidates(
         self,
@@ -4571,322 +3618,67 @@ class SessionManager:
         min_confidence: Optional[float] = None,
         max_confidence: Optional[float] = None,
     ) -> list[dict[str, Any]]:
-        return [
-            candidate.to_dict()
-            for candidate in self.governance_store.list_candidates(
-                status=status,
-                min_confidence=min_confidence,
-                max_confidence=max_confidence,
-            )
-        ]
+        return self.memory_service.memory_candidates(
+            status=status,
+            min_confidence=min_confidence,
+            max_confidence=max_confidence,
+        )
 
-    def auto_accept_high_confidence(self, threshold: float = 0.9) -> dict[str, Any]:
-        """Auto-accept candidates whose confidence meets the threshold."""
-        return self.governance_store.auto_accept_high_confidence(
-            self.memory_store, threshold=threshold
+    def auto_accept_high_confidence(
+        self, threshold: float = 0.9, *, confirmed: bool = False
+    ) -> dict[str, Any]:
+        return self.memory_service.auto_accept_high_confidence(
+            threshold, confirmed=confirmed
         )
 
     def memory_confidence_summary(self) -> dict[str, Any]:
-        """Summarize pending candidates by confidence tier for quick-review UX."""
-        candidates = self.governance_store.list_candidates("pending")
-        tiers = {"high": 0, "medium": 0, "low": 0, "unscored": 0}
-        for c in candidates:
-            if c.confidence is None:
-                tiers["unscored"] += 1
-            elif c.confidence >= 0.8:
-                tiers["high"] += 1
-            elif c.confidence >= 0.5:
-                tiers["medium"] += 1
-            else:
-                tiers["low"] += 1
-        return {
-            "total_pending": len(candidates),
-            "tiers": tiers,
-        }
+        return self.memory_service.memory_confidence_summary()
 
     def memory_candidate(self, candidate_id: str) -> Optional[dict[str, Any]]:
-        candidate = self.governance_store.get_candidate(candidate_id)
-        if candidate is None:
-            return None
-        data = candidate.to_dict()
-        data["source_records"] = [
-            record.to_dict()
-            for source_id in candidate.sources
-            if (record := self.sensory_store.get(source_id)) is not None
-        ]
-        return data
+        return self.memory_service.memory_candidate(candidate_id)
 
     def decide_memory_candidate(
         self, candidate_id: str, body: dict[str, Any]
     ) -> dict[str, Any]:
-        return self.governance_store.decide(
-            candidate_id,
-            str(body.get("action", "")),
-            self.memory_store,
-            content=body.get("content"),
-            merge_memory_id=(
-                int(body["merge_memory_id"])
-                if body.get("merge_memory_id") is not None
-                else None
-            ),
-        )
+        return self.memory_service.decide_memory_candidate(candidate_id, body)
 
     def decide_memory_candidates(self, body: dict[str, Any]) -> dict[str, Any]:
-        """Apply one safe decision to multiple candidates and report partial failures."""
-        raw_ids = body.get("candidate_ids")
-        if not isinstance(raw_ids, list):
-            raise ValueError("candidate_ids must be a list")
-        candidate_ids = list(dict.fromkeys(str(value).strip() for value in raw_ids if str(value).strip()))
-        if not candidate_ids:
-            raise ValueError("candidate_ids must not be empty")
-        action = str(body.get("action", ""))
-        if action not in {"accept", "ignore"}:
-            raise ValueError("batch action must be accept or ignore")
-
-        processed: list[dict[str, Any]] = []
-        failed: list[dict[str, str]] = []
-        for candidate_id in candidate_ids:
-            try:
-                processed.append(
-                    {
-                        "candidate_id": candidate_id,
-                        **self.decide_memory_candidate(candidate_id, {"action": action}),
-                    }
-                )
-            except KeyError:
-                failed.append({"candidate_id": candidate_id, "error": "candidate not found"})
-            except ValueError as exc:
-                failed.append({"candidate_id": candidate_id, "error": str(exc)})
-        return {
-            "ok": not failed,
-            "action": action,
-            "requested": len(candidate_ids),
-            "processed": processed,
-            "failed": failed,
-        }
+        return self.memory_service.decide_memory_candidates(body)
 
     def retype_memory_candidates(self, body: dict[str, Any]) -> dict[str, Any]:
-        raw_ids = body.get("candidate_ids")
-        if not isinstance(raw_ids, list):
-            raise ValueError("candidate_ids must be a list")
-        candidate_ids = list(
-            dict.fromkeys(
-                str(value).strip() for value in raw_ids if str(value).strip()
-            )
-        )
-        if not candidate_ids:
-            raise ValueError("candidate_ids must not be empty")
-        memory_type = str(body.get("memory_type", "")).strip()
-        processed: list[dict[str, Any]] = []
-        failed: list[dict[str, str]] = []
-        for candidate_id in candidate_ids:
-            try:
-                candidate = self.governance_store.set_candidate_type(
-                    candidate_id, memory_type
-                )
-                processed.append(candidate.to_dict())
-            except KeyError:
-                failed.append(
-                    {"candidate_id": candidate_id, "error": "candidate not found"}
-                )
-            except ValueError as exc:
-                failed.append({"candidate_id": candidate_id, "error": str(exc)})
-        return {
-            "ok": not failed,
-            "memory_type": memory_type,
-            "requested": len(candidate_ids),
-            "processed": processed,
-            "failed": failed,
-        }
+        return self.memory_service.retype_memory_candidates(body)
 
     def governance_tasks(
         self, *, status: Optional[str] = None, limit: int = 100
     ) -> list[dict[str, Any]]:
-        return self.governance_store.list_tasks(status=status, limit=limit)
+        return self.memory_service.governance_tasks(status=status, limit=limit)
 
     def governance_task(self, task_id: str) -> Optional[dict[str, Any]]:
-        task = self.governance_store.get_task(task_id)
-        if task is None:
-            return None
-        task["candidates"] = [
-            candidate.to_dict()
-            for candidate in self.governance_store.list_candidates(status=None)
-            if candidate.task_id == task_id
-        ]
-        return task
+        return self.memory_service.governance_task(task_id)
 
     def set_memory_status(self, memory_id: int, status: str) -> dict[str, Any]:
-        result = self.governance_store.set_memory_status(
-            self.memory_store, memory_id, status
-        )
-        memory = result["memory"]
-        return {
-            "ok": True,
-            "idempotent": result["idempotent"],
-            "memory": {
-                "id": memory.id,
-                "scope": memory.scope.value,
-                "content": memory.content,
-                "key": memory.key,
-                "workspace": memory.workspace,
-                "session_id": memory.session_id,
-                "created_at": memory.created_at,
-                "status": memory.status,
-                "updated_at": memory.updated_at,
-                "source_record_id": memory.source_record_id,
-            },
-        }
+        return self.memory_service.set_memory_status(memory_id, status)
 
     def memory_usage_history(
         self, *, limit: int = 50, memory_id: Optional[int] = None
     ) -> dict[str, Any]:
-        rows = self.governance_store.query_usage_history(limit=limit, memory_id=memory_id)
-        return {
-            "records": [
-                {
-                    "usage_id": r["usage_id"],
-                    "memory_id": r["memory_id"],
-                    "session_id": r["session_id"],
-                    "workspace": r["workspace"],
-                    "used_at": r["used_at"],
-                    "content": (r.get("content") or "")[:120],
-                    "key": r.get("key"),
-                }
-                for r in rows
-            ],
-        }
+        return self.memory_service.memory_usage_history(
+            limit=limit, memory_id=memory_id
+        )
+
+    def list_memory(
+        self, *, status: Optional[str] = "active"
+    ) -> list[dict[str, Any]]:
+        return self.memory_service.list_memory(status=status)
 
     def sync_codex(self, limit_sessions: Optional[int] = None) -> dict[str, Any]:
-        """Read local Codex rollout sessions and ingest each conversation TURN (one user
-        prompt + its following assistant replies) as one sensory_record (source_type='codex').
-        Turn-level granularity gives the memory pipeline a full question→answer unit. Idempotent
-        via ingest's content-hash dedupe, so re-syncing the same sessions creates no duplicates.
-        `limit_sessions` caps how many session FILES are read (newest first) — pass a small N to
-        validate before a full import. Does NOT run the memory pipeline; that stays separate."""
-        from ..connectors.codex_client import (
-            iter_session_files,
-            read_sessions,
-            resolve_sessions_root,
-        )
-
-        # Prefer the user-granted folder saved at connect time (macOS TCC needs the user to
-        # pick ~/.codex in a native dialog before the app can read it); fall back to the default
-        # ~/.codex/sessions when no folder was granted (e.g. dev/CLI runs).
-        profile = self.secrets.get("codex:default") or {}
-        root = resolve_sessions_root(profile.get("sessions_path")) if profile.get("sessions_path") else None
-
-        return self._run_rollout_sync(
-            source_type="codex",
-            content_type="codex_turn",
-            root=root,
-            files=iter_session_files(root),
-            sessions_iter=read_sessions(limit=limit_sessions, root=root),
-        )
+        return self.memory_service.sync_codex(limit_sessions)
 
     def sync_traex(self, limit_sessions: Optional[int] = None) -> dict[str, Any]:
-        """Import user-owned TraeX / TRAE CLI conversations from ~/.trae/cli/sessions.
-
-        TraeX uses the same rollout envelope as Codex, but stores subagent threads beside main
-        sessions. The TraeX reader excludes those internal threads before they reach the sensory
-        pool. A packaged macOS app reads the explicitly granted folder saved by the connector.
-        """
-        from ..connectors.codex_client import iter_session_files
-        from ..connectors.traex_client import read_sessions, resolve_sessions_root
-
-        profile = self.secrets.get("traex:default") or {}
-        root = (
-            resolve_sessions_root(profile.get("sessions_path"))
-            if profile.get("sessions_path")
-            else None
-        )
-        return self._run_rollout_sync(
-            source_type="traex",
-            content_type="traex_turn",
-            root=root,
-            files=iter_session_files(root),
-            sessions_iter=read_sessions(limit=limit_sessions, root=root),
-        )
-
-    def _run_rollout_sync(
-        self,
-        *,
-        source_type: str,
-        content_type: str,
-        root: Optional[Path],
-        files: list[Path],
-        sessions_iter,
-    ) -> dict[str, Any]:
-        job_id = self.connector_sync_store.start(
-            source_type, str(root) if root is not None else None
-        )
-        try:
-            result = self._sync_rollout_sessions(
-                sessions_iter,
-                source_type=source_type,
-                content_type=content_type,
-            )
-            last_file = str(files[0]) if files else None
-            last_mtime = files[0].stat().st_mtime if files else None
-            job = self.connector_sync_store.finish(
-                job_id,
-                status="completed",
-                files_scanned=len(files),
-                sessions_read=result["sessions_read"],
-                records_seen=result["turns_seen"],
-                records_ingested=result["records_ingested"],
-                last_file=last_file,
-                last_file_mtime=last_mtime,
-                details={"source_type": source_type},
-            )
-            return {**result, "job_id": job_id, "sync": job}
-        except Exception as exc:
-            self.connector_sync_store.fail(job_id, exc)
-            raise
+        return self.memory_service.sync_traex(limit_sessions)
 
     def connector_sync_status(self, name: str) -> Optional[dict[str, Any]]:
-        return self.connector_sync_store.latest(name)
-
-    def _sync_rollout_sessions(
-        self,
-        sessions_iter,
-        *,
-        source_type: str,
-        content_type: str,
-    ) -> dict[str, Any]:
-        before = self.sensory_store.count(source_type=source_type)
-        sessions = 0
-        turns_seen = 0
-        for session in sessions_iter:
-            sessions += 1
-            for turn in session.turns():
-                turns_seen += 1
-                self.ingest_sensory_record(
-                    {
-                        "source_type": source_type,
-                        "connector_id": source_type,
-                        "content_type": content_type,
-                        "raw_content": turn.as_text(),
-                        # session_id + turn position → stable id; dedupe also guards content_hash.
-                        "external_id": f"{session.session_id}:{turn.index}",
-                        "occurred_at": turn.timestamp or session.started_at,
-                        "project_path": session.cwd,
-                        "conversation_id": session.session_id,
-                        "source_locator": str(session.path),
-                        "metadata": {
-                            "roles": [m.role for m in turn.messages],
-                            "message_count": len(turn.messages),
-                            "model_provider": session.model_provider,
-                            "originator": session.originator,
-                        },
-                    }
-                )
-        after = self.sensory_store.count(source_type=source_type)
-        return {
-            "sessions_read": sessions,
-            "turns_seen": turns_seen,
-            # Real new rows (idempotent dedupe means a re-sync reports 0 here).
-            "records_ingested": after - before,
-        }
+        return self.memory_service.connector_sync_status(name)
 
     def rename_session(self, session_id: str, title: str) -> dict[str, Any]:
         if session_id.startswith("__"):
@@ -4913,14 +3705,7 @@ class SessionManager:
     def delete_session(self, session_id: str) -> dict[str, Any]:
         if session_id.startswith("__"):
             return {"ok": False, "error": "internal sessions cannot be deleted here"}
-        engine = self._engines.pop(session_id, None)
-        if engine is not None:
-            try:
-                # (was engine.interrupt() — a method that never existed; the AttributeError
-                # was silently swallowed, so deleting a running session never stopped it.)
-                engine.request_interrupt()
-            except Exception:
-                pass
+        self._runtimes.discard(session_id)
         record = self.session_store.load(session_id)
         ok = self.session_store.delete(session_id)
         # Deleting a session is the one implicit unsubscribe (otherwise subscriptions are permanent).
@@ -4995,231 +3780,32 @@ class SessionManager:
             return "sleeping"
         return "idle"
 
-    # -- projects ---------------------------------------------------------------
+    # -- application/project compatibility facades -----------------------------
 
     def _ensure_builtin_app_projects(self) -> None:
-        for manifest in self.app_registry.list():
-            self._ensure_app_project(manifest)
-            self.app_store.ensure_instance(manifest.app_id, enabled=True)
+        return self.app_projects._ensure_builtin_app_projects()
 
-    def _ensure_app_project(self, manifest: AppManifest) -> ProjectRecord:
-        existing = self.session_store.get_project_by_system_key(manifest.system_project_id)
-        if existing is not None:
-            return existing
-        by_id = self.session_store.get_project(manifest.system_project_id)
-        if by_id is not None:
-            return by_id
-        managed_workspace = self._data_base / "apps" / manifest.app_id / "workspace"
-        managed_workspace.mkdir(parents=True, exist_ok=True)
-        project = ProjectRecord(
-            project_id=manifest.system_project_id,
-            name=manifest.system_project_name,
-            icon="S",
-            workspace_path=str(managed_workspace.resolve()),
-            description=manifest.description,
-            status="active",
-            default_agent=manifest.default_agent,
-            pinned=True,
-            sort_order=-100,
-            project_type="system_app",
-            owner_app_id=manifest.app_id,
-            system_key=manifest.system_project_id,
+    def _app_manifest(self, app_id: str):
+        return self.app_projects._app_manifest(app_id)
+
+    def app_descriptor(
+        self, app_id: str, *, inspect_runtime: bool = True
+    ) -> dict[str, Any]:
+        return self.app_projects.app_descriptor(
+            app_id, inspect_runtime=inspect_runtime
         )
-        self.session_store.create_project(project)
-        return project
-
-    def _app_manifest(self, app_id: str) -> AppManifest:
-        manifest = self.app_registry.get(app_id)
-        if manifest is None:
-            raise KeyError(app_id)
-        return manifest
-
-    def _app_status_payload(self, app_id: str) -> dict[str, Any]:
-        self._app_manifest(app_id)
-        if app_id != "minem":
-            return {"app_installed": False, "cli_available": False, "health": "offline"}
-        inspected = get_minem_client().inspect()
-        self.app_store.update_instance(
-            app_id,
-            install_state="installed" if inspected.get("app_installed") or inspected.get("cli_available") else "not_installed",
-            runtime_state="available" if inspected.get("health") == "running" else "offline",
-            status=inspected,
-            last_checked_at=_now_iso(),
-        )
-        return inspected
-
-    def app_descriptor(self, app_id: str, *, inspect_runtime: bool = True) -> dict[str, Any]:
-        manifest = self._app_manifest(app_id)
-        project = self._ensure_app_project(manifest)
-        instance = self.app_store.ensure_instance(app_id)
-        status = self._app_status_payload(app_id) if inspect_runtime else instance.get("status", {})
-        instance = self.app_store.get_instance(app_id) or instance
-        return {
-            **manifest.to_dict(),
-            "instance": instance,
-            "runtime": status,
-            "project": self.get_project(project.project_id),
-        }
 
     def list_apps(self) -> list[dict[str, Any]]:
-        return [self.app_descriptor(item.app_id) for item in self.app_registry.list()]
+        return self.app_projects.list_apps()
 
     def enable_app(self, app_id: str) -> dict[str, Any]:
-        manifest = self._app_manifest(app_id)
-        self._ensure_app_project(manifest)
-        if app_id != "minem":
-            raise ValueError("application adapter is not available")
-        result = connect_connector(self.secrets, manifest.connector_id, {})
-        self.app_store.update_instance(
-            app_id,
-            enabled=bool(result.get("ok")),
-            install_state="installed" if result.get("ok") else "not_installed",
-            runtime_state="available" if result.get("ok") else "error",
-            app_version=result.get("app_version"),
-            protocol_version=result.get("api_version"),
-            status=result,
-            last_checked_at=_now_iso(),
-            last_error=None if result.get("ok") else result.get("error"),
-        )
-        return {"ok": bool(result.get("ok")), "app": self.app_descriptor(app_id, inspect_runtime=False), "result": result}
+        return self.app_projects.enable_app(app_id)
 
     def check_app(self, app_id: str) -> dict[str, Any]:
-        self._app_manifest(app_id)
-        result = get_minem_client().status() if app_id == "minem" else {"ok": False, "error": "adapter unavailable"}
-        self.app_store.update_instance(
-            app_id,
-            install_state="installed" if result.get("app_installed") or result.get("cli_available") else "not_installed",
-            runtime_state="available" if result.get("ok") else "error",
-            app_version=result.get("app_version"),
-            protocol_version=result.get("api_version"),
-            status=result,
-            last_checked_at=_now_iso(),
-            last_error=None if result.get("ok") else result.get("error"),
-        )
-        return {"ok": bool(result.get("ok")), "app": self.app_descriptor(app_id, inspect_runtime=False), "result": result}
+        return self.app_projects.check_app(app_id)
 
     def disable_app(self, app_id: str) -> dict[str, Any]:
-        manifest = self._app_manifest(app_id)
-        disconnect_connector(self.secrets, manifest.connector_id)
-        self.app_store.update_instance(app_id, enabled=False, runtime_state="disabled", last_error=None)
-        self.session_store.update_project(manifest.system_project_id, status="paused")
-        return {"ok": True, "app": self.app_descriptor(app_id, inspect_runtime=False)}
-
-    def _record_app_result(
-        self,
-        app_id: str,
-        capability: str,
-        arguments: dict[str, Any],
-        result: dict[str, Any],
-        *,
-        session_id: Optional[str] = None,
-    ) -> dict[str, Any]:
-        manifest = self._app_manifest(app_id)
-        project = self._ensure_app_project(manifest)
-        run = self.app_store.record_capability_run(
-            app_id=app_id,
-            project_id=project.project_id,
-            session_id=session_id,
-            capability=capability,
-            arguments=_sensory_safe(arguments),
-            result=_sensory_safe(result),
-        )
-        sensory = self.sensory_store.add(
-            source_type=app_id,
-            connector_id=manifest.connector_id,
-            content_type="app_capability_result",
-            raw_content={
-                "capability": capability,
-                "arguments": _sensory_safe(arguments),
-                "result": _sensory_safe(result),
-            },
-            external_id=run["capability_run_id"],
-            project_path=project.workspace_path,
-            conversation_id=session_id,
-            sensitivity="private",
-            metadata={
-                "app_id": app_id,
-                "project_id": project.project_id,
-                "capability": capability,
-                "capability_run_id": run["capability_run_id"],
-            },
-            source_locator=f"{app_id}://capability/{run['capability_run_id']}",
-        )
-        self._capture_app_assets(app_id, project.project_id, result, sensory.record_id)
-        return {**result, "smallink": {**run, "sensory_record_id": sensory.record_id}}
-
-    def _capture_app_assets(
-        self, app_id: str, project_id: str, payload: Any, sensory_record_id: str
-    ) -> None:
-        seen: set[tuple[str, str]] = set()
-
-        def visit(value: Any, inherited_links: Optional[dict[str, Any]] = None) -> None:
-            if isinstance(value, list):
-                for item in value:
-                    visit(item, inherited_links)
-                return
-            if not isinstance(value, dict):
-                return
-            links = value.get("links") if isinstance(value.get("links"), dict) else inherited_links
-            asset_type = str(value.get("type") or value.get("assetType") or "").lower()
-            code = str(value.get("code") or value.get("assetCode") or "").strip()
-            external_id = str(value.get("id") or value.get("assetId") or "").strip()
-            looks_like_asset = asset_type in {"report", "page", "resource", "case", "single_html", "html", "ppt"}
-            looks_like_asset = looks_like_asset or code.startswith(("RPT-", "CTRL-", "RES-"))
-            if looks_like_asset and (external_id or code):
-                stable_id = external_id or code
-                version_id = str(value.get("versionId") or value.get("version_id") or value.get("version") or "")
-                key = (stable_id, version_id)
-                if key not in seen:
-                    seen.add(key)
-                    preview = value.get("previewUrl") or value.get("preview") or value.get("url")
-                    if not preview and links:
-                        preview = links.get("preview")
-                    digest = hashlib.sha256(
-                        json.dumps(value, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
-                    ).hexdigest()
-                    self.app_store.upsert_asset(
-                        app_id=app_id,
-                        project_id=project_id,
-                        external_asset_id=stable_id,
-                        external_code=code or None,
-                        asset_type=asset_type or None,
-                        version_id=version_id,
-                        title=str(value.get("title") or value.get("name") or "") or None,
-                        preview_ref=str(preview) if preview else None,
-                        content_hash=digest,
-                        sensory_record_id=sensory_record_id,
-                    )
-                    self.knowledge_store.upsert(
-                        project_id=project_id,
-                        source_type=f"app:{app_id}",
-                        external_id=stable_id,
-                        title=str(
-                            value.get("title")
-                            or value.get("name")
-                            or code
-                            or stable_id
-                        ),
-                        content=json.dumps(
-                            value,
-                            ensure_ascii=False,
-                            sort_keys=True,
-                            default=str,
-                        ),
-                        source_record_id=sensory_record_id,
-                        metadata={
-                            "app_id": app_id,
-                            "asset_type": asset_type or None,
-                            "external_code": code or None,
-                            "version_id": version_id or None,
-                            "source_locator": f"{app_id}://asset/{stable_id}",
-                        },
-                    )
-            for child in value.values():
-                if child is not links:
-                    visit(child, links)
-
-        visit(payload)
+        return self.app_projects.disable_app(app_id)
 
     def app_assets(
         self,
@@ -5230,20 +3816,13 @@ class SessionManager:
         limit: int = 60,
         session_id: Optional[str] = None,
     ) -> dict[str, Any]:
-        manifest = self._app_manifest(app_id)
-        if app_id != "minem":
-            raise ValueError("application adapter is not available")
-        arguments = {"query": query, "type": asset_type, "limit": limit}
-        if query.strip():
-            result = get_minem_client().search_assets(query, asset_type=asset_type, limit=limit)
-            items = result.get("results", [])
-            capability = "asset.search"
-        else:
-            result = get_minem_client().list_assets(asset_type=asset_type, limit=limit)
-            items = result.get("assets", [])
-            capability = "asset.list"
-        recorded = self._record_app_result(app_id, capability, arguments, result, session_id=session_id)
-        return {**recorded, "items": items, "project_id": manifest.system_project_id}
+        return self.app_projects.app_assets(
+            app_id,
+            query=query,
+            asset_type=asset_type,
+            limit=limit,
+            session_id=session_id,
+        )
 
     def invoke_app_capability(
         self,
@@ -5253,174 +3832,39 @@ class SessionManager:
         *,
         session_id: Optional[str] = None,
     ) -> dict[str, Any]:
-        manifest = self._app_manifest(app_id)
-        if capability not in manifest.capabilities:
-            raise ValueError("capability is not declared by this application")
-        if app_id != "minem":
-            raise ValueError("application adapter is not available")
-        result = get_minem_client().invoke(capability, arguments)
-        return self._record_app_result(app_id, capability, arguments, result, session_id=session_id)
+        return self.app_projects.invoke_app_capability(
+            app_id, capability, arguments, session_id=session_id
+        )
 
-    def app_activity(self, app_id: str, *, limit: int = 50) -> list[dict[str, Any]]:
-        self._app_manifest(app_id)
-        return self.app_store.list_runs(app_id, limit=limit)
+    def app_activity(
+        self, app_id: str, *, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        return self.app_projects.app_activity(app_id, limit=limit)
 
-    def list_projects(self, status: Optional[str] = None) -> list[dict[str, Any]]:
-        projects = self.session_store.list_projects(status=status)
-        return [
-            {
-                "project_id": p.project_id,
-                "name": p.name,
-                "icon": p.icon,
-                "workspace_path": p.workspace_path,
-                "description": p.description,
-                "status": p.status,
-                "default_agent": p.default_agent,
-                "default_model": p.default_model,
-                "pinned": p.pinned,
-                "sort_order": p.sort_order,
-                "project_type": p.project_type,
-                "owner_app_id": p.owner_app_id,
-                "system_key": p.system_key,
-                "disabled_at": p.disabled_at,
-                "session_count": self.session_store.project_session_count(p.project_id),
-                "created_at": p.created_at,
-                "updated_at": p.updated_at,
-            }
-            for p in projects
-        ]
+    def list_projects(
+        self, status: Optional[str] = None
+    ) -> list[dict[str, Any]]:
+        return self.app_projects.list_projects(status=status)
 
     def create_project(self, body: dict[str, Any]) -> dict[str, Any]:
-        import uuid
-
-        workspace_path = body.get("workspace_path", "")
-        if not workspace_path:
-            return {"ok": False, "error": "workspace_path required"}
-        path = Path(workspace_path).expanduser()
-        if not path.is_dir():
-            return {"ok": False, "error": "directory does not exist"}
-        resolved = str(path.resolve())
-
-        existing = self.session_store.get_project_by_workspace(resolved)
-        if existing:
-            return {"ok": False, "error": "project already exists for this directory", "project_id": existing.project_id}
-
-        project_id = str(uuid.uuid4())
-        name = body.get("name") or path.name
-        record = ProjectRecord(
-            project_id=project_id,
-            name=name,
-            icon=body.get("icon", "\U0001f4c1"),
-            workspace_path=resolved,
-            description=body.get("description", ""),
-            status="active",
-            default_agent=body.get("default_agent"),
-            default_model=body.get("default_model"),
-        )
-        self.session_store.create_project(record)
-        # Retroactively assign existing sessions with the same workspace to this project.
-        for s in self.session_store.list():
-            if s.workspace == resolved and not s.project_id:
-                self.session_store.set_session_project(s.session_id, project_id)
-        return {"ok": True, "project": self.get_project(project_id)}
+        return self.app_projects.create_project(body)
 
     def get_project(self, project_id: str) -> Optional[dict[str, Any]]:
-        p = self.session_store.get_project(project_id)
-        if not p:
-            return None
-        return {
-            "project_id": p.project_id,
-            "name": p.name,
-            "icon": p.icon,
-            "workspace_path": p.workspace_path,
-            "description": p.description,
-            "status": p.status,
-            "default_agent": p.default_agent,
-            "default_model": p.default_model,
-            "pinned": p.pinned,
-            "sort_order": p.sort_order,
-            "project_type": p.project_type,
-            "owner_app_id": p.owner_app_id,
-            "system_key": p.system_key,
-            "disabled_at": p.disabled_at,
-            "session_count": self.session_store.project_session_count(p.project_id),
-            "created_at": p.created_at,
-            "updated_at": p.updated_at,
-        }
+        return self.app_projects.get_project(project_id)
 
-    def update_project(self, project_id: str, body: dict[str, Any]) -> dict[str, Any]:
-        ok = self.session_store.update_project(project_id, **body)
-        if not ok:
-            return {"ok": False, "error": "project not found or no changes"}
-        return {"ok": True, "project": self.get_project(project_id)}
+    def update_project(
+        self, project_id: str, body: dict[str, Any]
+    ) -> dict[str, Any]:
+        return self.app_projects.update_project(project_id, body)
 
     def delete_project(self, project_id: str) -> dict[str, Any]:
-        project = self.session_store.get_project(project_id)
-        if project is not None and project.project_type == "system_app":
-            return {"ok": False, "error": "system application projects cannot be deleted"}
-        ok = self.session_store.delete_project(project_id)
-        if not ok:
-            return {"ok": False, "error": "project not found"}
-        return {"ok": True}
+        return self.app_projects.delete_project(project_id)
 
     def project_sessions(self, project_id: str) -> list[dict[str, Any]]:
-        return [
-            s for s in self.list_sessions()
-            if s.get("project_id") == project_id
-        ]
+        return self.app_projects.project_sessions(project_id)
 
     def project_overview(self, project_id: str) -> Optional[dict[str, Any]]:
-        project = self.get_project(project_id)
-        if project is None:
-            return None
-        workspace = str(project["workspace_path"])
-        sessions = self.project_sessions(project_id)
-        tasks = self.list_runtime_tasks(limit=100, project_id=project_id)
-        source_records = self.sensory_store.list(
-            project_path=workspace, limit=100
-        )
-        source_statuses = {
-            status: self.sensory_store.count(
-                project_path=workspace, governance_status=status
-            )
-            for status in ("pending", "processing", "processed", "skipped", "failed")
-        }
-        source_total = self.sensory_store.count(project_path=workspace)
-        governance = self.governance_store.source_summary(workspace)
-        governed_items = self.governance_store.project_items(workspace, limit=100)
-        knowledge = self.knowledge_store.list(project_id=project_id, limit=100)
-        app_assets: list[dict[str, Any]] = []
-        app_asset_total = 0
-        owner_app_id = project.get("owner_app_id")
-        if owner_app_id:
-            app_assets = self.app_store.list_assets(
-                str(owner_app_id), project_id=project_id, limit=100
-            )
-            app_asset_total = self.app_store.count_assets(
-                str(owner_app_id), project_id=project_id
-            )
-        return {
-            "project": project,
-            "metrics": {
-                "sessions": len(sessions),
-                "tasks": len(tasks),
-                "source_records": source_total,
-                "pending_governance": source_statuses["pending"],
-                "memory_candidates": governance["candidate_total"],
-                "memories": governance["memory_total"],
-                "app_assets": app_asset_total,
-                "knowledge": self.knowledge_store.count(project_id=project_id),
-            },
-            "sessions": sessions[:100],
-            "tasks": tasks,
-            "source_records": [record.to_dict() for record in source_records],
-            "source_statuses": source_statuses,
-            "candidates": governed_items["candidates"],
-            "memories": governed_items["memories"],
-            "memory_types": governance["memory_types"],
-            "app_assets": app_assets,
-            "knowledge": knowledge,
-        }
+        return self.app_projects.project_overview(project_id)
 
     def list_agents(self) -> list[dict[str, Any]]:
         return _list_agents()
@@ -5435,17 +3879,11 @@ class SessionManager:
         resolved = self.resolve_workspace(workspace) if workspace else self.default_workspace
         return SkillStore(self._data_base, workspace=resolved)
 
-    def _invalidate_idle_skill_engines(self) -> None:
-        for session_id, engine in list(self._engines.items()):
-            if session_id in self._running_sessions:
+    def _invalidate_idle_skill_runtimes(self) -> None:
+        for session_id, _engine in list(self._runtimes.engine_items()):
+            if self.is_running(session_id):
                 continue
-            self._engines.pop(session_id, None)
-            executor = getattr(engine, "executor", None)
-            if executor is not None:
-                try:
-                    executor.close()
-                except Exception:
-                    pass
+            self._runtimes.discard(session_id)
 
     def list_skills(self, workspace: Optional[str] = None) -> dict[str, Any]:
         loader = self._skill_loader(workspace)
@@ -5465,36 +3903,15 @@ class SessionManager:
             short_description=body.get("short_description", ""),
             scope=body.get("scope", "user"),
         )
-        self._invalidate_idle_skill_engines()
+        self._invalidate_idle_skill_runtimes()
         return skill_result(skill)
 
     def import_skill(self, body: dict[str, Any]) -> dict[str, Any]:
         skill = self._skill_store(body.get("workspace")).import_path(
             body.get("path", ""), scope=body.get("scope", "user")
         )
-        self._invalidate_idle_skill_engines()
+        self._invalidate_idle_skill_runtimes()
         return skill_result(skill)
-
-    def list_memory(
-        self, *, status: Optional[str] = "active"
-    ) -> list[dict[str, Any]]:
-        # Defaults to active-only: the confirmed-memory view and any prompt use never see
-        # "pending" pipeline output. Pass status=None to inspect every row (e.g. verification).
-        return [
-            {
-                "id": m.id,
-                "scope": m.scope.value,
-                "content": m.content,
-                "key": m.key,
-                "workspace": m.workspace,
-                "session_id": m.session_id,
-                "created_at": m.created_at,
-                "status": m.status,
-                "updated_at": m.updated_at,
-                "source_record_id": m.source_record_id,
-            }
-            for m in self.memory_store.list(status=status)
-        ]
 
     def add_memory(
         self, content: str, scope: str = "workspace", workspace: Optional[str] = None

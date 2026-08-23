@@ -49,6 +49,12 @@ class ToolProvider(Protocol):
 
     def execute(self, name: str, arguments: Optional[dict[str, Any]] = None) -> Any: ...
 
+    def register(self, func: Any, *, metadata: Any = None, schema: Any = None) -> Any: ...
+
+    def register_all(self, funcs: list[Any]) -> None: ...
+
+    def clear(self) -> None: ...
+
 
 @runtime_checkable
 class MemoryProvider(Protocol):
@@ -86,8 +92,8 @@ class PermissionProvider(Protocol):
         self, tool_name: str, arguments: dict[str, Any], metadata: Any = None
     ) -> Any: ...
 
-    @property
-    def mode(self) -> Any: ...
+    mode: Any
+    risk_overrides: Any
 
     def allow_tool_for_session(self, tool_name: str) -> None: ...
 
@@ -98,8 +104,8 @@ class CapabilityContainer:
     """Resolved capability implementations for one session's engine.
 
     The manager builds this per-session and passes it to build_engine.
-    Existing code can ignore it and keep using keyword args; new code pulls
-    from the container.
+    Existing code can ignore it and keep using keyword args; new composition
+    roots can supply any subset while a session is migrated.
     """
 
     __slots__ = ("provider", "tools", "permissions", "memory")
@@ -108,8 +114,8 @@ class CapabilityContainer:
         self,
         *,
         provider: LLMProvider,
-        tools: ToolProvider,
-        permissions: PermissionProvider,
+        tools: Optional[ToolProvider] = None,
+        permissions: Optional[PermissionProvider] = None,
         memory: Optional[MemoryProvider] = None,
     ) -> None:
         self.provider = provider

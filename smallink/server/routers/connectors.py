@@ -10,6 +10,7 @@ from fastapi import APIRouter
 
 def connectors_router(manager: Any) -> APIRouter:
     router = APIRouter()
+    memory_service = manager.memory_service
 
     @router.get("/v1/connectors")
     def connectors_list() -> dict[str, Any]:
@@ -253,17 +254,17 @@ def connectors_router(manager: Any) -> APIRouter:
         body = body or {}
         raw = body.get("limit_sessions")
         limit = int(raw) if raw is not None else None
-        return await asyncio.to_thread(manager.sync_codex, limit)
+        return await asyncio.to_thread(memory_service.sync_codex, limit)
 
     @router.post("/v1/connectors/traex/sync")
     async def sync_traex(body: dict | None = None) -> dict[str, Any]:
         body = body or {}
         raw = body.get("limit_sessions")
         limit = int(raw) if raw is not None else None
-        return await asyncio.to_thread(manager.sync_traex, limit)
+        return await asyncio.to_thread(memory_service.sync_traex, limit)
 
     @router.get("/v1/connectors/{name}/sync-status")
     def connector_sync_status(name: str) -> dict[str, Any]:
-        return {"sync": manager.connector_sync_status(name)}
+        return {"sync": memory_service.connector_sync_status(name)}
 
     return router

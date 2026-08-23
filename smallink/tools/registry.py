@@ -46,6 +46,30 @@ class ToolRegistry:
         self._tools[name] = spec
         return spec
 
+    def unregister(self, name: str) -> None:
+        """Remove a registration; missing names are already disposed."""
+        self._tools.pop(name, None)
+
+    def clear(self) -> None:
+        """Release all registrations owned by this registry."""
+        self._tools.clear()
+
+    def contribute(
+        self,
+        func: Callable[..., Any],
+        *,
+        metadata: Any = None,
+        schema: Optional[dict[str, Any]] = None,
+    ) -> Callable[[], None]:
+        """Register a tool and return an idempotent disposer for its exact entry."""
+        spec = self.register(func, metadata=metadata, schema=schema)
+
+        def dispose() -> None:
+            if self._tools.get(spec.name) is spec:
+                self._tools.pop(spec.name, None)
+
+        return dispose
+
     def register_all(self, funcs: list[Callable[..., Any]]) -> None:
         for func in funcs:
             self.register(func)

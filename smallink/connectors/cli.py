@@ -117,7 +117,11 @@ def _cmd_sync_local_source(
             return 1
         print(f"Connected {title} folder: {conn.get('sessions_path')}")
 
-    sync = manager.sync_codex if source == "codex" else manager.sync_traex
+    sync = (
+        manager.memory_service.sync_codex
+        if source == "codex"
+        else manager.memory_service.sync_traex
+    )
     result = sync(limit_sessions=limit)
     print(
         f"{title} import: read {result['sessions_read']} sessions, "
