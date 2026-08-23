@@ -627,12 +627,60 @@ export interface MemoryCandidate {
 
 export async function getMemoryCandidates(
   status: "pending" | "accepted" | "ignored" | "all" = "pending",
+  opts?: { min_confidence?: number; max_confidence?: number },
 ): Promise<MemoryCandidate[]> {
+  const params = new URLSearchParams({ status });
+  if (opts?.min_confidence != null) params.set("min_confidence", String(opts.min_confidence));
+  if (opts?.max_confidence != null) params.set("max_confidence", String(opts.max_confidence));
   const res = await fetch(
-    `${httpBase()}/v1/memory/candidates?status=${encodeURIComponent(status)}`,
+    `${httpBase()}/v1/memory/candidates?${params.toString()}`,
   );
   if (!res.ok) throw new Error("Could not load memory candidates");
   return (await res.json()).candidates ?? [];
+}
+
+export interface ConfidenceSummary {
+  total_pending: number;
+  tiers: { high: number; medium: number; low: number; unscored: number };
+}
+
+export async function getConfidenceSummary(): Promise<ConfidenceSummary> {
+  const res = await fetch(`${httpBase()}/v1/memory/candidates/confidence-summary`);
+  if (!res.ok) throw new Error("Could not load confidence summary");
+  return res.json();
+}
+
+export async function autoAcceptHighConfidence(
+  threshold = 0.9,
+): Promise<{ auto_accepted: number; failed: number; threshold: number }> {
+  const res = await fetch(`${httpBase()}/v1/memory/candidates/auto-accept`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ threshold }),
+  });
+  if (!res.ok) throw new Error("Could not auto-accept candidates");
+  return res.json();
+}
+
+export interface MemoryUsageRecord {
+  usage_id: string;
+  memory_id: number;
+  session_id: string | null;
+  workspace: string | null;
+  used_at: string;
+  content: string;
+  key: string | null;
+}
+
+export async function getMemoryUsageHistory(
+  limit = 50,
+  memoryId?: number,
+): Promise<{ records: MemoryUsageRecord[] }> {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (memoryId != null) params.set("memory_id", String(memoryId));
+  const res = await fetch(`${httpBase()}/v1/memory/usage-history?${params}`);
+  if (!res.ok) throw new Error("Could not load memory usage history");
+  return res.json();
 }
 
 export async function getMemoryCandidate(candidateId: string): Promise<MemoryCandidate> {

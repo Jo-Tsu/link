@@ -27,6 +27,7 @@ class EventType(str, Enum):
     )
     TOOL_STARTED = "tool_started"
     TOOL_FINISHED = "tool_finished"
+    MEMORY_CITED = "memory_cited"  # which memories were injected into this turn's context
     ITERATION_END = "iteration_end"
     TURN_END = "turn_end"
     ERROR = "error"

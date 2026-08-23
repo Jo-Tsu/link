@@ -1,6 +1,10 @@
 import { useEffect, useState } from "react";
 import {
   getSettings,
+  getConnectors,
+  getSensoryStats,
+  deleteSensoryRecords,
+  getMemory,
   getTrustedWorkspaces,
   setOnboarded,
   setPdfSettings,
@@ -47,7 +51,7 @@ import { ConfirmDialog } from "./ConfirmDialog";
 // Models + Personas host the existing tab components inside the page shell (field re-skin to follow).
 // "appearance" is the General tab's stable key — callers deep-link with it, so the
 // rename (UX-021) changed only the label. "files" folded into General as a card.
-type SetTab = "appearance" | "models" | "voice" | "personas";
+type SetTab = "appearance" | "models" | "voice" | "personas" | "privacy";
 
 const CARD = "rounded-lg border border-line bg-panel";
 const FIELD_LABEL = "text-[12.5px] font-medium text-ink";
@@ -58,11 +62,12 @@ const BTN_ACCENT = "text-[12.5px] px-3 py-2 rounded-lg bg-accent text-onAccent s
 const BTN_BORDERED =
   "text-[12.5px] px-3 py-2 rounded-lg border border-line bg-paper hover:border-lineStrong shrink-0";
 
-const SET_TABS: { key: SetTab; label: string; icon: "sliders" | "code" | "mic" | "sparkle" }[] = [
+const SET_TABS: { key: SetTab; label: string; icon: "sliders" | "code" | "mic" | "sparkle" | "shield" }[] = [
   { key: "appearance", label: "General", icon: "sliders" },
   { key: "models", label: "Models", icon: "code" },
   { key: "voice", label: "Voice input", icon: "mic" },
   { key: "personas", label: "Personas", icon: "sparkle" },
+  { key: "privacy", label: "Privacy", icon: "shield" },
 ];
 
 export function SettingsView({
@@ -105,7 +110,9 @@ export function SettingsView({
                   ? t("settings.models")
                   : item.key === "voice"
                     ? t("settings.voice")
-                    : t("settings.personas")}
+                    : item.key === "privacy"
+                      ? t("settings.privacy")
+                      : t("settings.personas")}
             </button>
           );
         })}
@@ -130,6 +137,8 @@ export function SettingsView({
             </section>
           ) : tab === "voice" ? (
             <VoiceInputSection />
+          ) : tab === "privacy" ? (
+            <PrivacySection />
           ) : (
             <PersonasSection onOpenPersona={onOpenPersona} />
           )}
@@ -794,5 +803,206 @@ function FilesCard() {
       </div>
       {scratchMsg && <div className="text-[12.5px] text-muted mt-2.5">{scratchMsg}</div>}
     </div>
+  );
+}
+
+// -- Privacy & data management ------------------------------------------------
+function PrivacySection() {
+  const { tr } = useI18n();
+  const [sensoryStats, setSensoryStats] = useState<{ total: number; sources: Record<string, number> } | null>(null);
+  const [memoryCount, setMemoryCount] = useState<number | null>(null);
+  const [connectors, setConnectors] = useState<{ name: string; connected: boolean }[]>([]);
+  const [deleting, setDeleting] = useState(false);
+  const [deleteResult, setDeleteResult] = useState<string | null>(null);
+  const [confirmDelete, setConfirmDelete] = useState<"sensory" | "memory" | null>(null);
+  const [retentionDays, setRetentionDays] = useState(90);
+
+  useEffect(() => {
+    getSensoryStats()
+      .then((s) => setSensoryStats(s as any))
+      .catch(() => setSensoryStats(null));
+    getMemory("all")
+      .then((m) => setMemoryCount(m.length))
+      .catch(() => setMemoryCount(null));
+    getConnectors()
+      .then((c) => setConnectors(c.map((x: any) => ({ name: x.name || x.id, connected: !!x.connected }))))
+      .catch(() => setConnectors([]));
+  }, []);
+
+  const deleteSensoryOlderThan = async () => {
+    setDeleting(true);
+    setDeleteResult(null);
+    try {
+      const before = new Date(Date.now() - retentionDays * 86400000).toISOString();
+      const res = await deleteSensoryRecords({ before });
+      setDeleteResult(tr("{count} source records deleted.", { count: res.deleted_records }));
+      const stats = await getSensoryStats();
+      setSensoryStats(stats as any);
+    } catch (e: any) {
+      setDeleteResult(e.message || tr("Delete failed."));
+    } finally {
+      setDeleting(false);
+      setConfirmDelete(null);
+    }
+  };
+
+  const deleteAllMemories = async () => {
+    setDeleting(true);
+    setDeleteResult(null);
+    try {
+      const memories = await getMemory("all");
+      let archived = 0;
+      for (const m of memories) {
+        try {
+          await globalThis.fetch(
+            ((globalThis as any).__LINK_HTTP__ || (import.meta as any).env?.VITE_LINK_HTTP || "http://127.0.0.1:42871") +
+              `/v1/memory/${m.id}/archive`,
+            { method: "POST" },
+          );
+          archived++;
+        } catch { /* skip */ }
+      }
+      setDeleteResult(tr("{count} memories archived.", { count: archived }));
+      setMemoryCount(0);
+    } catch (e: any) {
+      setDeleteResult(e.message || tr("Archive failed."));
+    } finally {
+      setDeleting(false);
+      setConfirmDelete(null);
+    }
+  };
+
+  return (
+    <section>
+      <PanelHead
+        title={tr("Privacy & data")}
+        sub={tr("Understand what Smallink stores and manage your data retention.")}
+      />
+
+      <div className={CARD + " p-4 mb-4"}>
+        <div className={FIELD_LABEL}>{tr("Data storage")}</div>
+        <div className={FIELD_HELP + " mb-3"}>
+          {tr("All data stays on this computer. Nothing is sent to external servers except model API calls.")}
+        </div>
+        <div className="grid grid-cols-2 gap-3 text-[12.5px]">
+          <div className="rounded-lg border border-line bg-paper p-3">
+            <div className="text-muted">{tr("Location")}</div>
+            <div className="text-ink font-mono mt-1 break-all">~/.config/link</div>
+          </div>
+          <div className="rounded-lg border border-line bg-paper p-3">
+            <div className="text-muted">{tr("Source records")}</div>
+            <div className="text-ink font-medium mt-1">{sensoryStats?.total ?? "..."}</div>
+          </div>
+          <div className="rounded-lg border border-line bg-paper p-3">
+            <div className="text-muted">{tr("Memories")}</div>
+            <div className="text-ink font-medium mt-1">{memoryCount ?? "..."}</div>
+          </div>
+          <div className="rounded-lg border border-line bg-paper p-3">
+            <div className="text-muted">{tr("Connectors")}</div>
+            <div className="text-ink font-medium mt-1">{connectors.filter((c) => c.connected).length} {tr("active")}</div>
+          </div>
+        </div>
+      </div>
+
+      <div className={CARD + " p-4 mb-4"}>
+        <div className={FIELD_LABEL}>{tr("Source record retention")}</div>
+        <div className={FIELD_HELP}>
+          {tr("Delete source records (conversation snapshots, imported documents) older than a threshold.")}
+        </div>
+        <div className="flex items-center gap-3 mt-3">
+          <span className="text-[13px] text-ink">{tr("Delete records older than")}</span>
+          <input
+            type="number"
+            min={7}
+            max={365}
+            value={retentionDays}
+            className="w-20 px-2 py-1.5 rounded-lg border border-line bg-paper text-[13px] text-ink outline-none focus:border-accent"
+            onChange={(e) => setRetentionDays(Math.max(7, Math.min(365, Number(e.target.value) || 90)))}
+          />
+          <span className="text-[12.5px] text-muted">{tr("days")}</span>
+          <button
+            className={BTN_BORDERED + " text-danger border-danger/30"}
+            disabled={deleting}
+            onClick={() => setConfirmDelete("sensory")}
+          >
+            {tr("Delete")}
+          </button>
+        </div>
+      </div>
+
+      <div className={CARD + " p-4 mb-4"}>
+        <div className={FIELD_LABEL}>{tr("Memory data")}</div>
+        <div className={FIELD_HELP}>
+          {tr("Archive all learned memories. Archived memories are no longer used in conversations but can be restored from the Memory view.")}
+        </div>
+        <div className="flex items-center gap-3 mt-3">
+          <span className="text-[13px] text-ink">
+            {memoryCount !== null ? tr("{count} active memories", { count: memoryCount }) : tr("Loading...")}
+          </span>
+          <button
+            className={BTN_BORDERED + " text-danger border-danger/30"}
+            disabled={deleting || !memoryCount}
+            onClick={() => setConfirmDelete("memory")}
+          >
+            {tr("Archive all")}
+          </button>
+        </div>
+      </div>
+
+      <div className={CARD + " p-4"}>
+        <div className={FIELD_LABEL}>{tr("Connected services")}</div>
+        <div className={FIELD_HELP + " mb-3"}>
+          {tr("Data synced from external services is stored locally. Disconnect a service to stop syncing.")}
+        </div>
+        {connectors.length === 0 ? (
+          <div className="text-[12.5px] text-muted">{tr("No connectors configured.")}</div>
+        ) : (
+          <div className="divide-y divide-line">
+            {connectors.map((c) => (
+              <div key={c.name} className="py-2.5 flex items-center gap-3">
+                <span className="text-[13px] text-ink capitalize">{c.name}</span>
+                <span
+                  className={
+                    "ml-auto text-[11.5px] px-2 py-0.5 rounded-full " +
+                    (c.connected ? "bg-okSoft text-ok" : "bg-paper text-muted")
+                  }
+                >
+                  {c.connected ? tr("Connected") : tr("Disconnected")}
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {deleteResult && (
+        <div className="mt-4 rounded-lg border border-line bg-paper px-3 py-2.5 text-[12.5px] text-muted">
+          {deleteResult}
+        </div>
+      )}
+
+      {confirmDelete === "sensory" && (
+        <ConfirmDialog
+          title={tr("Delete source records older than {days} days?", { days: retentionDays })}
+          body={tr("This cannot be undone. Memories derived from these records will remain.")}
+          confirmLabel={tr("Delete")}
+          danger
+          busy={deleting}
+          onCancel={() => setConfirmDelete(null)}
+          onConfirm={() => void deleteSensoryOlderThan()}
+        />
+      )}
+      {confirmDelete === "memory" && (
+        <ConfirmDialog
+          title={tr("Archive all memories?")}
+          body={tr("Archived memories stop influencing conversations. You can restore them later from the Memory view.")}
+          confirmLabel={tr("Archive all")}
+          danger
+          busy={deleting}
+          onCancel={() => setConfirmDelete(null)}
+          onConfirm={() => void deleteAllMemories()}
+        />
+      )}
+    </section>
   );
 }

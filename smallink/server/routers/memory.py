@@ -97,9 +97,29 @@ def memory_router(manager: Any) -> APIRouter:
         return {"memory": manager.list_memory(status=wanted)}
 
     @router.get("/v1/memory/candidates")
-    def memory_candidates(status: str | None = "pending") -> dict[str, Any]:
+    def memory_candidates(
+        status: str | None = "pending",
+        min_confidence: float | None = None,
+        max_confidence: float | None = None,
+    ) -> dict[str, Any]:
         wanted = None if status in (None, "", "all") else status
-        return {"candidates": manager.memory_candidates(status=wanted)}
+        return {"candidates": manager.memory_candidates(
+            status=wanted,
+            min_confidence=min_confidence,
+            max_confidence=max_confidence,
+        )}
+
+    @router.post("/v1/memory/candidates/auto-accept")
+    async def auto_accept_candidates(body: dict | None = None) -> dict[str, Any]:
+        body = body or {}
+        threshold = float(body.get("threshold", 0.9))
+        return await asyncio.to_thread(
+            manager.auto_accept_high_confidence, threshold
+        )
+
+    @router.get("/v1/memory/candidates/confidence-summary")
+    def confidence_summary() -> dict[str, Any]:
+        return manager.memory_confidence_summary()
 
     @router.get("/v1/memory/governance/tasks")
     def governance_tasks(
@@ -178,5 +198,9 @@ def memory_router(manager: Any) -> APIRouter:
             return JSONResponse(
                 status_code=404, content={"error": "memory not found"}
             )
+
+    @router.get("/v1/memory/usage-history")
+    def memory_usage_history(limit: int = 50, memory_id: int | None = None) -> Any:
+        return manager.memory_usage_history(limit=limit, memory_id=memory_id)
 
     return router

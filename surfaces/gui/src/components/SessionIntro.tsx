@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { getConnectors, getSessionConnections } from "../api";
+import { getConnectors, getSessionConnections, getSkills, type SkillCatalogItem } from "../api";
 import type { Attachment } from "../types";
 import { ConnectorIcon } from "../connectors/ConnectorIcon";
 import { indexConnectors, visualFor, type ConnectorMap } from "../connectors/visuals";
@@ -22,6 +22,8 @@ const HUBSPOT_PROMPT =
   "Create a report on my recent HubSpot leads: sources, stages, and who needs follow-up.";
 const GH_SLACK_PROMPT =
   "Set up a weekly progress report: summarize activity in my GitHub repos and post it to Slack every Friday morning.";
+const CODE_REVIEW_PROMPT = "Review the recent changes in this project and summarize any code quality concerns.";
+const WEB_RESEARCH_PROMPT = "Search the web for the latest trends in AI agents and summarize the top 5 findings.";
 const SHOW_HUBSPOT_TASK = isConnectorVisible("hubspot");
 const SHOW_GITHUB_SLACK_TASK =
   isConnectorVisible("github") && isConnectorVisible("slack");
@@ -41,6 +43,7 @@ export function SessionIntro({
   const [live, setLive] = useState<Set<string>>(new Set());
   const [byName, setByName] = useState<ConnectorMap>({});
   const [addingFolder, setAddingFolder] = useState(false);
+  const [suggestedSkills, setSuggestedSkills] = useState<SkillCatalogItem[]>([]);
 
   useEffect(() => {
     if (!SHOW_HUBSPOT_TASK && !SHOW_GITHUB_SLACK_TASK) return;
@@ -53,6 +56,17 @@ export function SessionIntro({
       .then((list) => setByName(indexConnectors(list)))
       .catch(() => {});
   }, [sessionId]);
+
+  useEffect(() => {
+    getSkills()
+      .then((catalog) => {
+        const active = catalog.skills
+          .filter((s) => s.active && s.valid)
+          .slice(0, 4);
+        setSuggestedSkills(active);
+      })
+      .catch(() => {});
+  }, []);
 
   const shared = roots.filter((r) => !r.primary);
   const hubspotReady = live.has("hubspot");
@@ -133,7 +147,42 @@ export function SessionIntro({
           </span>
           <span className="task-card-act">{tr(ghSlackReady ? "Start →" : "Configure ›")}</span>
         </button>}
+
+        <button className="task-card" data-testid="intro-task-code-review" onClick={() => onPrefill(tr(CODE_REVIEW_PROMPT))}>
+          <span className="task-card-body">
+            <span className="task-card-title">{tr("Review recent code changes")}</span>
+            <span className="task-card-sub">{tr("Get a quality summary of recent project modifications")}</span>
+          </span>
+          <span className="task-card-act">{tr("Start →")}</span>
+        </button>
+
+        <button className="task-card" data-testid="intro-task-web-research" onClick={() => onPrefill(tr(WEB_RESEARCH_PROMPT))}>
+          <span className="task-card-body">
+            <span className="task-card-title">{tr("Research a topic on the web")}</span>
+            <span className="task-card-sub">{tr("Search, read, and summarize the latest information")}</span>
+          </span>
+          <span className="task-card-act">{tr("Start →")}</span>
+        </button>
       </div>
+
+      {suggestedSkills.length > 0 && (
+        <div className="intro-skills mt-4">
+          <h2 className="text-[12px] font-medium text-muted mb-2">{tr("Available Skills")}</h2>
+          <div className="flex flex-wrap gap-2">
+            {suggestedSkills.map((skill) => (
+              <button
+                key={skill.id}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-line bg-panel text-[12px] text-ink hover:border-accent hover:text-accent transition-colors"
+                onClick={() => onPrefill(tr("Use the {name} skill to help me with my next task.", { name: skill.display_name }))}
+                title={skill.short_description || skill.description}
+              >
+                <Icon name="sparkle" size={12} className="text-accent" />
+                {skill.display_name}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

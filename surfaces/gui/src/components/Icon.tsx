@@ -44,6 +44,7 @@ export type IconName =
   | "table"
   | "mic"
   | "stop"
+  | "memory"
   | "x";
 
 export function Icon({
@@ -366,6 +367,13 @@ export function Icon({
           <path d="M10 11v6M14 11v6" />
           <path d="M6.5 7l.9 12c.1.9.8 1.5 1.7 1.5h7.8c.9 0 1.6-.6 1.7-1.5l.9-12" />
           <path d="M9.2 7V4.9c0-.5.4-.9.9-.9h3.8c.5 0 .9.4.9.9V7" />
+        </svg>
+      );
+    case "memory":
+      return (
+        <svg {...s}>
+          <circle cx="12" cy="12" r="3" />
+          <path d="M12 2v4M12 18v4M4.9 4.9l2.8 2.8M16.3 16.3l2.8 2.8M2 12h4M18 12h4M4.9 19.1l2.8-2.8M16.3 7.7l2.8-2.8" />
         </svg>
       );
   }

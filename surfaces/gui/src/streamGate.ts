@@ -27,7 +27,7 @@ export function midTurn(items: Item[], running: boolean): boolean {
   if (!running) return false;
   for (let i = items.length - 1; i >= 0; i--) {
     const item = items[i];
-    if (item.kind === "notice") continue;
+    if (item.kind === "notice" || item.kind === "memory_cited") continue;
     return item.kind === "tool" || item.kind === "approval" || item.kind === "assistant";
   }
   return false;

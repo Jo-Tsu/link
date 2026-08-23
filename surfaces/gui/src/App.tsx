@@ -858,6 +858,10 @@ export function App() {
             setBrowserRefreshKey((k) => k + 1);
           }
           break;
+        case "memory_cited":
+          if (d.memories && d.memories.length > 0)
+            updateItems((p) => [...p, { kind: "memory_cited", memories: d.memories }]);
+          break;
         case "turn_end":
           if (d.status === "max_iterations_exceeded")
             updateItems((p) => [...p, { kind: "notice", tone: "warn", text: tr("Stopped: max iterations reached.") }]);
@@ -1297,6 +1301,9 @@ export function App() {
   const subtitleParts = [modelDisplay];
   if (isProjectScoped(personaOf(agent)) && workspace) subtitleParts.push(baseName(workspace));
   const activeInfo = sessions.find((s) => s.session_id === sessionId);
+  const activeProject = activeInfo?.project_id
+    ? projects.find((p) => p.project_id === activeInfo.project_id)
+    : null;
   const activeTitle = activeInfo?.title || tr("New session");
 
   const desktop = isTauri();
@@ -1629,6 +1636,19 @@ export function App() {
                 this release (owner ask 2026-07-22). */}
             {hasHistory && (
               <span className="title-sub" data-testid="session-subtitle">
+                {activeProject && (
+                  <button
+                    className="inline-flex items-center gap-1 text-accent hover:underline cursor-pointer mr-1"
+                    onClick={() => {
+                      setProjectViewId(activeProject.project_id);
+                      setSurface("project");
+                    }}
+                  >
+                    <Icon name="folder" size={11} />
+                    {activeProject.name}
+                    <span className="text-faint">·</span>
+                  </button>
+                )}
                 {subtitleParts.join(" · ")}
               </span>
             )}
@@ -1749,6 +1769,7 @@ export function App() {
                     !reasoningStream &&
                     (!streaming || streamMode(streaming, items, running) === "hold") &&
                     !lastItemIsAssistant(items) && <WaitingForAgent />}
+                  <ExecutionProgress items={items} running={running} />
                   {streaming && streamMode(streaming, items, running) === "answer" && (
                     <div className="transcript">
                       <div className="bubble-assistant">
@@ -1926,6 +1947,32 @@ function WaitingForAgent() {
         <span className="waiting-spinner" />
         <span>{tr("Waiting for agent…")}</span>
       </div>
+    </div>
+  );
+}
+
+function ExecutionProgress({ items, running }: { items: Item[]; running: boolean }) {
+  const { tr } = useI18n();
+  if (!running) return null;
+  const tools = items.filter((it): it is Extract<Item, { kind: "tool" }> => it.kind === "tool");
+  const total = tools.length;
+  const completed = tools.filter((t) => t.status !== "…").length;
+  const activeTool = tools.find((t) => t.status === "…");
+  if (total === 0) return null;
+  const progress = total > 0 ? Math.round((completed / total) * 100) : 0;
+  return (
+    <div className="flex items-center gap-2.5 px-4 py-1.5 text-[11.5px] text-muted" data-testid="execution-progress">
+      <div className="flex-1 h-1 rounded-full bg-line overflow-hidden">
+        <div
+          className="h-full bg-accent rounded-full transition-all duration-300"
+          style={{ width: `${progress}%` }}
+        />
+      </div>
+      <span className="shrink-0 tabular-nums">
+        {activeTool
+          ? tr("Running {tool} ({done}/{total})", { tool: activeTool.name.replace(/_/g, " "), done: completed, total })
+          : tr("{done}/{total} steps", { done: completed, total })}
+      </span>
     </div>
   );
 }

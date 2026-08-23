@@ -333,9 +333,12 @@ def build_engine(
         else None
     )
 
+    _cited_memories: list[dict[str, Any]] = []
+
     def context_provider(
         current_messages: Optional[list[dict[str, Any]]] = None,
     ) -> str:
+        _cited_memories.clear()
         parts = []
         if permissions.mode is Mode.PLAN:
             parts.append(_PLAN_MODE_CONTEXT)
@@ -364,6 +367,13 @@ def build_engine(
             block = format_memories(selected)
             if block:
                 parts.append(block)
+                for memory in selected:
+                    _cited_memories.append({
+                        "memory_id": memory.id,
+                        "content": memory.content[:120],
+                        "key": memory.key,
+                        "scope": memory.scope.value if hasattr(memory.scope, "value") else str(memory.scope),
+                    })
                 if governance_store is not None:
                     for memory in selected:
                         governance_store.record_usage(
@@ -397,6 +407,7 @@ def build_engine(
     engine.todo = todo  # type: ignore[attr-defined]
     engine.agent_name = agent.name  # type: ignore[attr-defined]
     engine.roots = root_list  # type: ignore[attr-defined]  # shared list; Slice C mutates in place
+    engine.cited_memories = _cited_memories  # type: ignore[attr-defined]
     engine.audit_context = {
         "session_id": session_id or "",
         "agent": agent.name,

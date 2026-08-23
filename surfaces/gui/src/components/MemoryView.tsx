@@ -1,14 +1,17 @@
 import { useEffect, useMemo, useState } from "react";
 import {
+  autoAcceptHighConfidence,
   decideMemoryCandidate,
   decideMemoryCandidates,
   deleteSensoryRecords,
+  getConfidenceSummary,
   getGovernanceTask,
   getGovernanceSchedule,
   getGovernanceTasks,
   getMemory,
   getMemoryCandidate,
   getMemoryCandidates,
+  getMemoryUsageHistory,
   getSensoryRecord,
   getSensoryRecords,
   getSensoryStats,
@@ -16,10 +19,12 @@ import {
   runMemoryPipeline,
   setMemoryArchived,
   updateGovernanceSchedule,
+  type ConfidenceSummary,
   type GovernanceSchedule,
   type GovernanceTask,
   type MemoryCandidate,
   type MemoryRecord,
+  type MemoryUsageRecord,
   type SensoryRecord,
   type SensoryStats,
 } from "../api";
@@ -44,7 +49,7 @@ const MEMORY_TYPES = [
 
 type MemoryType = (typeof MEMORY_TYPES)[number][0];
 const KNOWN_TYPES = new Set<string>(MEMORY_TYPES.map(([key]) => key));
-type MemorySurface = "home" | "pending" | "sources" | "type" | "prompts" | "tasks" | "archived";
+type MemorySurface = "home" | "pending" | "sources" | "type" | "prompts" | "tasks" | "archived" | "personality";
 
 export function MemoryView() {
   const { tr } = useI18n();
@@ -65,6 +70,7 @@ export function MemoryView() {
     body: string;
   } | null>(null);
   const [sourceStats, setSourceStats] = useState<SensoryStats | null>(null);
+  const [confidenceSummary, setConfidenceSummary] = useState<ConfidenceSummary | null>(null);
   const [statsError, setStatsError] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -96,6 +102,7 @@ export function MemoryView() {
       );
       try {
         setSourceStats(await getSensoryStats());
+        setConfidenceSummary(await getConfidenceSummary());
         setStatsError(false);
       } catch {
         setSourceStats(null);
@@ -241,6 +248,10 @@ export function MemoryView() {
     return <PromptsView onBack={openHome} />;
   }
 
+  if (surface === "personality") {
+    return <PersonalityDashboard memories={memories} onBack={openHome} />;
+  }
+
   if (surface === "sources") {
     return <SourceRecordsView onBack={openHome} />;
   }
@@ -312,6 +323,36 @@ export function MemoryView() {
               body={tr("Accept, edit, merge, or ignore each candidate. Only accepted memories are available to agents.")}
             />
           </div>
+          {confidenceSummary && confidenceSummary.tiers.high > 0 && (
+            <div className="mb-4 flex items-center gap-3 rounded-lg border border-accent/30 bg-accentSoft/20 px-4 py-3">
+              <Icon name="sparkle" size={16} className="text-accent" />
+              <span className="flex-1 text-[12.5px] text-ink">
+                {tr("{count} high-confidence memories ready for auto-accept", { count: confidenceSummary.tiers.high })}
+              </span>
+              <button
+                type="button"
+                disabled={batchBusy}
+                onClick={async () => {
+                  setBatchBusy(true);
+                  try {
+                    const result = await autoAcceptHighConfidence(0.9);
+                    setBatchFeedback({
+                      tone: "success",
+                      body: tr("Auto-accepted {count} high-confidence memories.", { count: result.auto_accepted }),
+                    });
+                    await load();
+                  } catch {
+                    setBatchFeedback({ tone: "warning", body: tr("Could not auto-accept memories") });
+                  } finally {
+                    setBatchBusy(false);
+                  }
+                }}
+                className="rounded-lg bg-accent px-3 py-1.5 text-[12px] text-onAccent disabled:opacity-40"
+              >
+                {tr("Auto-accept all")}
+              </button>
+            </div>
+          )}
           {batchFeedback && (
             <div className="mb-4">
               <InlineFeedback tone={batchFeedback.tone} title={tr("Batch decision")} body={batchFeedback.body} />
@@ -405,7 +446,8 @@ export function MemoryView() {
                     }}
                   >
                     <div className="text-[13px] text-ink line-clamp-2">{item.content}</div>
-                    <div className="text-[11px] text-muted mt-1.5">
+                    <div className="flex items-center gap-1.5 text-[11px] text-muted mt-1.5">
+                      {item.confidence != null && <ConfidenceBadge confidence={item.confidence} />}
                       {candidateTypeLabel(item, tr)} · {candidateScopeLabel(item, tr)} · {formatTime(item.created_at, tr)}
                     </div>
                   </button>
@@ -504,6 +546,22 @@ export function MemoryView() {
             <span className="min-w-0">
               <span className="block text-[13px] font-medium text-ink">{tr("System Prompts")}</span>
               <span className="block text-[11.5px] text-muted mt-0.5">{tr("View all prompt layers that shape the agent's personality and behavior.")}</span>
+            </span>
+          </span>
+          <span className="flex items-center gap-1 text-[12px] text-accent shrink-0">{tr("View")} <Icon name="chevronRight" size={14} /></span>
+        </button>
+
+        {/* Personality dashboard entry */}
+        <button
+          className="w-full mb-5 flex items-center justify-between gap-3 rounded-lg border border-line bg-panel px-3.5 py-3 text-left hover:border-accent/50 hover:bg-accentSoft/10"
+          onClick={() => setSurface("personality")}
+          data-testid="memory-personality-entry"
+        >
+          <span className="flex items-center gap-2.5">
+            <Icon name="memory" size={15} className="text-accent shrink-0" />
+            <span className="min-w-0">
+              <span className="block text-[13px] font-medium text-ink">{tr("Personality & Usage")}</span>
+              <span className="block text-[11.5px] text-muted mt-0.5">{tr("See how your memories shape the agent's behavior and which are used most.")}</span>
             </span>
           </span>
           <span className="flex items-center gap-1 text-[12px] text-accent shrink-0">{tr("View")} <Icon name="chevronRight" size={14} /></span>
@@ -742,6 +800,126 @@ function SummaryCard({
     </button>
   ) : (
     <div className="rounded-xl border border-line bg-panel px-4 py-3">{content}</div>
+  );
+}
+
+function PersonalityDashboard({ memories, onBack }: { memories: MemoryRecord[]; onBack: () => void }) {
+  const { tr } = useI18n();
+  const [usageRecords, setUsageRecords] = useState<MemoryUsageRecord[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    setLoading(true);
+    getMemoryUsageHistory(100)
+      .then((res) => setUsageRecords(res.records))
+      .catch(() => {})
+      .finally(() => setLoading(false));
+  }, []);
+
+  const typeDistribution = useMemo(() => {
+    const counts: Record<string, number> = {};
+    for (const m of memories) {
+      const key = m.key || "untyped";
+      counts[key] = (counts[key] || 0) + 1;
+    }
+    return Object.entries(counts)
+      .sort((a, b) => b[1] - a[1])
+      .map(([key, count]) => ({ key, count, pct: memories.length ? Math.round((count / memories.length) * 100) : 0 }));
+  }, [memories]);
+
+  const topUsed = useMemo(() => {
+    const freq: Record<number, { count: number; content: string; key: string | null }> = {};
+    for (const r of usageRecords) {
+      if (!freq[r.memory_id]) freq[r.memory_id] = { count: 0, content: r.content, key: r.key };
+      freq[r.memory_id].count++;
+    }
+    return Object.entries(freq)
+      .map(([id, v]) => ({ memory_id: Number(id), ...v }))
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 10);
+  }, [usageRecords]);
+
+  const typeLabel = (key: string) => {
+    const found = MEMORY_TYPES.find(([k]) => k === key);
+    return found ? found[1] : key;
+  };
+
+  return (
+    <main className="flex-1 min-w-0 min-h-0 overflow-y-auto hairline-scroll bg-paper" data-testid="personality-dashboard">
+      <div className="max-w-6xl mx-auto px-5 sm:px-8 py-6">
+        <button className="inline-flex items-center gap-1.5 text-[12px] text-muted hover:text-ink mb-4" onClick={onBack}>
+          <Icon name="arrowLeft" size={14} /> {tr("Back to memory")}
+        </button>
+        <div className="mb-6">
+          <h1 className="text-[24px] font-semibold text-heading">{tr("Personality & Usage")}</h1>
+          <p className="text-[12.5px] text-muted mt-0.5">{tr("Your memories shape the agent's personality. Here's a summary of what it knows and uses most.")}</p>
+        </div>
+
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+          {/* Type Distribution */}
+          <section className="border border-line rounded-xl bg-panel p-5">
+            <h2 className="text-[14px] font-semibold text-heading mb-3">{tr("Memory type distribution")}</h2>
+            {typeDistribution.length === 0 ? (
+              <p className="text-[12px] text-muted">{tr("No confirmed memories yet.")}</p>
+            ) : (
+              <div className="space-y-2">
+                {typeDistribution.map(({ key, count, pct }) => (
+                  <div key={key} className="flex items-center gap-3">
+                    <span className="w-32 text-[12px] text-muted truncate">{tr(typeLabel(key))}</span>
+                    <div className="flex-1 h-5 rounded-full bg-surfaceAlt overflow-hidden">
+                      <div className="h-full rounded-full bg-accent/70" style={{ width: `${Math.max(pct, 3)}%` }} />
+                    </div>
+                    <span className="text-[11px] text-ink w-10 text-right">{count} ({pct}%)</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </section>
+
+          {/* Most Used Memories */}
+          <section className="border border-line rounded-xl bg-panel p-5">
+            <h2 className="text-[14px] font-semibold text-heading mb-3">{tr("Most-used memories")}</h2>
+            {loading ? (
+              <p className="text-[12px] text-muted">{tr("Loading usage data...")}</p>
+            ) : topUsed.length === 0 ? (
+              <p className="text-[12px] text-muted">{tr("No usage records yet. Memories are tracked each time they are cited in a conversation.")}</p>
+            ) : (
+              <div className="space-y-2">
+                {topUsed.map((item) => (
+                  <div key={item.memory_id} className="flex items-start gap-2 px-2 py-1.5 rounded-lg hover:bg-paper">
+                    <span className="shrink-0 mt-0.5 w-6 h-6 rounded-full bg-accentSoft text-accent grid place-items-center text-[11px] font-semibold">{item.count}</span>
+                    <div className="min-w-0 flex-1">
+                      <div className="text-[12px] text-ink line-clamp-2">{item.content}</div>
+                      {item.key && <span className="text-[10px] text-muted">{tr(typeLabel(item.key))}</span>}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </section>
+        </div>
+
+        {/* Recent Usage Timeline */}
+        <section className="mt-6 border border-line rounded-xl bg-panel p-5">
+          <h2 className="text-[14px] font-semibold text-heading mb-3">{tr("Recent memory usage")}</h2>
+          {loading ? (
+            <p className="text-[12px] text-muted">{tr("Loading...")}</p>
+          ) : usageRecords.length === 0 ? (
+            <p className="text-[12px] text-muted">{tr("No usage history yet.")}</p>
+          ) : (
+            <div className="max-h-72 overflow-y-auto space-y-1">
+              {usageRecords.slice(0, 30).map((r) => (
+                <div key={r.usage_id} className="flex items-center gap-3 px-2 py-1.5 rounded-lg hover:bg-paper text-[12px]">
+                  <span className="text-muted shrink-0 w-28">{new Date(r.used_at).toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}</span>
+                  <span className="text-ink flex-1 truncate">{r.content}</span>
+                  {r.key && <span className="shrink-0 px-1.5 rounded bg-surfaceAlt text-[10px] text-muted">{r.key}</span>}
+                </div>
+              ))}
+            </div>
+          )}
+        </section>
+      </div>
+    </main>
   );
 }
 
@@ -1259,4 +1437,24 @@ function contentTypeLabel(value: string, tr: (text: string) => string): string {
 
 function shortId(value: string): string {
   return value.length > 16 ? `${value.slice(0, 8)}…${value.slice(-5)}` : value;
+}
+
+function ConfidenceBadge({ confidence }: { confidence: number }) {
+  let color: string;
+  let label: string;
+  if (confidence >= 0.8) {
+    color = "bg-green-100 text-green-700 border-green-200";
+    label = "High";
+  } else if (confidence >= 0.5) {
+    color = "bg-amber-50 text-amber-700 border-amber-200";
+    label = "Med";
+  } else {
+    color = "bg-red-50 text-red-600 border-red-200";
+    label = "Low";
+  }
+  return (
+    <span className={`inline-flex items-center rounded px-1.5 py-0.5 text-[9.5px] font-medium border ${color}`}>
+      {label} {Math.round(confidence * 100)}%
+    </span>
+  );
 }

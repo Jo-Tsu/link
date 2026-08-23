@@ -12,6 +12,7 @@ export type EventType =
   | "plan_proposed"
   | "tool_started"
   | "tool_finished"
+  | "memory_cited"
   | "iteration_end"
   | "turn_end"
   | "error"
@@ -118,7 +119,8 @@ export type Item =
       multi?: boolean;
       resolved?: string;
     }
-  | { kind: "notice"; tone: "info" | "warn"; text: string; retriable?: boolean };
+  | { kind: "notice"; tone: "info" | "warn"; text: string; retriable?: boolean }
+  | { kind: "memory_cited"; memories: Array<{ memory_id: number; content: string; key?: string; scope: string }> };
 
 export interface Project {
   project_id: string;

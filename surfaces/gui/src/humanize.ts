@@ -59,7 +59,7 @@ export function humanizeTool(name: string, args: any, tr: Translator = identity)
     case "apply_unified_diff":
       return { pre: tr("Edited "), obj: a.path ? baseName(String(a.path)) : tr("files") };
     case "grep":
-      return { pre: tr("Searched the code for "), obj: `“${trunc(String(a.pattern ?? ""), 40)}”` };
+      return { pre: tr("Searched the code for "), obj: `"${trunc(String(a.pattern ?? ""), 40)}"` };
     case "git_log":
       return { pre: tr("Looked through recent git history") };
     case "todo_write": {
@@ -71,7 +71,7 @@ export function humanizeTool(name: string, args: any, tr: Translator = identity)
         const status = String(it.status || "").replace(/_/g, " ");
         return {
           pre: tr("Updated the plan — "),
-          obj: `“${trunc(String(it.content ?? ""), 70)}”`,
+          obj: `"${trunc(String(it.content ?? ""), 70)}"`,
           ...(status ? { post: ` → ${status}` } : {}),
         };
       }
@@ -83,7 +83,7 @@ export function humanizeTool(name: string, args: any, tr: Translator = identity)
       return { pre: tr("Sent a {platform} message to ", { platform }), obj: tail };
     }
     case "web_search":
-      return { pre: tr("Searched the web — "), obj: `“${trunc(String(a.query ?? ""), 60)}”` };
+      return { pre: tr("Searched the web — "), obj: `"${trunc(String(a.query ?? ""), 60)}"` };
     case "web_fetch": {
       let host = String(a.url ?? "");
       try {
@@ -94,7 +94,9 @@ export function humanizeTool(name: string, args: any, tr: Translator = identity)
       return { pre: tr("Read a web page — "), obj: trunc(host, 50) };
     }
     case "explore":
-      return { pre: tr("Sent a sub-agent to explore — "), obj: `“${trunc(String(a.task ?? a.prompt ?? ""), 60)}”` };
+      return { pre: tr("Sent a sub-agent to explore — "), obj: `"${trunc(String(a.task ?? a.prompt ?? ""), 60)}"` };
+    case "delegate_to_agent":
+      return { pre: tr("Delegated to {role} — ", { role: String(a.role || "specialist") }), obj: `"${trunc(String(a.task ?? ""), 60)}"` };
     case "ask_user":
       return { pre: tr("Asked you a question") };
     case "propose_plan":
@@ -136,7 +138,7 @@ export function humanizeApprovalTitle(name: string, args: any, tr: Translator = 
     }
     case "create_scheduled_task":
       return a.title
-        ? { pre: tr("Create the automation "), obj: `“${trunc(String(a.title), 60)}”` }
+        ? { pre: tr("Create the automation "), obj: `"${trunc(String(a.title), 60)}"` }
         : { pre: tr("Create an automation") };
     default:
       return { pre: tr("Use {name}", { name }) };

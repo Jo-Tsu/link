@@ -3125,6 +3125,13 @@ class SessionManager:
             async for event in events:
                 event_count += 1
                 event_type = event.type.value
+                # Emit memory citations after the first assistant message (context was
+                # assembled for that model call, so cited_memories is populated).
+                if event_type == "assistant_message":
+                    cited = getattr(engine, "cited_memories", None)
+                    if cited:
+                        from ..events import Event, EventType as ET
+                        yield Event(ET.MEMORY_CITED, {"memories": list(cited)})
                 # Token deltas are a live transport detail. Persist the completed message and
                 # semantic lifecycle events instead; one short answer can contain hundreds of
                 # deltas and made both the database and Runs UI grow without useful information.
@@ -4468,6 +4475,10 @@ class SessionManager:
                 False,
                 False,
             )
+            auto_result = await asyncio.to_thread(
+                self.auto_accept_high_confidence, 0.9
+            )
+            result["auto_accepted"] = auto_result.get("auto_accepted", 0)
             stored = self._prefs.get("governance_schedule")
             schedule = stored if isinstance(stored, dict) else {}
             schedule["last_run_at"] = _now_iso()
@@ -4481,11 +4492,45 @@ class SessionManager:
         finally:
             self._governance_schedule_running = False
 
-    def memory_candidates(self, status: Optional[str] = "pending") -> list[dict[str, Any]]:
+    def memory_candidates(
+        self,
+        status: Optional[str] = "pending",
+        *,
+        min_confidence: Optional[float] = None,
+        max_confidence: Optional[float] = None,
+    ) -> list[dict[str, Any]]:
         return [
             candidate.to_dict()
-            for candidate in self.governance_store.list_candidates(status=status)
+            for candidate in self.governance_store.list_candidates(
+                status=status,
+                min_confidence=min_confidence,
+                max_confidence=max_confidence,
+            )
         ]
+
+    def auto_accept_high_confidence(self, threshold: float = 0.9) -> dict[str, Any]:
+        """Auto-accept candidates whose confidence meets the threshold."""
+        return self.governance_store.auto_accept_high_confidence(
+            self.memory_store, threshold=threshold
+        )
+
+    def memory_confidence_summary(self) -> dict[str, Any]:
+        """Summarize pending candidates by confidence tier for quick-review UX."""
+        candidates = self.governance_store.list_candidates("pending")
+        tiers = {"high": 0, "medium": 0, "low": 0, "unscored": 0}
+        for c in candidates:
+            if c.confidence is None:
+                tiers["unscored"] += 1
+            elif c.confidence >= 0.8:
+                tiers["high"] += 1
+            elif c.confidence >= 0.5:
+                tiers["medium"] += 1
+            else:
+                tiers["low"] += 1
+        return {
+            "total_pending": len(candidates),
+            "tiers": tiers,
+        }
 
     def memory_candidate(self, candidate_id: str) -> Optional[dict[str, Any]]:
         candidate = self.governance_store.get_candidate(candidate_id)
@@ -4618,6 +4663,48 @@ class SessionManager:
                 "updated_at": memory.updated_at,
                 "source_record_id": memory.source_record_id,
             },
+        }
+
+    def memory_usage_history(
+        self, *, limit: int = 50, memory_id: Optional[int] = None
+    ) -> dict[str, Any]:
+        with self.governance_store._lock:
+            if memory_id is not None:
+                rows = self.governance_store._conn.execute(
+                    """
+                    SELECT u.usage_id, u.memory_id, u.session_id, u.workspace, u.used_at,
+                           m.content, m.key
+                    FROM memory_usage u
+                    LEFT JOIN memories m ON m.id = u.memory_id
+                    WHERE u.memory_id = ?
+                    ORDER BY u.used_at DESC LIMIT ?
+                    """,
+                    (memory_id, limit),
+                ).fetchall()
+            else:
+                rows = self.governance_store._conn.execute(
+                    """
+                    SELECT u.usage_id, u.memory_id, u.session_id, u.workspace, u.used_at,
+                           m.content, m.key
+                    FROM memory_usage u
+                    LEFT JOIN memories m ON m.id = u.memory_id
+                    ORDER BY u.used_at DESC LIMIT ?
+                    """,
+                    (limit,),
+                ).fetchall()
+        return {
+            "records": [
+                {
+                    "usage_id": r["usage_id"],
+                    "memory_id": r["memory_id"],
+                    "session_id": r["session_id"],
+                    "workspace": r["workspace"],
+                    "used_at": r["used_at"],
+                    "content": (r["content"] or "")[:120],
+                    "key": r["key"],
+                }
+                for r in rows
+            ],
         }
 
     def sync_codex(self, limit_sessions: Optional[int] = None) -> dict[str, Any]:

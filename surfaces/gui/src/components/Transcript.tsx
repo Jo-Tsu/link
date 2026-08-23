@@ -7,6 +7,33 @@ import { ConnectorMessageCard } from "./ConnectorMessageCard";
 import { Icon } from "./Icon";
 import { useI18n } from "../i18n";
 
+function MemoryCitationTag({ memories }: { memories: Array<{ memory_id: number; content: string; key?: string; scope: string }> }) {
+  const { tr } = useI18n();
+  const [expanded, setExpanded] = useState(false);
+  return (
+    <div className="memory-citation px-3 py-1.5">
+      <button
+        className="flex items-center gap-1.5 text-[11.5px] text-accent hover:text-accentHover cursor-pointer"
+        onClick={() => setExpanded((v) => !v)}
+      >
+        <Icon name="memory" size={12} />
+        <span>{tr("Based on {count} memories", { count: memories.length })}</span>
+        <Icon name="chevronDown" size={10} className={"transition-transform" + (expanded ? " rotate-180" : "")} />
+      </button>
+      {expanded && (
+        <div className="mt-1.5 pl-4 flex flex-col gap-1">
+          {memories.map((m) => (
+            <div key={m.memory_id} className="flex items-baseline gap-1.5 text-[11px] text-muted">
+              <span className="shrink-0 px-1 rounded bg-surfaceAlt text-[10px]">{m.key || m.scope}</span>
+              <span className="truncate">{m.content}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // Hover affordances for a message bubble (FB-005): copy the raw text + the message's time.
 // Lives in a ZERO-HEIGHT strip under the bubble (absolute, inside the transcript's 20px gap)
 // so revealing it on group-hover never shifts the layout. `ts` is unix seconds — canonical
@@ -371,6 +398,9 @@ export function Transcript({ items, running, streamingText, onRetry }: Props) {
       !item.resolved
     ) {
       return;
+    } else if (item.kind === "memory_cited") {
+      flush();
+      blocks.push({ item, i });
     } else {
       flush();
       blocks.push({ item, i });
@@ -467,6 +497,8 @@ export function Transcript({ items, running, streamingText, onRetry }: Props) {
                 )}
               </div>
             );
+          case "memory_cited":
+            return <MemoryCitationTag memories={item.memories} key={bi} />;
           default:
             return null;
         }

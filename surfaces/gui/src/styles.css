@@ -834,6 +834,9 @@ button:disabled,
 .notice { font-size: 13px; color: var(--muted); text-align: center; }
 .notice.warn { color: var(--accent); }
 
+/* memory citation */
+.memory-citation { border-radius: 8px; background: color-mix(in srgb, var(--accent) 6%, transparent); }
+
 /* approval */
 .approval {
   border: 1px solid var(--line-strong); background: var(--panel); border-radius: 14px;

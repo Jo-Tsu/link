@@ -264,16 +264,53 @@ class SQLiteGovernanceStore:
         assert candidate is not None
         return candidate
 
-    def list_candidates(self, status: Optional[str] = "pending") -> list[MemoryCandidate]:
+    def list_candidates(
+        self,
+        status: Optional[str] = "pending",
+        *,
+        min_confidence: Optional[float] = None,
+        max_confidence: Optional[float] = None,
+    ) -> list[MemoryCandidate]:
         query = "SELECT * FROM memory_candidates"
+        conditions: list[str] = []
         params: list[Any] = []
         if status is not None:
-            query += " WHERE status=?"
+            conditions.append("status=?")
             params.append(status)
-        query += " ORDER BY created_at DESC, candidate_id DESC"
+        if min_confidence is not None:
+            conditions.append("confidence >= ?")
+            params.append(min_confidence)
+        if max_confidence is not None:
+            conditions.append("confidence < ?")
+            params.append(max_confidence)
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        query += " ORDER BY confidence DESC, created_at DESC, candidate_id DESC"
         with self._lock:
             rows = self._conn.execute(query, params).fetchall()
         return [self._candidate(row) for row in rows]
+
+    def auto_accept_high_confidence(
+        self,
+        memory_store: MemoryStore,
+        *,
+        threshold: float = 0.9,
+    ) -> dict[str, Any]:
+        """Auto-accept pending candidates with confidence >= threshold."""
+        candidates = self.list_candidates("pending", min_confidence=threshold)
+        accepted = 0
+        failed: list[str] = []
+        for candidate in candidates:
+            try:
+                self.decide(candidate.candidate_id, "accept", memory_store)
+                accepted += 1
+            except Exception:
+                failed.append(candidate.candidate_id)
+        return {
+            "auto_accepted": accepted,
+            "failed": len(failed),
+            "threshold": threshold,
+        }
 
     def get_candidate(self, candidate_id: str) -> Optional[MemoryCandidate]:
         with self._lock:

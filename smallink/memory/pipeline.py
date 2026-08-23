@@ -64,8 +64,14 @@ For each fact, choose:
   workspace : specific to the current project/workspace
   session   : only relevant to the current task (rarely worth persisting)
 
+Also assess confidence (0.0–1.0) for each fact:
+- 1.0 = the user explicitly stated a preference or decision (e.g. "I prefer X", "We decided Y")
+- 0.8 = clearly implied from consistent behavior or strong context
+- 0.5 = reasonable inference but could be wrong
+- 0.3 = weak signal, speculative
+
 Return ONLY valid JSON, no prose, no code fences:
-{"facts": [{"content": "<self-contained fact>", "memory_type": "<type>", "scope": "<scope>"}]}
+{"facts": [{"content": "<self-contained fact>", "memory_type": "<type>", "scope": "<scope>", "confidence": <float>}]}
 If there is nothing to remember, return {"facts": []}."""
 
 
