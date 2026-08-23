@@ -32,6 +32,7 @@ class EventType(str, Enum):
     TURN_END = "turn_end"
     ERROR = "error"
     INTERRUPTED = "interrupted"
+    PHASE_CHANGED = "phase_changed"  # lifecycle FSM transition
 
 
 @dataclass

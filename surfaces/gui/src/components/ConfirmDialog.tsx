@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import { useI18n } from "../i18n";
 
 export function ConfirmDialog({
@@ -19,9 +19,28 @@ export function ConfirmDialog({
   onCancel: () => void;
 }) {
   const { tr } = useI18n();
+  const dialogRef = useRef<HTMLDivElement>(null);
+
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if (event.key === "Escape" && !busy) onCancel();
+      if (event.key === "Tab") {
+        const el = dialogRef.current;
+        if (!el) return;
+        const focusable = el.querySelectorAll<HTMLElement>(
+          'button:not([disabled]), [tabindex]:not([tabindex="-1"])',
+        );
+        if (focusable.length === 0) return;
+        const first = focusable[0];
+        const last = focusable[focusable.length - 1];
+        if (event.shiftKey && document.activeElement === first) {
+          event.preventDefault();
+          last.focus();
+        } else if (!event.shiftKey && document.activeElement === last) {
+          event.preventDefault();
+          first.focus();
+        }
+      }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -30,6 +49,7 @@ export function ConfirmDialog({
   return (
     <div className="fixed inset-0 z-[90] bg-ink/35 grid place-items-center px-4">
       <div
+        ref={dialogRef}
         role="alertdialog"
         aria-modal="true"
         aria-labelledby="confirm-dialog-title"

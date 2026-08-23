@@ -63,6 +63,7 @@ import { WorkspaceTrustPrompt } from "./components/WorkspaceTrustPrompt";
 import { PageState } from "./components/AsyncFeedback";
 import { useI18n } from "./i18n";
 import { shouldStartWindowDrag } from "./windowDrag";
+import { useAgentLifecycle } from "./useAgentLifecycle";
 
 const ScheduledView = lazy(() =>
   import("./components/ScheduledView").then((module) => ({ default: module.ScheduledView })),
@@ -208,6 +209,7 @@ function ConversationSkeleton() {
 
 export function App() {
   const { t, tr } = useI18n();
+  const [lifecycle, lifecycleActions] = useAgentLifecycle();
   const [workspace, setWorkspace] = useState<string | null>(null);
   const [branch, setBranch] = useState<string | null>(null);
   const [showGate, setShowGate] = useState(false);
@@ -715,6 +717,8 @@ export function App() {
     const connectedSessionId = sessionId;
     const handleEvent = (ev: WsEvent) => {
       if (activeSessionIdRef.current !== connectedSessionId) return;
+      // Feed all events to the lifecycle state machine
+      lifecycleActions.handleEvent(ev);
       const d = ev.data || {};
       // An interrupted/errored turn never emits assistant_message, so its streamed partial
       // would otherwise live only in the ephemeral buffer until the next turn_start wipes it
@@ -897,9 +901,10 @@ export function App() {
         case "turn_done":
           setRunning(false);
           refreshSessions();
-          // Catch-all artifact refresh: files created via shell or on a brand-new session (whose
-          // record only exists after the first save) appear once the turn completes.
           setBrowserRefreshKey((k) => k + 1);
+          break;
+        case "phase_changed":
+          // Already handled by lifecycleActions.handleEvent above
           break;
       }
     };
@@ -909,6 +914,7 @@ export function App() {
       onOpen: () => {
         if (activeSessionIdRef.current !== connectedSessionId) return;
         setConnected(true);
+        lifecycleActions.onConnected();
         // Auto-send the task prompt once a "Run now" session connects.
         const p = pendingPromptRef.current;
         if (p) {
@@ -920,6 +926,7 @@ export function App() {
       onReconnect: () => {
         if (activeSessionIdRef.current !== connectedSessionId) return;
         setConnected(true);
+        lifecycleActions.onConnected();
         window.setTimeout(() => {
           if (activeSessionIdRef.current === connectedSessionId) {
             void loadSessionHistory(connectedSessionId, true);
@@ -927,7 +934,10 @@ export function App() {
         }, 250);
       },
       onClose: () => {
-        if (activeSessionIdRef.current === connectedSessionId) setConnected(false);
+        if (activeSessionIdRef.current === connectedSessionId) {
+          setConnected(false);
+          lifecycleActions.onDisconnected();
+        }
       },
     });
     sessionRef.current = session;
@@ -1388,6 +1398,12 @@ export function App() {
         </div>
         <div className="boot-progress" aria-hidden="true"><span /></div>
         <div className="boot-detail">{t(`app.${bootPhase}`)}</div>
+        <BootTimeout onRetry={() => {
+          setBootError(null);
+          setBooting(true);
+          setUiReady(false);
+          setBootAttempt((v) => v + 1);
+        }} />
       </div>
     );
   }
@@ -1399,6 +1415,7 @@ export function App() {
         (overlay ? " tauri-overlay" : "") +
         (navCollapsed ? " nav-collapsed" : "")
       }
+      data-phase={lifecycle.phase}
       onPointerDown={beginTopStripWindowDrag}
     >
       {/* Dev-only fake traffic lights so ?overlay=1 previews the real desktop top-left. */}
@@ -1482,6 +1499,9 @@ export function App() {
           onOpenAgents={() => setSurface("agents")}
           onOpenRuns={() => setSurface("runs")}
           onOpenScheduled={() => setSurface("scheduled")}
+          onOpenIntegrations={() => setSurface("integrations")}
+          onOpenInbox={() => setSurface("inbox")}
+          onOpenAudit={() => setSurface("audit")}
           onOpenSettings={() => openSettings("appearance")}
         />
       ) : (
@@ -1941,11 +1961,23 @@ function lastItemIsAssistant(items: Item[]): boolean {
 
 function WaitingForAgent() {
   const { tr } = useI18n();
+  const [elapsed, setElapsed] = useState(0);
+  useEffect(() => {
+    const t0 = Date.now();
+    const id = setInterval(() => setElapsed(Math.floor((Date.now() - t0) / 1000)), 1000);
+    return () => clearInterval(id);
+  }, []);
   return (
     <div className="waiting-transcript">
       <div className="waiting-row" aria-live="polite">
         <span className="waiting-spinner" />
-        <span>{tr("Waiting for agent…")}</span>
+        <span>
+          {elapsed < 15
+            ? tr("Waiting for agent…")
+            : elapsed < 45
+              ? tr("Still working… ({seconds}s)", { seconds: elapsed })
+              : tr("Taking longer than usual… ({seconds}s)", { seconds: elapsed })}
+        </span>
       </div>
     </div>
   );
@@ -2048,4 +2080,25 @@ function resolveLastQuestion(items: Item[], answer: string): Item[] {
     }
   }
   return copy;
+}
+
+function BootTimeout({ onRetry }: { onRetry: () => void }) {
+  const { tr } = useI18n();
+  const [showRetry, setShowRetry] = useState(false);
+  useEffect(() => {
+    const id = setTimeout(() => setShowRetry(true), 15000);
+    return () => clearTimeout(id);
+  }, []);
+  if (!showRetry) return null;
+  return (
+    <div className="boot-retry mt-4 text-center">
+      <p className="text-[12px] text-muted mb-2">{tr("Taking longer than expected…")}</p>
+      <button
+        className="inline-flex h-8 items-center justify-center rounded-lg border border-line bg-panel px-3 text-[12px] font-medium text-ink hover:border-lineStrong"
+        onClick={onRetry}
+      >
+        {tr("Retry")}
+      </button>
+    </div>
+  );
 }

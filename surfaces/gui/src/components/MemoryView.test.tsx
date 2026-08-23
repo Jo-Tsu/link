@@ -1,14 +1,17 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  autoAcceptHighConfidence,
   decideMemoryCandidate,
   decideMemoryCandidates,
+  getConfidenceSummary,
   getGovernanceTask,
   getGovernanceSchedule,
   getGovernanceTasks,
   getMemory,
   getMemoryCandidate,
   getMemoryCandidates,
+  getMemoryUsageHistory,
   getSensoryRecord,
   getSensoryRecords,
   getSensoryStats,
@@ -35,6 +38,9 @@ vi.mock("../api", async () => {
     getSensoryRecord: vi.fn(),
     getSensoryRecords: vi.fn(),
     getSensoryStats: vi.fn(),
+    getConfidenceSummary: vi.fn(),
+    getMemoryUsageHistory: vi.fn(),
+    autoAcceptHighConfidence: vi.fn(),
     retypeMemoryCandidates: vi.fn(),
     runMemoryPipeline: vi.fn(),
     setMemoryArchived: vi.fn(),
@@ -97,6 +103,12 @@ beforeEach(() => {
     pending: 12,
     sources: { traex: 9, codex: 3 },
   });
+  vi.mocked(getConfidenceSummary).mockResolvedValue({
+    total_pending: 5,
+    tiers: { high: 2, medium: 2, low: 1, unscored: 0 },
+  });
+  vi.mocked(getMemoryUsageHistory).mockResolvedValue({ records: [] });
+  vi.mocked(autoAcceptHighConfidence).mockResolvedValue({ auto_accepted: 0, failed: 0, threshold: 0.9 });
   vi.mocked(getSensoryRecords).mockResolvedValue({
     records: [],
     total: 0,

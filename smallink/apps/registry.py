@@ -107,5 +107,35 @@ MINEM_MANIFEST = AppManifest(
 )
 
 
+BWF_MANIFEST = AppManifest(
+    schema_version="smallink.app/v1",
+    app_id="bwf",
+    name="BWF Studio",
+    description="AI short-video production workbench: script → storyboard → video → assembly.",
+    icon="bwf",
+    runtime_kind="embedded",
+    connector_id="bwf",
+    system_project_id="system:bwf",
+    system_project_name="BWF Studio",
+    default_agent="link",
+    capabilities=(
+        "project.list",
+        "project.create",
+        "project.get",
+        "project.delete",
+        "series.list",
+        "series.create",
+        "video_task.create",
+        "video_task.list",
+    ),
+    memory_types=(
+        "user_preference",
+        "project_context",
+        "product_decision",
+        "artifact_summary",
+    ),
+)
+
+
 def builtin_app_registry() -> AppRegistry:
-    return AppRegistry((MINEM_MANIFEST,))
+    return AppRegistry((MINEM_MANIFEST, BWF_MANIFEST))

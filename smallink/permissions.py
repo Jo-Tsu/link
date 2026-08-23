@@ -191,16 +191,6 @@ class PermissionEngine:
         p = Path(path).expanduser()
         return p.resolve() if p.is_absolute() else (self.workspace_root / p).resolve()
 
-    def _under_root(self, path: str) -> bool:
-        candidate = self._candidate(path)
-        for rp, _ in self._resolved_roots():
-            try:
-                candidate.relative_to(rp)
-                return True
-            except ValueError:
-                continue
-        return False
-
     def _under_writable_root(self, path: str) -> bool:
         candidate = self._candidate(path)
         for rp, writable in self._resolved_roots():

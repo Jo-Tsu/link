@@ -17,6 +17,7 @@ export default {
       colors: {
         paper: color("--paper"),
         panel: color("--panel"),
+        surfaceAlt: color("--surface-alt"),
         ink: color("--ink"),
         heading: color("--heading"),
         muted: color("--muted"),
@@ -31,8 +32,10 @@ export default {
         okSoft: color("--ok-soft"),
         okLine: color("--ok-line"),
         okDot: color("--ok-dot"),
+        warn: color("--warn-ink"),
         warnInk: color("--warn-ink"),
         warnSoft: color("--warn-soft"),
+        warnLine: color("--warn-line"),
         danger: color("--danger"),
         dangerSoft: color("--danger-soft"),
         tealInk: color("--teal-ink"),

@@ -16,6 +16,9 @@ describe("CompactSidebar", () => {
       onOpenAgents: vi.fn(),
       onOpenRuns: vi.fn(),
       onOpenScheduled: vi.fn(),
+      onOpenIntegrations: vi.fn(),
+      onOpenInbox: vi.fn(),
+      onOpenAudit: vi.fn(),
       onOpenSettings: vi.fn(),
     };
     render(<CompactSidebar surface="apps" {...handlers} />);

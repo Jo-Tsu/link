@@ -87,22 +87,26 @@ def _manager(tmp_path, monkeypatch):
     return SessionManager(data_dir=tmp_path / "data", provider=NoopProvider())
 
 
-def test_builtin_minem_app_creates_one_protected_system_project(tmp_path, monkeypatch):
+def test_builtin_apps_create_protected_system_projects(tmp_path, monkeypatch):
     manager = _manager(tmp_path, monkeypatch)
 
     apps = manager.list_apps()
-    assert len(apps) == 1
-    assert apps[0]["app_id"] == "minem"
-    assert apps[0]["project"]["project_id"] == "system:minem"
-    assert apps[0]["project"]["project_type"] == "system_app"
-    assert apps[0]["project"]["owner_app_id"] == "minem"
-    assert manager.delete_project("system:minem") == {
-        "ok": False,
-        "error": "system application projects cannot be deleted",
-    }
+    by_id = {app["app_id"]: app for app in apps}
+    assert set(by_id) == {"minem", "bwf"}
+    for app_id in ("minem", "bwf"):
+        project = by_id[app_id]["project"]
+        assert project["project_id"] == f"system:{app_id}"
+        assert project["project_type"] == "system_app"
+        assert project["owner_app_id"] == app_id
+        assert manager.delete_project(f"system:{app_id}") == {
+            "ok": False,
+            "error": "system application projects cannot be deleted",
+        }
 
     manager._ensure_builtin_app_projects()
-    assert [item.project_id for item in manager.session_store.list_projects()].count("system:minem") == 1
+    project_ids = [item.project_id for item in manager.session_store.list_projects()]
+    assert project_ids.count("system:minem") == 1
+    assert project_ids.count("system:bwf") == 1
 
 
 def test_minem_asset_reads_create_source_facts_and_stable_refs(tmp_path, monkeypatch):

@@ -606,6 +606,10 @@ export async function getMemory(status?: "active" | "pending" | "archived" | "al
   return (await res.json()).memory ?? [];
 }
 
+export async function archiveMemory(id: number): Promise<void> {
+  await fetch(`${httpBase()}/v1/memory/${id}/archive`, { method: "POST" });
+}
+
 export interface MemoryCandidate {
   candidate_id: string;
   task_id: string;

@@ -302,7 +302,10 @@ export function Composer(props: Props) {
     try {
       if (dictation?.recording) {
         setDictationBusy("transcribing");
-        const transcript = await stopDictation();
+        const timeoutPromise = new Promise<null>((_, reject) =>
+          setTimeout(() => reject(new Error(tr("Transcription timed out. Please try again."))), 30000),
+        );
+        const transcript = await Promise.race([stopDictation(), timeoutPromise]);
         if (transcript === null) throw new Error(tr("Could not transcribe your recording."));
         if (transcript.trim()) {
           setText((draft) => (draft.trim() ? `${draft.trimEnd()} ${transcript.trim()}` : transcript.trim()));
@@ -381,6 +384,12 @@ export function Composer(props: Props) {
       )}
 
       {/* Attachments preview — a strip ABOVE the input box (mock/Claude-style). */}
+      {!props.connected && !props.running && (
+        <div className="max-w-3xl mx-auto mb-1.5 px-3 py-2 rounded-lg border border-warnLine bg-warnSoft text-[12px] text-warn flex items-center gap-2">
+          <span className="inline-block w-2 h-2 rounded-full bg-warn animate-pulse" />
+          {tr("Connecting to server…")}
+        </div>
+      )}
       {attachments.length > 0 && (
         <div className="max-w-3xl mx-auto mb-1.5 flex flex-wrap gap-2">
           {attachments.map((a, i) => (
@@ -557,7 +566,15 @@ export function Composer(props: Props) {
               }
               onClick={submit}
               disabled={!props.connected || !!dictation?.recording || !!dictationBusy}
-              title={needsModel ? tr("Connect a model to send") : undefined}
+              title={
+                needsModel
+                  ? tr("Connect a model to send")
+                  : !props.connected
+                    ? tr("Connecting to server…")
+                    : dictationBusy
+                      ? tr("Transcribing…")
+                      : undefined
+              }
               aria-label={tr("Send")}
             >
               <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">

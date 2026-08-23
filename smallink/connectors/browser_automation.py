@@ -256,16 +256,6 @@ def _target_locator(page, target: str):
         return page.get_by_text(target, exact=False).first
 
 
-def _safe_call(fn: Callable[[], Any]) -> dict[str, Any]:
-    try:
-        return fn()
-    except Exception as exc:
-        return {"error": str(exc)}
-
-
-def _browser_call(action: str, fn: Callable[[], dict[str, Any]]) -> dict[str, Any]:
-    return _BROWSER.call(action, lambda _page: fn())
-
 
 _SNAPSHOT_JS = """
 () => {

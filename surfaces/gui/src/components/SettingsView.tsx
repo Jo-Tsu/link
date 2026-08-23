@@ -5,6 +5,7 @@ import {
   getSensoryStats,
   deleteSensoryRecords,
   getMemory,
+  archiveMemory,
   getTrustedWorkspaces,
   setOnboarded,
   setPdfSettings,
@@ -854,11 +855,7 @@ function PrivacySection() {
       let archived = 0;
       for (const m of memories) {
         try {
-          await globalThis.fetch(
-            ((globalThis as any).__LINK_HTTP__ || (import.meta as any).env?.VITE_LINK_HTTP || "http://127.0.0.1:42871") +
-              `/v1/memory/${m.id}/archive`,
-            { method: "POST" },
-          );
+          await archiveMemory(m.id);
           archived++;
         } catch { /* skip */ }
       }

@@ -14,6 +14,9 @@ export function CompactSidebar({
   onOpenAgents,
   onOpenRuns,
   onOpenScheduled,
+  onOpenIntegrations,
+  onOpenInbox,
+  onOpenAudit,
   onOpenSettings,
 }: {
   surface: SurfaceKey;
@@ -26,6 +29,9 @@ export function CompactSidebar({
   onOpenAgents: () => void;
   onOpenRuns: () => void;
   onOpenScheduled: () => void;
+  onOpenIntegrations: () => void;
+  onOpenInbox: () => void;
+  onOpenAudit: () => void;
   onOpenSettings: () => void;
 }) {
   const { t, tr } = useI18n();
@@ -49,6 +55,9 @@ export function CompactSidebar({
       <RailButton icon="sparkle" label={t("nav.agents")} active={surface === "agents"} onClick={onOpenAgents} />
       <RailButton icon="branch" label={tr("Run center")} active={surface === "runs"} onClick={onOpenRuns} />
       <RailButton icon="clock" label={tr("Automations")} active={surface === "scheduled"} onClick={onOpenScheduled} />
+      <RailButton icon="plug" label={tr("Integrations")} active={surface === "integrations"} onClick={onOpenIntegrations} />
+      <RailButton icon="inbox" label={tr("Inbox")} active={surface === "inbox"} onClick={onOpenInbox} />
+      <RailButton icon="shield" label={tr("Audit")} active={surface === "audit"} onClick={onOpenAudit} />
       <div className="flex-1" />
       <RailButton icon="gear" label={tr("Settings")} active={surface === "settings"} onClick={onOpenSettings} />
     </aside>

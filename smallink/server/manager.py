@@ -42,6 +42,8 @@ from ..audit import AuditStore
 from ..config import load_config, workspace_allowed_commands
 from ..conversations import ConversationStore, title_from
 from ..engine import ApprovalOutcome, Approver, TurnEngine
+from ..events import Event, EventType
+from ..lifecycle import AgentPhase, LifecycleTracker
 from ..projects import ProjectRecord
 from ..roots import RootDir
 from ..workspace_trust import WorkspaceTrustStore
@@ -205,6 +207,7 @@ class SessionManager:
         if self.default_workspace:
             self.session_store.touch_workspace(self.default_workspace)
         self._engines: dict[str, TurnEngine] = {}
+        self._trackers: dict[str, LifecycleTracker] = {}
         self._running_sessions: set[str] = (
             set()
         )  # sessions with an in-flight turn (busy)
@@ -3011,23 +3014,83 @@ class SessionManager:
 
     def mark_running(self, session_id: str) -> None:
         self._running_sessions.add(session_id)
+        tracker = self._get_tracker(session_id)
+        if tracker.phase == AgentPhase.IDLE:
+            tracker.transition(AgentPhase.STARTING)
 
     def try_mark_running(self, session_id: str) -> bool:
         """Atomically claim an idle session for one turn on the server event loop."""
         if session_id in self._running_sessions:
             return False
         self._running_sessions.add(session_id)
+        tracker = self._get_tracker(session_id)
+        if tracker.phase == AgentPhase.IDLE:
+            tracker.transition(AgentPhase.STARTING)
         return True
 
     def mark_idle(self, session_id: str) -> None:
         self._running_sessions.discard(session_id)
-        # Every turn path (WS, background delivery, durable resume) marks idle when it
-        # finishes — the one shared post-turn moment, so auto-titling hooks in here and
-        # can never add latency to the response itself.
+        tracker = self._trackers.get(session_id)
+        if tracker and tracker.phase != AgentPhase.IDLE:
+            if tracker.phase in (AgentPhase.ERRORED, AgentPhase.INTERRUPTED):
+                tracker.transition(AgentPhase.IDLE)
+            elif tracker.phase == AgentPhase.COMPLETING:
+                tracker.transition(AgentPhase.IDLE)
+            else:
+                tracker.reset()
         self._maybe_autotitle(session_id)
 
     def is_running(self, session_id: str) -> bool:
         return session_id in self._running_sessions
+
+    def _get_tracker(self, session_id: str) -> LifecycleTracker:
+        tracker = self._trackers.get(session_id)
+        if tracker is None:
+            tracker = LifecycleTracker(session_id)
+            self._trackers[session_id] = tracker
+        return tracker
+
+    def get_phase(self, session_id: str) -> AgentPhase:
+        return self._get_tracker(session_id).phase
+
+    _EVENT_PHASE_MAP: dict[str, AgentPhase] = {
+        "turn_start": AgentPhase.STARTING,
+        "assistant_delta": AgentPhase.THINKING,
+        "reasoning_delta": AgentPhase.THINKING,
+        "tool_proposed": AgentPhase.TOOL_PENDING,
+        "permission_required": AgentPhase.AWAITING_APPROVAL,
+        "directory_requested": AgentPhase.AWAITING_APPROVAL,
+        "question_requested": AgentPhase.AWAITING_APPROVAL,
+        "plan_proposed": AgentPhase.AWAITING_APPROVAL,
+        "tool_started": AgentPhase.EXECUTING,
+        "tool_finished": AgentPhase.THINKING,
+        "turn_end": AgentPhase.COMPLETING,
+        "error": AgentPhase.ERRORED,
+        "interrupted": AgentPhase.INTERRUPTED,
+    }
+
+    def _drive_phase(self, session_id: str, event_type: str) -> None:
+        target = self._EVENT_PHASE_MAP.get(event_type)
+        if target is None:
+            return
+        tracker = self._get_tracker(session_id)
+        if target == tracker.phase:
+            return
+        allowed = {AgentPhase.IDLE, AgentPhase.STARTING, AgentPhase.THINKING,
+                   AgentPhase.TOOL_PENDING, AgentPhase.AWAITING_APPROVAL,
+                   AgentPhase.EXECUTING, AgentPhase.COMPLETING,
+                   AgentPhase.ERRORED, AgentPhase.INTERRUPTED}
+        if target not in allowed:
+            return
+        try:
+            tracker.transition(target)
+        except Exception:
+            tracker.reset()
+            if target != AgentPhase.IDLE:
+                try:
+                    tracker.transition(target)
+                except Exception:
+                    pass
 
     async def tracked_engine_events(
         self,
@@ -3125,13 +3188,14 @@ class SessionManager:
             async for event in events:
                 event_count += 1
                 event_type = event.type.value
+                # Drive lifecycle FSM from engine events
+                self._drive_phase(session_id, event_type)
                 # Emit memory citations after the first assistant message (context was
                 # assembled for that model call, so cited_memories is populated).
                 if event_type == "assistant_message":
                     cited = getattr(engine, "cited_memories", None)
                     if cited:
-                        from ..events import Event, EventType as ET
-                        yield Event(ET.MEMORY_CITED, {"memories": list(cited)})
+                        yield Event(EventType.MEMORY_CITED, {"memories": list(cited)})
                 # Token deltas are a live transport detail. Persist the completed message and
                 # semantic lifecycle events instead; one short answer can contain hundreds of
                 # deltas and made both the database and Runs UI grow without useful information.
@@ -3201,6 +3265,14 @@ class SessionManager:
                         event.data.get("reason", "execution interrupted")
                     )
                 yield event
+                # Emit phase_changed event after each engine event
+                tracker = self._trackers.get(session_id)
+                if tracker:
+                    yield Event(EventType.PHASE_CHANGED, {
+                        "phase": tracker.phase.value,
+                        "trigger": event_type,
+                        "session_id": session_id,
+                    })
             if terminal_status is None:
                 if event_count == 0 and (retry or resume):
                     terminal_status = "completed"
@@ -4668,30 +4740,7 @@ class SessionManager:
     def memory_usage_history(
         self, *, limit: int = 50, memory_id: Optional[int] = None
     ) -> dict[str, Any]:
-        with self.governance_store._lock:
-            if memory_id is not None:
-                rows = self.governance_store._conn.execute(
-                    """
-                    SELECT u.usage_id, u.memory_id, u.session_id, u.workspace, u.used_at,
-                           m.content, m.key
-                    FROM memory_usage u
-                    LEFT JOIN memories m ON m.id = u.memory_id
-                    WHERE u.memory_id = ?
-                    ORDER BY u.used_at DESC LIMIT ?
-                    """,
-                    (memory_id, limit),
-                ).fetchall()
-            else:
-                rows = self.governance_store._conn.execute(
-                    """
-                    SELECT u.usage_id, u.memory_id, u.session_id, u.workspace, u.used_at,
-                           m.content, m.key
-                    FROM memory_usage u
-                    LEFT JOIN memories m ON m.id = u.memory_id
-                    ORDER BY u.used_at DESC LIMIT ?
-                    """,
-                    (limit,),
-                ).fetchall()
+        rows = self.governance_store.query_usage_history(limit=limit, memory_id=memory_id)
         return {
             "records": [
                 {
@@ -4700,8 +4749,8 @@ class SessionManager:
                     "session_id": r["session_id"],
                     "workspace": r["workspace"],
                     "used_at": r["used_at"],
-                    "content": (r["content"] or "")[:120],
-                    "key": r["key"],
+                    "content": (r.get("content") or "")[:120],
+                    "key": r.get("key"),
                 }
                 for r in rows
             ],

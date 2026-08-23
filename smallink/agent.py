@@ -54,6 +54,7 @@ from .web import make_web_fetch_tool, make_web_search_tool
 from .workspace_trust import WorkspaceTrustStore
 from .tools.shell import LocalExecutor
 from .tools.todo import TodoList
+from .capabilities import CapabilityContainer
 
 # Appended each turn while discuss mode is active: enforcement-only read-only, with no
 # pressure toward a plan proposal (that's what distinguishes it from plan mode).
@@ -155,7 +156,14 @@ def build_engine(
     subagent_observer: Optional[Any] = None,
     subagent_read_tools: Optional[list[Any]] = None,
     skill_state_root: Optional[str | Path] = None,
+    capabilities: Optional[CapabilityContainer] = None,
 ) -> TurnEngine:
+    # CapabilityContainer overrides — forward-compatible entry point for callers that
+    # assemble capabilities before calling build_engine. Falls back to explicit kwargs.
+    if capabilities is not None:
+        provider = provider or capabilities.provider  # type: ignore[assignment]
+        memory_store = memory_store or capabilities.memory  # type: ignore[assignment]
+
     ws = Path(workspace).expanduser().resolve() if workspace else None
     if agent.needs_workspace and ws is None:
         raise ValueError(f"agent '{agent.name}' requires a workspace")

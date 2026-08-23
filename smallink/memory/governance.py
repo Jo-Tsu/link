@@ -840,6 +840,35 @@ class SQLiteGovernanceStore:
             )
             self._conn.commit()
 
+    def query_usage_history(
+        self, *, limit: int = 50, memory_id: Optional[int] = None
+    ) -> list[dict[str, Any]]:
+        with self._lock:
+            if memory_id is not None:
+                rows = self._conn.execute(
+                    """
+                    SELECT u.usage_id, u.memory_id, u.session_id, u.workspace, u.used_at,
+                           m.content, m.key
+                    FROM memory_usage u
+                    LEFT JOIN memories m ON m.id = u.memory_id
+                    WHERE u.memory_id = ?
+                    ORDER BY u.used_at DESC LIMIT ?
+                    """,
+                    (memory_id, limit),
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    """
+                    SELECT u.usage_id, u.memory_id, u.session_id, u.workspace, u.used_at,
+                           m.content, m.key
+                    FROM memory_usage u
+                    LEFT JOIN memories m ON m.id = u.memory_id
+                    ORDER BY u.used_at DESC LIMIT ?
+                    """,
+                    (limit,),
+                ).fetchall()
+        return [dict(r) for r in rows]
+
     def finish_task(self, task_id: str) -> dict[str, Any]:
         with self._lock:
             counts = {

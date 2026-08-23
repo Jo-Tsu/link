@@ -807,12 +807,14 @@ function PersonalityDashboard({ memories, onBack }: { memories: MemoryRecord[]; 
   const { tr } = useI18n();
   const [usageRecords, setUsageRecords] = useState<MemoryUsageRecord[]>([]);
   const [loading, setLoading] = useState(true);
+  const [usageError, setUsageError] = useState(false);
 
   useEffect(() => {
     setLoading(true);
+    setUsageError(false);
     getMemoryUsageHistory(100)
       .then((res) => setUsageRecords(res.records))
-      .catch(() => {})
+      .catch(() => setUsageError(true))
       .finally(() => setLoading(false));
   }, []);
 
@@ -881,6 +883,8 @@ function PersonalityDashboard({ memories, onBack }: { memories: MemoryRecord[]; 
             <h2 className="text-[14px] font-semibold text-heading mb-3">{tr("Most-used memories")}</h2>
             {loading ? (
               <p className="text-[12px] text-muted">{tr("Loading usage data...")}</p>
+            ) : usageError ? (
+              <p className="text-[12px] text-danger">{tr("Could not load usage data.")}</p>
             ) : topUsed.length === 0 ? (
               <p className="text-[12px] text-muted">{tr("No usage records yet. Memories are tracked each time they are cited in a conversation.")}</p>
             ) : (
