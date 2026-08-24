@@ -14,8 +14,9 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable, Coroutine
 from pathlib import Path
 from typing import Any, Optional
 
@@ -28,7 +29,7 @@ from ..connections import (
     SessionConnectionStore,
     effective as effective_connections,
 )
-from ..inbox import InboxStore, args_preview
+from ..inbox import InboxStore, VIS_INBOX, args_preview
 from ..inbox_routing import InboxRouting
 from ..personas import PersonaRegistry
 from ..personas.registry import set_registry as set_persona_registry
@@ -95,7 +96,9 @@ from ..tools import ToolRegistry
 from .services import AppProjectService, MemoryService, SettingsService
 
 _SCOPES = {s.value for s in Scope}
+BROADCAST_CALLBACK_TIMEOUT_SECONDS = 3.0
 logger = logging.getLogger("smallink.manager")
+BINDING_WORKER_DRAIN_TIMEOUT_SECONDS = 5.0
 
 def _grants_of(engine) -> dict[str, Any]:
     """The engine's session-scoped "Always allow" approvals, in persistable shape."""
@@ -193,10 +196,21 @@ class SessionManager:
             session_store=self.session_store,
             lifecycle_for=self._get_tracker,
         )
+        self._session_persistence_lock = threading.RLock()
+        # Engine assembly can be comparatively expensive. Serialize only callers targeting the
+        # same session; the persistence lock below stays a short critical section so one session
+        # opening cannot stall saves/deletes for every other session.
+        self._engine_build_locks: dict[str, threading.RLock] = {}
+        # Delete tombstones are process-local guards against late turn-finally rewrites. They also
+        # retain a scratch path for deferred cleanup until the live runtime actually releases.
+        self._deleted_sessions: set[str] = set()
+        self._deleted_scratch: dict[str, str] = {}
         # Sessions with an auto-title LLM call in flight (FB-010) — one call at a time.
         self._autotitle_inflight: set[str] = set()
         self._autotitle_tasks: set[asyncio.Task] = set()
         self._autotitle_attempts: dict[str, int] = {}
+        self._background_tasks: set[asyncio.Task[Any]] = set()
+        self._closing = False
         self.workspace_trust = WorkspaceTrustStore()
         # No explicit provider injected → route by the model's `provider:` prefix (OpenAI default,
         # Ollama, …). Tests inject a provider directly and bypass the router. The same router is
@@ -238,13 +252,17 @@ class SessionManager:
         # Automation: scheduled tasks store + the tick scheduler (started in the lifespan).
         # The scheduler also resumes self-wake'd sessions each tick (extra_tick).
         self.task_store = TaskStore(base / "automation.db")
+
+        def _recoverable_automation_status(session_id: str) -> Optional[str]:
+            runtime_task = self.runtime_store.get_task_by_session(session_id)
+            if runtime_task is None:
+                return None
+            return runtime_task.status
+
         self.task_store.recover_incomplete_runs(
-            runtime_status=lambda session_id: (
-                self.runtime_store.get_task_by_session(session_id).status
-                if self.runtime_store.get_task_by_session(session_id) is not None
-                else None
-            )
+            runtime_status=_recoverable_automation_status
         )
+        self._finalize_recoverable_automation_runs()
         self.scheduler = Scheduler(
             self.task_store, self._run_scheduled_task, extra_tick=self.resume_due_wakes
         )
@@ -271,6 +289,7 @@ class SessionManager:
         # People directory: "platform:user_id" → display name, noted from every inbound
         # (authorized or parked) so allow-list chips read "Rohit Prsad", not "U07JK…".
         self._people_path = base / "people.json"
+        self._people_lock = threading.RLock()
         try:
             self._people: dict[str, str] = json.loads(self._people_path.read_text())
         except (OSError, ValueError):
@@ -438,17 +457,56 @@ class SessionManager:
         plan_approver: Optional[Any] = None,
         question_asker: Optional[Any] = None,
     ) -> Optional[TurnEngine]:
-        engine = self._runtimes.engine(session_id)
-        if engine is not None:
-            if approver is not None:
-                engine.approver = approver
-            if directory_requester is not None:
-                engine.directory_requester = directory_requester
-            if plan_approver is not None:
-                engine.plan_approver = plan_approver
-            if question_asker is not None:
-                engine.question_asker = question_asker
-            return engine
+        build_lock = self._session_build_lock(session_id)
+        # A per-session lock prevents duplicate construction and synchronizes deletion without
+        # making an unrelated session wait for tool/provider assembly.
+        with build_lock:
+            return self._get_engine_serialized(
+                session_id,
+                workspace=workspace,
+                agent=agent,
+                approver=approver,
+                extra_tools=extra_tools,
+                directory_requester=directory_requester,
+                plan_approver=plan_approver,
+                question_asker=question_asker,
+            )
+
+    def _session_build_lock(self, session_id: str) -> threading.RLock:
+        with self._session_persistence_lock:
+            return self._engine_build_locks.setdefault(session_id, threading.RLock())
+
+    def _get_engine_serialized(
+        self,
+        session_id: str,
+        *,
+        workspace: Optional[str] = None,
+        agent: str = "code",
+        approver: Optional[Approver] = None,
+        extra_tools: Optional[list[Any]] = None,
+        directory_requester: Optional[Any] = None,
+        plan_approver: Optional[Any] = None,
+        question_asker: Optional[Any] = None,
+    ) -> Optional[TurnEngine]:
+        # Deletion uses the same per-session build lock. The global lock is needed only while
+        # observing or publishing shared runtime state.
+        with self._session_persistence_lock:
+            if self.is_session_deleted(session_id):
+                return None
+            engine = self._runtimes.engine(session_id)
+            if engine is not None:
+                # The HTTP/WS composition root supplies manager-owned, session-scoped handlers
+                # (never socket closures), so rebinding is safe and upgrades a headless scheduled
+                # runtime when a user opens it for an interactive follow-up.
+                if approver is not None:
+                    engine.approver = approver
+                if directory_requester is not None:
+                    engine.directory_requester = directory_requester
+                if plan_approver is not None:
+                    engine.plan_approver = plan_approver
+                if question_asker is not None:
+                    engine.question_asker = question_asker
+                return engine
 
         record = self.session_store.load(session_id)
         is_new_session = record is None
@@ -518,15 +576,15 @@ class SessionManager:
                 # Background / self-wake / durable-resume runs have no live socket → default to the
                 # Inbox-based callbacks so a rebuilt engine can still get approvals/answers (and, on
                 # resume, the already-resolved item returns immediately).
-                approver=approver or self.inbox_approver(session_id, agent),
+                approver=approver or self.inbox_approver(session_id, agent_name),
                 directory_requester=directory_requester
-                or self.inbox_directory_requester(session_id, agent),
-                plan_approver=plan_approver or self.inbox_plan_approver(session_id, agent),
+                or self.inbox_directory_requester(session_id, agent_name),
+                plan_approver=plan_approver or self.inbox_plan_approver(session_id, agent_name),
                 question_asker=question_asker
-                or self.inbox_question_asker(session_id, agent),
+                or self.inbox_question_asker(session_id, agent_name),
                 subscription_store=self.subscriptions,
                 channel_buffer=self.channel_buffer,
-                routing_targets=self._routing_targets(session_id, agent),
+                routing_targets=self._routing_targets(session_id, agent_name),
                 # Per-session connection hierarchy: expose only effective-enabled connectors' tools.
                 connector_filter=self.effective_connectors(session_id, agent_name),
                 subagent_observer=AgentRunObserver(self.runtime_store, session_id),
@@ -545,7 +603,11 @@ class SessionManager:
                 )
             if record is not None and record.grants:
                 self._apply_grants(engine, record.grants)
-            self._runtimes.publish(session_id, engine, scope=scope)
+            with self._session_persistence_lock:
+                if self.is_session_deleted(session_id):
+                    scope.close()
+                    return None
+                self._runtimes.publish(session_id, engine, scope=scope)
         except Exception:
             scope.close()
             raise
@@ -600,6 +662,18 @@ class SessionManager:
             return persona_id
         record = self.session_store.load(session_id)
         return (record.agent if record else None) or self.personas.default_id()
+
+    def session_persona(self, session_id: str, *, fallback: Optional[str] = None) -> str:
+        """The authoritative persona for a session: live engine first, then persisted record."""
+        engine = self._runtimes.engine(session_id)
+        if engine is not None:
+            persona = str(getattr(engine, "agent_name", "") or "").strip()
+            if persona:
+                return persona
+        record = self.session_store.load(session_id)
+        if record and record.agent:
+            return record.agent
+        return fallback or self.personas.default_id()
 
     def effective_connectors(
         self, session_id: str, persona_id: Optional[str] = None
@@ -807,55 +881,88 @@ class SessionManager:
         }
 
     def inbox_question_asker(self, session_id: str, agent: str):
-        """The Unattended `ask_user` handler: turn the agent's question into an Inbox item and
-        suspend until a human answers it (from the Inbox, or inline when they open the session).
-        Also the default for background/self-wake runs (no live socket). Mirrors to a bound channel
-        like the approver does."""
-
+        """Session-scoped question handler: inline for a viewed attended session, Inbox for
+        unattended/background runs. It never captures a particular WebSocket."""
         async def ask(
             args: dict[str, Any], tool_call_id: Optional[str] = None
         ) -> dict[str, Any]:
             question = str(args.get("question", "")).strip()
             if not question:
                 return {"answer": "", "error": "no question"}
-            inbox_name = self.inbox_routing.route_for(session_id, agent)
             item = self.inbox.add_question(
                 session_id,
                 title=question,
-                inbox=inbox_name,
+                inbox=self.inbox_routing.route_for(session_id, agent),
+                visibility=self._interactive_prompt_visibility(session_id),
                 options=list(args.get("options") or []),
                 allow_text=bool(args.get("allow_text", True)),
                 multi=bool(args.get("multi", False)),
                 tool_call_id=tool_call_id,
             )
-            if (
-                item.state != "pending"
-            ):  # durable resume re-raised an already-answered prompt
-                return {"answer": item.resolution or ""}
-            self.persist_session(session_id)  # the pending tool call is now on disk
-            await self.mirror_inbox_item(item)
-            answer = await self.inbox.wait(item.id)
-            return {"answer": answer}
+            if item.state == "pending":
+                self.persist_session(session_id)
+                if item.visibility == VIS_INBOX:
+                    await self.mirror_inbox_item(item)
+                else:
+                    await self._broadcast_prompt_item(
+                        item,
+                        "question_requested",
+                        {
+                            "question": item.title,
+                            "options": item.options,
+                            "allow_text": item.allow_text,
+                            "multi": item.multi,
+                            "header": str(args.get("header", "")),
+                        },
+                    )
+            return {"answer": await self.inbox.wait(item.id)}
 
         return ask
 
-    def inbox_approver(self, session_id: str, agent: str):
-        """Inbox-based approver — the default for no-socket runs (background, self-wake, durable
-        resume). On resume the item already exists + is resolved, so wait returns at once.
-        """
+    def _interactive_prompt_visibility(self, session_id: str) -> str:
+        from ..inbox import VIS_INLINE
 
+        return (
+            VIS_INBOX
+            if self.unattended.is_unattended(session_id)
+            or not self._session_clients.get(session_id)
+            else VIS_INLINE
+        )
+
+    async def _broadcast_prompt_item(
+        self, item: Any, event_type: str, data: dict[str, Any]
+    ) -> None:
+        await self.broadcast_session(
+            item.session_id,
+            {"type": event_type, "data": {"prompt_id": item.id, **data}},
+        )
+
+    def inbox_approver(self, session_id: str, agent: str):
         async def approve(request):
             item = self.inbox.add_approval(
                 session_id,
                 f"Run `{request.tool_name}`?",
                 body=_approval_body(request),
                 inbox=self.inbox_routing.route_for(session_id, agent),
-                tool_call_id=getattr(request, "tool_call_id", None),
+                visibility=self._interactive_prompt_visibility(session_id),
                 data=self.approval_prompt_data(session_id, request),
+                tool_call_id=getattr(request, "tool_call_id", None),
             )
             if item.state == "pending":
                 self.persist_session(session_id)
-                await self.mirror_inbox_item(item)
+                if item.visibility == VIS_INBOX:
+                    await self.mirror_inbox_item(item)
+                else:
+                    await self._broadcast_prompt_item(
+                        item,
+                        "permission_required",
+                        {
+                            "name": request.tool_name,
+                            "arguments": getattr(request, "arguments", None) or {},
+                            "reason": getattr(request, "reason", "") or "",
+                            **(item.data or {}),
+                        },
+                    )
             resolution = await self.inbox.wait(item.id)
             return self.approval_outcome(resolution, request, session_id)
 
@@ -868,6 +975,7 @@ class SessionManager:
                 "Grant access to a folder?",
                 body=str(args.get("reason", "")),
                 inbox=self.inbox_routing.route_for(session_id, agent),
+                visibility=self._interactive_prompt_visibility(session_id),
                 data={
                     "path": str(args.get("path", "")),
                     "writable": bool(args.get("writable", False)),
@@ -876,7 +984,18 @@ class SessionManager:
             )
             if item.state == "pending":
                 self.persist_session(session_id)
-                await self.mirror_inbox_item(item)
+                if item.visibility == VIS_INBOX:
+                    await self.mirror_inbox_item(item)
+                else:
+                    await self._broadcast_prompt_item(
+                        item,
+                        "directory_requested",
+                        {
+                            "reason": item.body,
+                            "path": item.data.get("path", ""),
+                            "writable": bool(item.data.get("writable", False)),
+                        },
+                    )
             resp = _parse_inbox_json(await self.inbox.wait(item.id))
             if not resp.get("granted"):
                 return {"granted": False, "reason": "the user declined the request"}
@@ -884,13 +1003,27 @@ class SessionManager:
             if not path:
                 return {"granted": False, "error": "no directory was provided"}
             writable = bool(resp.get("writable", args.get("writable", False)))
-            res = self.add_root(session_id, path, writable)
-            if not res.get("ok"):
+            result = self.add_root(session_id, path, writable)
+            if not result.get("ok"):
                 return {
                     "granted": False,
-                    "error": res.get("error", "could not grant access"),
+                    "error": result.get("error", "could not grant access"),
                 }
-            return {"granted": True, "path": path, "writable": writable}
+            primary = next(
+                (
+                    root
+                    for root in result.get("roots", [])
+                    if root.get("path")
+                    and Path(root["path"]).expanduser().resolve()
+                    == Path(path).expanduser().resolve()
+                ),
+                None,
+            )
+            return {
+                "granted": True,
+                "path": (primary or {}).get("path", path),
+                "writable": writable,
+            }
 
         return request
 
@@ -901,11 +1034,17 @@ class SessionManager:
                 "Approve the plan?",
                 body=str(args.get("plan", "")),
                 inbox=self.inbox_routing.route_for(session_id, agent),
+                visibility=self._interactive_prompt_visibility(session_id),
                 tool_call_id=tool_call_id,
             )
             if item.state == "pending":
                 self.persist_session(session_id)
-                await self.mirror_inbox_item(item)
+                if item.visibility == VIS_INBOX:
+                    await self.mirror_inbox_item(item)
+                else:
+                    await self._broadcast_prompt_item(
+                        item, "plan_proposed", {"plan": item.body}
+                    )
             resp = _parse_inbox_json(await self.inbox.wait(item.id))
             if not resp.get("approved"):
                 return {
@@ -918,6 +1057,8 @@ class SessionManager:
 
     def persist_session(self, session_id: str) -> None:
         """Save the cached engine's thread (so a prompt's pending tool call survives a crash)."""
+        if self.is_session_deleted(session_id):
+            return
         engine = self._runtimes.engine(session_id)
         if engine is not None:
             self.save(session_id, engine)
@@ -931,6 +1072,17 @@ class SessionManager:
         ok = self.inbox.resolve(item_id, resolution)
         if not ok or item is None:
             return ok
+        await self.broadcast_session(
+            item.session_id,
+            {
+                "type": "prompt_resolved",
+                "data": {
+                    "prompt_id": item.id,
+                    "kind": item.kind,
+                    "resolution": resolution,
+                },
+            },
+        )
         if not self.is_running(item.session_id):
             await self._durable_resume(item)
         return ok
@@ -941,7 +1093,7 @@ class SessionManager:
         engine = self.get_engine(item.session_id)
         if engine is None or not hasattr(engine, "resume"):
             return
-        self.mark_running(item.session_id)
+        self.mark_running(item.session_id, engine=engine)
         try:
             async for _event in self.tracked_engine_events(
                 item.session_id,
@@ -2148,7 +2300,9 @@ class SessionManager:
         if not user_id or not name:
             return
         key = f"{platform}:{user_id}"
-        if self._people.get(key) != name:
+        with self._people_lock:
+            if self._people.get(key) == name:
+                return
             self._people[key] = name
             try:
                 self._people_path.write_text(json.dumps(self._people))
@@ -2159,7 +2313,7 @@ class SessionManager:
         """Gateway callback: keep what an unallowed sender said (names already resolved by the
         adapter, best-effort) so the owner can allow-and-deliver without a re-send."""
         s = event.source
-        self._note_person(s.platform, s.user_id, s.user_name)
+        await asyncio.to_thread(self._note_person, s.platform, s.user_id, s.user_name)
         self.parked.park(
             platform=s.platform,
             chat_id=s.chat_id,
@@ -2215,14 +2369,34 @@ class SessionManager:
     def unregister_event_client(self, send_cb: Any) -> None:
         self._event_clients.discard(send_cb)
 
+    async def _broadcast_callbacks(
+        self,
+        callbacks: tuple[Any, ...],
+        message: dict,
+        unregister: Callable[[Any], None],
+    ) -> None:
+        if not callbacks:
+            return
+
+        async def _send(send_cb: Any) -> None:
+            try:
+                await asyncio.wait_for(
+                    send_cb(message),
+                    timeout=BROADCAST_CALLBACK_TIMEOUT_SECONDS,
+                )
+            except Exception:
+                unregister(send_cb)
+
+        await asyncio.gather(*(_send(send_cb) for send_cb in callbacks))
+
     async def broadcast_event(self, message: dict) -> None:
         """Fan an app-wide event out to every /ws/events socket. Best-effort: a dead
         socket is dropped, never fatal to the caller."""
-        for cb in list(self._event_clients):
-            try:
-                await cb(message)
-            except Exception:
-                self.unregister_event_client(cb)
+        await self._broadcast_callbacks(
+            tuple(self._event_clients),
+            message,
+            self.unregister_event_client,
+        )
 
     def register_session_client(self, session_id: str, send_cb: Any) -> None:
         self._session_clients.setdefault(session_id, set()).add(send_cb)
@@ -2237,17 +2411,107 @@ class SessionManager:
     async def broadcast_session(self, session_id: str, message: dict) -> None:
         """Fan a turn event out to every socket viewing this session. Best-effort: a dead socket
         is dropped, never fatal to the turn (delivery is socket-independent)."""
-        for cb in list(self._session_clients.get(session_id, ())):
+        await self._broadcast_callbacks(
+            tuple(self._session_clients.get(session_id, ())),
+            message,
+            lambda send_cb: self.unregister_session_client(session_id, send_cb),
+        )
+
+    def spawn_background_task(
+        self, coro: Coroutine[Any, Any, Any]
+    ) -> asyncio.Task[Any]:
+        """Start a manager-owned task whose lifetime cannot outlive this manager."""
+        if self._closing:
+            coro.close()
+            raise RuntimeError("session manager is closing")
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_task_done)
+        return task
+
+    def _background_task_done(self, task: asyncio.Task[Any]) -> None:
+        self._background_tasks.discard(task)
+        if task.cancelled():
+            return
+        try:
+            error = task.exception()
+        except asyncio.CancelledError:
+            return
+        if error is not None:
+            logger.error(
+                "background task failed",
+                exc_info=(type(error), error, error.__traceback__),
+            )
+
+    def begin_shutdown(self) -> None:
+        """Stop admitting new work and ask all live engines to stop ASAP."""
+        if self._closing:
+            return
+        self._closing = True
+        for engine in self._runtimes.engines():
             try:
-                await cb(message)
+                engine.request_interrupt()
             except Exception:
-                self.unregister_session_client(session_id, cb)
+                logger.exception("failed to interrupt engine during shutdown")
 
     async def aclose(self) -> None:
+        self.begin_shutdown()
         await self.memory_service.stop_governance_scheduler()
         await self.scheduler.stop()
         await self.stop_gateway()
+
+        background_tasks = tuple(self._background_tasks)
+        autotitle_tasks = tuple(self._autotitle_tasks)
+        owned_tasks = background_tasks + autotitle_tasks
+        for task in owned_tasks:
+            task.cancel()
+        if owned_tasks:
+            await asyncio.gather(*owned_tasks, return_exceptions=True)
+        self._background_tasks.clear()
+        self._autotitle_tasks.clear()
+        self._autotitle_inflight.clear()
+
         await self.mcp.aclose()
+        # Cancelling an asyncio wrapper cannot stop work that has already entered a thread. Keep
+        # stores alive until those provider/tool calls return so they cannot write after close.
+        engines = tuple(self._runtimes.engines())
+        if engines:
+            drained = await asyncio.gather(
+                *(
+                    engine.wait_for_thread_workers(
+                        timeout=BINDING_WORKER_DRAIN_TIMEOUT_SECONDS
+                    )
+                    for engine in engines
+                ),
+                return_exceptions=True,
+            )
+            for engine, result in zip(engines, drained):
+                if result is True:
+                    continue
+                if isinstance(result, Exception):
+                    logger.error(
+                        "shutdown worker drain failed for %r",
+                        engine,
+                        exc_info=(type(result), result, result.__traceback__),
+                    )
+                    continue
+                logger.warning(
+                    "shutdown worker drain timed out for %r after %.1fs",
+                    engine,
+                    BINDING_WORKER_DRAIN_TIMEOUT_SECONDS,
+                )
+            if any(result is not True for result in drained):
+                logger.error(
+                    "shutdown leaving runtime/data stores open because blocking workers did not drain"
+                )
+                return
+            # The real workers are finished, so their asyncio wrappers can no longer block. Let
+            # completion callbacks run, then settle them before tearing down the shared stores.
+            await asyncio.sleep(0)
+            await asyncio.gather(
+                *(engine.wait_for_workers() for engine in engines),
+                return_exceptions=True,
+            )
         self._runtimes.close_all()
         self.governance_store.close()
         self.connector_sync_store.close()
@@ -2297,13 +2561,14 @@ class SessionManager:
         rule to the live engine so the run's next call auto-allows."""
         from ..permissions import standing_rule_candidate
 
-        task = self.task_store.task_for_run_session(session_id)
-        if task is None:
-            return False
-        target = standing_rule_candidate(tool_name, arguments or {}, metadata)
-        if not target or not task.add_rule(tool_name, target):
-            return False
-        self.task_store.save(task)
+        with self.task_store.transaction():
+            task = self.task_store.task_for_run_session(session_id)
+            if task is None:
+                return False
+            target = standing_rule_candidate(tool_name, arguments or {}, metadata)
+            if not target or not task.add_rule(tool_name, target):
+                return False
+            self.task_store.save(task)
         engine = self._runtimes.engine(session_id)
         if engine is not None:
             engine.permissions.task_rules.setdefault(tool_name, set()).add(target)
@@ -2389,39 +2654,44 @@ class SessionManager:
     def _build_task_engine(self, task, *, session_id: str) -> TurnEngine:
         ag = get_agent(task.agent)
         Path(task.workspace).mkdir(parents=True, exist_ok=True)
-        scope = self._runtimes.prepare(session_id)
-        try:
-            engine = build_engine(
-                agent=ag,
-                workspace=task.workspace,
-                model=task.model or self.model,
-                mode=Mode.INTERACTIVE,
-                approver=self._scheduled_approver(task, session_id),
-                capabilities=CapabilityContainer(
-                    provider=self.provider,
-                    tools=ToolRegistry(),
-                    memory=self.memory_store,
-                ),
-                governance_store=self.governance_store,
-                secrets=self.secrets,
-                # No scheduling tools inside a scheduled run: the executing agent's job is to DO the
-                # task, and instructions that mention timing ("every day at 5:32pm…") otherwise tempt
-                # it to create another automation instead of running this one.
-                task_store=None,
-                session_id=session_id,
-                audit_sink=self.audit_store.append,
-                # Scheduled runs respect the same per-session connection hierarchy as live sessions:
-                # expose only the persona's effective-enabled connectors' tools (§4.3).
-                connector_filter=self.effective_connectors(session_id, task.agent),
-                skill_state_root=self._data_base,
-                runtime_scope=scope,
+        with self._session_persistence_lock:
+            build_lock = self._engine_build_locks.setdefault(
+                session_id, threading.RLock()
             )
-            self._seed_task_permissions(engine, task)
-            self._runtimes.publish(session_id, engine, scope=scope)
-        except Exception:
-            scope.close()
-            raise
-        return engine
+        with build_lock:
+            existing = self._runtimes.engine(session_id)
+            if existing is not None:
+                self._seed_task_permissions(existing, task)
+                return existing
+            scope = self._runtimes.prepare(session_id)
+            try:
+                engine = build_engine(
+                    agent=ag,
+                    workspace=task.workspace,
+                    model=task.model or self.model,
+                    mode=Mode.INTERACTIVE,
+                    approver=self._scheduled_approver(task, session_id),
+                    capabilities=CapabilityContainer(
+                        provider=self.provider,
+                        tools=ToolRegistry(),
+                        memory=self.memory_store,
+                    ),
+                    governance_store=self.governance_store,
+                    secrets=self.secrets,
+                    # No scheduling tools inside a scheduled run: its job is to execute.
+                    task_store=None,
+                    session_id=session_id,
+                    audit_sink=self.audit_store.append,
+                    connector_filter=self.effective_connectors(session_id, task.agent),
+                    skill_state_root=self._data_base,
+                    runtime_scope=scope,
+                )
+                self._seed_task_permissions(engine, task)
+                self._runtimes.publish(session_id, engine, scope=scope)
+            except Exception:
+                scope.close()
+                raise
+            return engine
 
     # -- mirroring inbox items to a bound channel -------------------------------
     async def mirror_inbox_item(self, item) -> None:
@@ -2526,7 +2796,12 @@ class SessionManager:
                     team_id=getattr(event.source, "team_id", None),
                 ):
                     return False
-            return self.inbox.resolve(item_id, resolution)
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                return asyncio.run(self.resolve_inbox(item_id, resolution))
+            self.spawn_background_task(self.resolve_inbox(item_id, resolution))
+            return True
 
         return resolve_from_reply(text, _resolve) is not None
 
@@ -2547,22 +2822,37 @@ class SessionManager:
                 self.wakes.mark_fired(wake.id)
         return resumed
 
-    def mark_running(self, session_id: str) -> None:
-        scope = self._runtimes.ensure(session_id)
-        if not scope.claim():
-            raise RuntimeError(f"session {session_id!r} is already running")
+    def mark_running(
+        self, session_id: str, *, engine: Optional[TurnEngine] = None
+    ) -> None:
+        if not self.try_mark_running(session_id, engine=engine):
+            raise RuntimeError(
+                f"session {session_id!r} is unavailable or already running"
+            )
 
-    def try_mark_running(self, session_id: str) -> bool:
+    def try_mark_running(
+        self, session_id: str, *, engine: Optional[TurnEngine] = None
+    ) -> bool:
         """Atomically claim an idle session for one turn on the server event loop."""
-        scope = self._runtimes.ensure(session_id)
-        if not scope.claim():
-            return False
-        return True
+        with self._session_persistence_lock:
+            if self._closing or self.is_session_deleted(session_id):
+                return False
+            scope = self._runtimes.scope(session_id)
+            if engine is not None and (scope is None or scope.engine is not engine):
+                return False
+            scope = scope or self._runtimes.ensure(session_id)
+            claimed = scope.claim()
+            if claimed and scope.engine is not None:
+                scope.engine.prepare_turn()
+            return claimed
 
     def mark_idle(self, session_id: str) -> None:
         scope = self._runtimes.scope(session_id)
         if scope is not None:
             scope.release()
+        if self.is_session_deleted(session_id):
+            self._finalize_deleted_session(session_id)
+            return
         self._maybe_autotitle(session_id)
 
     def is_running(self, session_id: str) -> bool:
@@ -2605,7 +2895,7 @@ class SessionManager:
 
     async def deliver_to_session(
         self, session_id: str, message: str, *, source: Optional[dict[str, Any]] = None
-    ) -> None:
+    ) -> bool:
         """Deliver an out-of-band message to a (durable) session — the agent stays resumable
         forever, so this works with no live socket. Busy (mid tool-loop): steer it into the live
         turn at its next step (don't start a colliding run). Idle: run a fresh background turn
@@ -2613,12 +2903,18 @@ class SessionManager:
         by self-wake and channel-subscription delivery. `source` is the display-only MessageSource
         sidecar for connector messages (framed `message` stays the model-facing text).
         """
+        if self._closing or self.is_session_deleted(session_id):
+            return False
         engine = self.get_engine(session_id)
         if engine is None:
-            return
-        if not self.try_mark_running(session_id):
+            return False
+        if not self.try_mark_running(session_id, engine=engine):
+            scope = self._runtimes.scope(session_id)
+            if scope is None or scope.engine is not engine or not scope.claimed:
+                return False
             engine.queue_steering(message, source)
-            return
+            return True
+        saved = False
         try:
             async for event in self.tracked_engine_events(
                 session_id,
@@ -2627,6 +2923,15 @@ class SessionManager:
                 source=source,
                 trigger=(str((source or {}).get("platform", "")) or "background"),
             ):
+                # These prompts are re-emitted by the session-owned callback only after the
+                # durable Inbox item exists, carrying its exact prompt_id. Broadcasting the raw
+                # engine event here would create a second, unanswerable card in live viewers.
+                if event.type.value in {
+                    "permission_required",
+                    "directory_requested",
+                    "plan_proposed",
+                }:
+                    continue
                 # Stream every event to any socket viewing this session, so a background turn
                 # (channel delivery, self-wake, durable resume) is seen live — not just on reselect.
                 await self.broadcast_session(
@@ -2640,7 +2945,7 @@ class SessionManager:
                         "background turn failed for %s: %s", session_id, reason
                     )
                     self.unrouted.record(session_id, "-", message, reason=reason)
-            self.save(session_id, engine)
+            saved = self.save(session_id, engine)
         except (
             Exception
         ) as exc:  # an unexpected raise out of the turn must not be swallowed
@@ -2652,6 +2957,7 @@ class SessionManager:
         finally:
             self.mark_idle(session_id)
             await self.broadcast_session(session_id, {"type": "turn_done", "data": {}})
+        return saved
 
     # -- channel subscriptions (inbound messaging) ------------------------------
     async def _dispatch_inbound(self, event) -> None:
@@ -2663,7 +2969,9 @@ class SessionManager:
         text = getattr(event, "text", "") or ""
         who = src.user_name or src.user_id or "?"
         channel = f"{src.platform}:{src.chat_id}"  # thread-agnostic channel address
-        self._note_person(src.platform, src.user_id, src.user_name)
+        await asyncio.to_thread(
+            self._note_person, src.platform, src.user_id, src.user_name
+        )
         # Structured sidecar (display-only) built from the resolved identities on the event — the
         # framed text below stays the model-facing `content`; `ms.text` carries the RAW message.
         ms = MessageSource(
@@ -2705,17 +3013,61 @@ class SessionManager:
                     ):
                         continue
                     try:
-                        await self.deliver_to_session(
+                        delivered = await self.deliver_to_session(
                             sub.session_id, msg, source=ms.to_dict()
                         )
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.warning(
+                            "subscription delivery crashed for %s on %s: %s",
+                            sub.session_id,
+                            channel,
+                            exc,
+                        )
+                        self.unrouted.record(
+                            channel,
+                            who,
+                            text,
+                            reason=f"delivery crashed for subscribed session {sub.session_id}: {exc}",
+                        )
+                        continue
+                    if not delivered:
+                        logger.warning(
+                            "subscription delivery dropped for %s on %s: no session runtime",
+                            sub.session_id,
+                            channel,
+                        )
+                        self.unrouted.record(
+                            channel,
+                            who,
+                            text,
+                            reason=f"delivery failed for subscribed session {sub.session_id}: no session runtime",
+                        )
                 return
             return  # channel with no subscribers — nobody is listening
         # DM (or any non-channel): route to the designated session, else park it for visibility.
         dm = self.dm_session()
         if dm and self._inbound_connector_allowed(dm, src.platform):
-            await self.deliver_to_session(dm, event.tagged_text(), source=ms.to_dict())
+            try:
+                delivered = await self.deliver_to_session(
+                    dm, event.tagged_text(), source=ms.to_dict()
+                )
+            except Exception as exc:
+                logger.warning("DM delivery crashed for %s from %s: %s", dm, src.target, exc)
+                self.unrouted.record(
+                    src.target,
+                    who,
+                    text,
+                    reason=f"delivery crashed for DM session {dm}: {exc}",
+                )
+                return
+            if not delivered:
+                logger.warning("DM delivery dropped for %s from %s", dm, src.target)
+                self.unrouted.record(
+                    src.target,
+                    who,
+                    text,
+                    reason=f"delivery failed for DM session {dm}: no session runtime",
+                )
         elif dm:
             # Designated, but this session has muted the connector → park rather than deliver.
             self.unrouted.record(
@@ -2752,11 +3104,35 @@ class SessionManager:
                 if not self._inbound_connector_allowed(sub.session_id, src.platform):
                     continue
                 try:
-                    await self.deliver_to_session(
+                    delivered = await self.deliver_to_session(
                         sub.session_id, msg, source=ms.to_dict()
                     )
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.warning(
+                        "mention delivery crashed for %s on %s: %s",
+                        sub.session_id,
+                        thread_target,
+                        exc,
+                    )
+                    self.unrouted.record(
+                        src.target,
+                        who,
+                        event.text or "",
+                        reason=f"mention delivery crashed for session {sub.session_id}: {exc}",
+                    )
+                    continue
+                if not delivered:
+                    logger.warning(
+                        "mention delivery dropped for %s on %s: no session runtime",
+                        sub.session_id,
+                        thread_target,
+                    )
+                    self.unrouted.record(
+                        src.target,
+                        who,
+                        event.text or "",
+                        reason=f"mention delivery failed for session {sub.session_id}: no session runtime",
+                    )
             return
         sid = self.mention_sessions.get(thread_target)
         if sid and self.session_store.load(sid) is not None:
@@ -2766,7 +3142,34 @@ class SessionManager:
                 f'(Reply in the thread with the send_message tool, target "{thread_target}" '
                 f"— replies there are pre-approved.)"
             )
-            await self.deliver_to_session(sid, msg, source=ms.to_dict())
+            try:
+                delivered = await self.deliver_to_session(sid, msg, source=ms.to_dict())
+            except Exception as exc:
+                logger.warning(
+                    "mention follow-up crashed for %s on %s: %s",
+                    sid,
+                    thread_target,
+                    exc,
+                )
+                self.unrouted.record(
+                    src.target,
+                    who,
+                    event.text or "",
+                    reason=f"mention follow-up crashed for session {sid}: {exc}",
+                )
+                return
+            if not delivered:
+                logger.warning(
+                    "mention follow-up dropped for %s on %s: no session runtime",
+                    sid,
+                    thread_target,
+                )
+                self.unrouted.record(
+                    src.target,
+                    who,
+                    event.text or "",
+                    reason=f"mention follow-up failed for session {sid}: no session runtime",
+                )
             return
         await self._spawn_mention_session(event, ms, thread_target)
 
@@ -2844,39 +3247,59 @@ class SessionManager:
         run = TaskRun(
             task_id=task.id, trigger=trigger
         )  # __post_init__ sets run.session_id
-        self.task_store.add_run(run)  # mark "running"
-        # UX-026: tell every open app window a SCHEDULED run just started (the 5s
-        # top-right toast). Manual runs never come through here — the user is
-        # already watching those live.
-        await self.broadcast_event(
-            {
-                "type": "automation_run_started",
-                "data": {
-                    "task_id": task.id,
-                    "task_title": task.title,
-                    "session_id": run.session_id,
-                    "workspace": task.workspace,
-                    "agent": task.agent,
-                    "trigger": trigger,
-                },
-            }
-        )
-        # Each run is a real, persisted conversation thread: it runs the instructions under its
-        # own session id, then saves the transcript. The user can reopen that session and ask a
-        # follow-up — the scheduled agent is no longer fire-and-forget.
-        engine = self._build_task_engine(task, session_id=run.session_id)
-        # Register the live engine up-front: a parked approval persists the session
-        # mid-run (durable suspend), and resolving from the Inbox must find this engine.
-        # The first turn is the task itself. The framing matters: instructions often restate the
-        # schedule ("every day at 5:32pm…"), so make explicit that the schedule already fired and
-        # the job now is to execute, not to (re)schedule.
-        opening = (
-            f"⏰ Scheduled run — {task.title}\n\n"
-            "This automation is due now: carry out the task below immediately and produce the "
-            "result. The schedule already exists — do not create or modify any scheduled tasks.\n\n"
-            f"{task.instructions}"
-        )
+        active_task = task
+        with self.task_store.transaction():
+            fresh_task = self.task_store.get(task.id)
+            if fresh_task is None:
+                run.status = "skipped"
+                run.error = "automation was deleted before the run started"
+                run.finished_at = _epoch()
+                return run
+            active_task = fresh_task
+            if trigger in {"schedule", "catchup"}:
+                if not active_task.enabled:
+                    run.status = "skipped"
+                    run.error = "automation was disabled before the run started"
+                    run.finished_at = _epoch()
+                    return run
+                due_ids = {due.id for due in self.task_store.due()}
+                if active_task.id not in due_ids:
+                    run.status = "skipped"
+                    run.error = "automation was no longer due at run start"
+                    run.finished_at = _epoch()
+                    return run
+            self.task_store.add_run(run)  # mark "running"
+        engine: Optional[TurnEngine] = None
+        claimed = False
         try:
+            # Publish before announcing the run. A user can click the toast immediately; publishing
+            # afterward allowed that WebSocket to build a competing runtime for the same session id.
+            engine = self._build_task_engine(active_task, session_id=run.session_id)
+            claimed = self.try_mark_running(run.session_id, engine=engine)
+            if not claimed:
+                run.status = "skipped"
+                run.error = "automation session was already active"
+                return run
+            await self.broadcast_event(
+                {
+                    "type": "automation_run_started",
+                    "data": {
+                        "task_id": active_task.id,
+                        "task_title": active_task.title,
+                        "session_id": run.session_id,
+                        "workspace": active_task.workspace,
+                        "agent": active_task.agent,
+                        "trigger": trigger,
+                    },
+                }
+            )
+            opening = (
+                f"⏰ Scheduled run — {active_task.title}\n\n"
+                "This automation is due now: carry out the task below immediately and produce "
+                "the result. The schedule already exists — do not create or modify any "
+                "scheduled tasks.\n\n"
+                f"{active_task.instructions}"
+            )
             async for _event in self.tracked_engine_events(
                 run.session_id,
                 engine,
@@ -2885,26 +3308,38 @@ class SessionManager:
             ):
                 pass
             run.result_text = _last_assistant_text(engine.messages)
-            run.artifacts = _recent_files(task.workspace, since=run.started_at)
+            run.artifacts = _recent_files(active_task.workspace, since=run.started_at)
             runtime_status, runtime_error = self._runtime_outcome(run.session_id)
             if runtime_status == "completed":
                 run.status = "ok"
             else:
                 run.status = "error"
                 run.error = runtime_error or f"runtime ended with status {runtime_status or 'unknown'}"
-            if task.notify_on_completion and run.status == "ok":
-                await self._notify_task_done(task, run)
+        except asyncio.CancelledError:
+            run.status = "interrupted"
+            run.error = "automation was interrupted during shutdown"
+            raise
         except Exception as exc:
             run.status, run.error = "error", str(exc)
         finally:
             run.finished_at = _epoch()
-            # Persist the run as a continuable session + keep the live engine for an immediate
-            # follow-up; record the run (now carrying its session_id).
-            try:
-                self.save(run.session_id, engine)
-            except Exception:
-                pass
-            self.task_store.add_run(run)
+            # Persist before releasing the execution slot so a live follow-up cannot race this
+            # snapshot. A successful execution without a durable transcript is an error.
+            if engine is not None and claimed:
+                try:
+                    saved = self.save(run.session_id, engine)
+                    if not saved and run.status == "ok":
+                        run.status = "error"
+                        run.error = "automation result could not be saved"
+                except Exception as exc:
+                    if run.status == "ok":
+                        run.status = "error"
+                        run.error = f"automation result could not be saved: {exc}"
+            if claimed:
+                self.mark_idle(run.session_id)
+            self.task_store.complete_run(run)
+            if active_task.notify_on_completion and run.status == "ok":
+                await self._notify_task_done(active_task, run)
         return run
 
     async def _notify_task_done(self, task, run: TaskRun) -> None:
@@ -2960,12 +3395,13 @@ class SessionManager:
         return {"tasks": tasks}
 
     def mark_automation_seen(self, task_id: str) -> dict[str, Any]:
-        task = self.task_store.get(task_id)
-        if task is None:
-            return {"ok": False, "error": "not found"}
-        task.seen_runs_at = time.time()
-        self.task_store.save(task)
-        return {"ok": True}
+        with self.task_store.transaction():
+            task = self.task_store.get(task_id)
+            if task is None:
+                return {"ok": False, "error": "not found"}
+            task.seen_runs_at = time.time()
+            self.task_store.save(task)
+            return {"ok": True}
 
     def get_automation(self, task_id: str) -> dict[str, Any]:
         task = self.task_store.get(task_id)
@@ -3021,55 +3457,59 @@ class SessionManager:
             always_allowed_tools=grant_entries(payload.get("permissions")),
         )
         task.workspace = self._provision_scratch(task.task_session_id)
-        self.task_store.save(task)
-        return {"ok": True, "task": task.public()}
+        with self.task_store.transaction():
+            self.task_store.save(task)
+            return {"ok": True, "task": task.public()}
 
     def update_automation(
         self, task_id: str, changes: dict[str, Any]
     ) -> dict[str, Any]:
-        task = self.task_store.get(task_id)
-        if task is None:
-            return {"ok": False, "error": "not found"}
-        if "enabled" in changes:
-            task.enabled = bool(changes["enabled"])
-        if changes.get("instructions") is not None:
-            task.instructions = changes["instructions"]
-        if changes.get("title") is not None:
-            task.title = changes["title"]
-        if changes.get("cron") is not None:
-            from croniter import croniter
+        with self.task_store.transaction():
+            task = self.task_store.get(task_id)
+            if task is None:
+                return {"ok": False, "error": "not found"}
+            if "enabled" in changes:
+                task.enabled = bool(changes["enabled"])
+            if changes.get("instructions") is not None:
+                task.instructions = changes["instructions"]
+            if changes.get("title") is not None:
+                task.title = changes["title"]
+            if changes.get("cron") is not None:
+                from croniter import croniter
 
-            if not croniter.is_valid(changes["cron"]):
-                return {"ok": False, "error": "invalid cron"}
-            task.schedule.cron, task.schedule.kind = changes["cron"], "cron"
-        if changes.get("revoke"):
-            # Revocation from the task detail page ("Allowed without asking … · Revoke").
-            # Human-only, like minting; the agent-facing update tool has no such field.
-            task.revoke_rule(str(changes["revoke"]))
-        self.task_store.save(task)
-        if changes.get("revoke"):
-            # A live run engine may still hold the revoked rule — reseed from the record.
-            for sid, engine in self._runtimes.engine_items():
-                owner = self.task_store.task_for_run_session(sid)
-                if owner is not None and owner.id == task.id:
-                    engine.permissions.task_rules = task.standing_rules()
-        return {"ok": True, "task": task.public()}
+                if not croniter.is_valid(changes["cron"]):
+                    return {"ok": False, "error": "invalid cron"}
+                task.schedule.cron, task.schedule.kind = changes["cron"], "cron"
+            if changes.get("revoke"):
+                # Revocation from the task detail page ("Allowed without asking … · Revoke").
+                # Human-only, like minting; the agent-facing update tool has no such field.
+                task.revoke_rule(str(changes["revoke"]))
+            self.task_store.save(task)
+            if changes.get("revoke"):
+                # A live run engine may still hold the revoked rule — reseed from the record.
+                for sid, engine in self._runtimes.engine_items():
+                    owner = self.task_store.task_for_run_session(sid)
+                    if owner is not None and owner.id == task.id:
+                        engine.permissions.task_rules = task.standing_rules()
+            return {"ok": True, "task": task.public()}
 
     def delete_automation(self, task_id: str) -> dict[str, Any]:
-        return {"ok": self.task_store.delete(task_id), "id": task_id}
+        with self.task_store.transaction():
+            return {"ok": self.task_store.delete(task_id), "id": task_id}
 
     def prepare_manual_run(self, task_id: str) -> dict[str, Any]:
         """Create a 'running' manual run and return its session, so the GUI can open it and
         drive the task LIVE over the normal session WS (you watch the agent + follow up). The
         automatic scheduler path stays headless (`_run_scheduled_task`)."""
-        task = self.task_store.get(task_id)
-        if task is None:
-            return {"ok": False, "error": "not found"}
-        Path(task.workspace).mkdir(parents=True, exist_ok=True)
-        run = TaskRun(
-            task_id=task.id, trigger="manual"
-        )  # status "running", session_id auto
-        self.task_store.add_run(run)
+        with self.task_store.transaction():
+            task = self.task_store.get(task_id)
+            if task is None:
+                return {"ok": False, "error": "not found"}
+            Path(task.workspace).mkdir(parents=True, exist_ok=True)
+            run = TaskRun(
+                task_id=task.id, trigger="manual"
+            )  # status "running", session_id auto
+            self.task_store.add_run(run)
         return {
             "ok": True,
             "run_id": run.run_id,
@@ -3096,6 +3536,27 @@ class SessionManager:
         latest = runs[0]
         return latest.status, latest.error
 
+    def _runtime_result_text(self, session_id: str) -> Optional[str]:
+        runtime_task = self.runtime_store.get_task_by_session(session_id)
+        if runtime_task is None:
+            return None
+        runs = self.runtime_store.list_task_runs(runtime_task.task_id)
+        if not runs:
+            return None
+        root = next(
+            (
+                run
+                for run in self.runtime_store.list_agent_runs(runs[0].task_run_id)
+                if run.parent_agent_run_id is None
+            ),
+            None,
+        )
+        output = root.output if root is not None else None
+        if not isinstance(output, dict):
+            return None
+        text = output.get("text")
+        return text if isinstance(text, str) and text else None
+
     def finalize_manual_run_session(self, session_id: str) -> Optional[dict[str, Any]]:
         """Finalize an automation run from the backend-owned session lifecycle."""
         if not session_id.startswith("__run__"):
@@ -3104,24 +3565,35 @@ class SessionManager:
         run = self.task_store.find_run(run_id)
         if run is None:
             return None
-        return self.finalize_manual_run(run.task_id, run.run_id)
+        return self.finalize_manual_run(run.task_id, run.run_id, _allow_active=True)
 
-    def finalize_manual_run(self, task_id: str, run_id: str) -> dict[str, Any]:
+    def finalize_manual_run(
+        self, task_id: str, run_id: str, *, _allow_active: bool = False
+    ) -> dict[str, Any]:
         """Mark a manual run complete once its first turn finished (the WS already saved the
         session). Pulls result text + artifacts from the persisted transcript/workspace.
         """
-        run = next(
-            (r for r in self.task_store.runs(task_id) if r.run_id == run_id), None
-        )
-        task = self.task_store.get(task_id)
-        if run is None or task is None:
-            return {"ok": False, "error": "not found"}
-        if run.status == "running":
+        with self.task_store.transaction():
+            run = next(
+                (r for r in self.task_store.runs(task_id) if r.run_id == run_id), None
+            )
+            task = self.task_store.get(task_id)
+            if run is None or task is None:
+                return {"ok": False, "error": "not found"}
+            if run.status != "running":
+                return {"ok": True, "run": run.to_dict()}
+            if not _allow_active and self.is_running(run.session_id):
+                return {"ok": False, "error": "run is still active", "run": run.to_dict()}
             runtime_status, runtime_error = self._runtime_outcome(run.session_id)
             if runtime_status in {"running", "waiting_approval"}:
                 return {"ok": False, "error": "run is still active", "run": run.to_dict()}
             record = self.session_store.load(run.session_id)
-            run.result_text = _last_assistant_text(record.messages) if record else None
+            runtime_text = self._runtime_result_text(run.session_id)
+            run.result_text = (
+                runtime_text
+                if runtime_status == "completed" and runtime_text is not None
+                else _last_assistant_text(record.messages) if record else None
+            )
             run.artifacts = _recent_files(task.workspace, since=run.started_at)
             # Legacy/manual callers may not have used tracked_engine_events. For normal GUI runs,
             # the runtime record is authoritative. A persisted error/interruption notice is the
@@ -3138,34 +3610,47 @@ class SessionManager:
             run.status = "ok" if succeeded else "error"
             run.error = None if succeeded else (runtime_error or (notice or {}).get("text") or "run failed")
             run.finished_at = _epoch()
-            self.task_store.add_run(run)
-            task.last_run, task.last_status = run.finished_at, run.status
-            task.run_count += 1
-            self.task_store.save(task)
-        return {"ok": True, "run": run.to_dict()}
+            self.task_store.complete_run(run)
+            return {"ok": True, "run": run.to_dict()}
 
-    def save(self, session_id: str, engine: TurnEngine) -> None:
+    def _finalize_recoverable_automation_runs(self) -> None:
+        """Finish runs whose runtime and final transcript both survived a crash."""
+        for task in self.task_store.list():
+            for run in self.task_store.runs(task.id):
+                if run.status != "running":
+                    continue
+                if self._runtime_outcome(run.session_id)[0] != "completed":
+                    continue
+                self.finalize_manual_run(task.id, run.run_id)
+
+    def save(self, session_id: str, engine: TurnEngine) -> bool:
         executor = getattr(engine, "executor", None)
         workspace = os.path.realpath(str(executor.cwd)) if executor else ""
-        existing = self.session_store.load(session_id)
-        project_id = existing.project_id if existing else None
-        if not project_id and workspace:
-            project = self.session_store.get_project_by_workspace(workspace)
-            project_id = project.project_id if project else None
-        self.session_store.save(
-            SessionRecord(
-                session_id=session_id,
-                workspace=workspace,
-                model=engine.model,
-                mode=engine.permissions.mode.value,
-                messages=engine.messages,
-                title=title_from(engine.messages),
-                agent=getattr(engine, "agent_name", "code"),
-                extra_roots=self._extra_roots_of(engine),
-                grants=_grants_of(engine),
-                project_id=project_id,
+        with self._session_persistence_lock:
+            if self.is_session_deleted(session_id):
+                return False
+            if self._runtimes.engine(session_id) is not engine:
+                return False
+            existing = self.session_store.load(session_id)
+            project_id = existing.project_id if existing else None
+            if not project_id and workspace:
+                project = self.session_store.get_project_by_workspace(workspace)
+                project_id = project.project_id if project else None
+            self.session_store.save(
+                SessionRecord(
+                    session_id=session_id,
+                    workspace=workspace,
+                    model=engine.model,
+                    mode=engine.permissions.mode.value,
+                    messages=engine.messages,
+                    title=title_from(engine.messages),
+                    agent=getattr(engine, "agent_name", "code"),
+                    extra_roots=self._extra_roots_of(engine),
+                    grants=_grants_of(engine),
+                    project_id=project_id,
+                )
             )
-        )
+            return True
 
     @staticmethod
     def _apply_grants(engine: TurnEngine, grants: dict[str, Any]) -> None:
@@ -3201,6 +3686,8 @@ class SessionManager:
         from the user-message count — steering injections also land as role "user", and
         counting them would silently suppress titling on a steered first turn. A restart
         forgetting the counter is harmless: renamed/auto_title still gate re-titling."""
+        if self._closing or self.is_session_deleted(session_id):
+            return
         if session_id.startswith("__"):
             return
         engine = self._runtimes.engine(session_id)
@@ -3274,6 +3761,8 @@ class SessionManager:
                 return
             if not title or len(title) > 80:
                 return
+            if self.is_session_deleted(session_id):
+                return
             if self.session_store.set_auto_title(session_id, title[:60]):
                 # Best-effort nudge for any live viewer; the sidebar's poll and
                 # post-turn refresh pick the new title up regardless.
@@ -3297,6 +3786,8 @@ class SessionManager:
         """The directories this session can touch: primary scratch first, then added folders.
         Reads the live engine when one is running; otherwise reconstructs from persisted state.
         """
+        if self.is_session_deleted(session_id):
+            return []
         engine = self._runtimes.engine(session_id)
         if engine is not None and getattr(engine, "roots", None):
             return [
@@ -3348,93 +3839,105 @@ class SessionManager:
         if not p.is_dir():
             return {"ok": False, "error": f"not a directory: {path}"}
         resolved = p.resolve()
-        engine = self._runtimes.engine(session_id)
-        if engine is not None and getattr(engine, "roots", None) is not None:
-            if any(r.path == resolved for r in engine.roots):
-                # already present: just update its access level
-                for r in engine.roots:
-                    if r.path == resolved:
-                        r.writable = bool(writable)
-            else:
-                engine.roots.append(RootDir(path=resolved, writable=bool(writable)))
-            self.session_store.set_extra_roots(session_id, self._extra_roots_of(engine))
-        else:
-            # A brand-new conversation has no record yet (it's only saved after the first turn) —
-            # create one now so set_extra_roots has a row to update and the folder survives.
-            if self.session_store.load(session_id) is None:
-                self.session_store.save(
-                    SessionRecord(
-                        session_id=session_id,
-                        workspace=self._provision_scratch(session_id),
-                        model=self.model,
-                        mode=self.mode.value,
-                        messages=[],
-                        agent="link",  # folder access is a Smallink affordance
-                    )
+        with self._session_build_lock(session_id), self._session_persistence_lock:
+            if self.is_session_deleted(session_id):
+                return {"ok": False, "error": "session is being deleted"}
+            engine = self._runtimes.engine(session_id)
+            if engine is not None and getattr(engine, "roots", None) is not None:
+                if any(r.path == resolved for r in engine.roots):
+                    # already present: just update its access level
+                    for r in engine.roots:
+                        if r.path == resolved:
+                            r.writable = bool(writable)
+                else:
+                    engine.roots.append(RootDir(path=resolved, writable=bool(writable)))
+                self.session_store.set_extra_roots(
+                    session_id, self._extra_roots_of(engine)
                 )
-            extra = [r for r in self.get_roots(session_id) if not r["primary"]]
-            extra = [r for r in extra if Path(r["path"]).resolve() != resolved]
-            extra.append(
-                {
-                    "path": str(resolved),
-                    "writable": bool(writable),
-                    "label": resolved.name,
-                }
-            )
-            self.session_store.set_extra_roots(
-                session_id,
-                [
+            else:
+                # A brand-new conversation has no record yet (it's only saved after the first
+                # turn) — create one now so the folder survives. The tombstone check and all row
+                # writes share the delete/save critical section, so cleanup cannot be undone.
+                if self.session_store.load(session_id) is None:
+                    self.session_store.save(
+                        SessionRecord(
+                            session_id=session_id,
+                            workspace=self._provision_scratch(session_id),
+                            model=self.model,
+                            mode=self.mode.value,
+                            messages=[],
+                            agent="link",  # folder access is a Smallink affordance
+                        )
+                    )
+                extra = [r for r in self.get_roots(session_id) if not r["primary"]]
+                extra = [r for r in extra if Path(r["path"]).resolve() != resolved]
+                extra.append(
                     {
-                        "path": r["path"],
-                        "writable": r["writable"],
-                        "label": r.get("label", ""),
+                        "path": str(resolved),
+                        "writable": bool(writable),
+                        "label": resolved.name,
                     }
-                    for r in extra
-                ],
-            )
-        self.session_store.touch_workspace(str(resolved))
-        return {"ok": True, "roots": self.get_roots(session_id)}
+                )
+                self.session_store.set_extra_roots(
+                    session_id,
+                    [
+                        {
+                            "path": r["path"],
+                            "writable": r["writable"],
+                            "label": r.get("label", ""),
+                        }
+                        for r in extra
+                    ],
+                )
+            self.session_store.touch_workspace(str(resolved))
+            return {"ok": True, "roots": self.get_roots(session_id)}
 
     def remove_root(self, session_id: str, path: str) -> dict[str, Any]:
         """Revoke a previously-added folder. The primary scratch cannot be removed."""
         resolved = Path(path).expanduser().resolve()
-        engine = self._runtimes.engine(session_id)
-        if engine is not None and getattr(engine, "roots", None):
-            if engine.roots and engine.roots[0].path == resolved:
-                return {
-                    "ok": False,
-                    "error": "cannot remove the primary scratch directory",
-                }
-            engine.roots[:] = [r for r in engine.roots if r.path != resolved]
-            self.session_store.set_extra_roots(session_id, self._extra_roots_of(engine))
-        else:
-            current = self.get_roots(session_id)
-            if (
-                current
-                and current[0]["primary"]
-                and Path(current[0]["path"]).resolve() == resolved
-            ):
-                return {
-                    "ok": False,
-                    "error": "cannot remove the primary scratch directory",
-                }
-            extra = [
-                r
-                for r in current
-                if not r["primary"] and Path(r["path"]).resolve() != resolved
-            ]
-            self.session_store.set_extra_roots(
-                session_id,
-                [
-                    {
-                        "path": r["path"],
-                        "writable": r["writable"],
-                        "label": r.get("label", ""),
+        with self._session_build_lock(session_id), self._session_persistence_lock:
+            if self.is_session_deleted(session_id):
+                return {"ok": False, "error": "session is being deleted"}
+            engine = self._runtimes.engine(session_id)
+            if engine is not None and getattr(engine, "roots", None):
+                if engine.roots and engine.roots[0].path == resolved:
+                    return {
+                        "ok": False,
+                        "error": "cannot remove the primary scratch directory",
                     }
-                    for r in extra
-                ],
-            )
-        return {"ok": True, "roots": self.get_roots(session_id)}
+                engine.roots[:] = [r for r in engine.roots if r.path != resolved]
+                self.session_store.set_extra_roots(
+                    session_id, self._extra_roots_of(engine)
+                )
+            else:
+                current = self.get_roots(session_id)
+                if (
+                    current
+                    and current[0]["primary"]
+                    and Path(current[0]["path"]).resolve() == resolved
+                ):
+                    return {
+                        "ok": False,
+                        "error": "cannot remove the primary scratch directory",
+                    }
+                extra = [
+                    r
+                    for r in current
+                    if not r["primary"]
+                    and Path(r["path"]).resolve() != resolved
+                ]
+                self.session_store.set_extra_roots(
+                    session_id,
+                    [
+                        {
+                            "path": r["path"],
+                            "writable": r["writable"],
+                            "label": r.get("label", ""),
+                        }
+                        for r in extra
+                    ],
+                )
+            return {"ok": True, "roots": self.get_roots(session_id)}
 
     def session_messages(self, session_id: str) -> list[dict[str, Any]]:
         # A live engine's in-memory thread is authoritative: mid-turn it's ahead of the
@@ -3683,7 +4186,10 @@ class SessionManager:
     def rename_session(self, session_id: str, title: str) -> dict[str, Any]:
         if session_id.startswith("__"):
             return {"ok": False, "error": "internal sessions cannot be renamed"}
-        ok = self.session_store.rename(session_id, title)
+        with self._session_persistence_lock:
+            if self.is_session_deleted(session_id):
+                return {"ok": False, "error": "session is being deleted"}
+            ok = self.session_store.rename(session_id, title)
         return {
             "ok": ok,
             "session_id": session_id,
@@ -3699,40 +4205,104 @@ class SessionManager:
     ) -> dict[str, Any]:
         if session_id.startswith("__"):
             return {"ok": False, "error": "internal sessions cannot be modified here"}
-        ok = self.session_store.set_flags(session_id, pinned=pinned, archived=archived)
+        with self._session_persistence_lock:
+            if self.is_session_deleted(session_id):
+                return {"ok": False, "error": "session is being deleted"}
+            ok = self.session_store.set_flags(
+                session_id, pinned=pinned, archived=archived
+            )
         return {"ok": ok, "session_id": session_id}
 
     def delete_session(self, session_id: str) -> dict[str, Any]:
         if session_id.startswith("__"):
             return {"ok": False, "error": "internal sessions cannot be deleted here"}
-        self._runtimes.discard(session_id)
-        record = self.session_store.load(session_id)
-        ok = self.session_store.delete(session_id)
-        # Deleting a session is the one implicit unsubscribe (otherwise subscriptions are permanent).
-        self.subscriptions.remove_session(session_id)
-        # ...and releases any Slack threads it owned (§31): the next tag there spawns fresh.
-        self.mention_sessions.remove_session(session_id)
-        # ...and drops its per-session connector overrides (§4.2, like subscriptions).
-        self.session_connections.remove_session(session_id)
-        # ...and closes its pending Inbox items — an orphaned approval/question can never be
-        # meaningfully answered (owner call, 2026-07-03).
-        self.inbox.resolve_session(session_id)
-        # ...and its scratch dir. STRICTLY scoped: only a directory inside scratch_base is
-        # removed — a real project folder the user picked is never touched.
-        if ok and record and record.workspace:
-            scratch = self.scratch_base().resolve()
-            ws = Path(record.workspace)
-            try:
-                resolved = ws.resolve()
-                if (
-                    resolved.is_relative_to(scratch)
-                    and resolved != scratch
-                    and resolved.is_dir()
-                ):
-                    shutil.rmtree(resolved)
-            except OSError:
-                pass  # a stale/foreign path must not fail the delete
-        return {"ok": ok, "session_id": session_id}
+        build_lock = self._session_build_lock(session_id)
+        with build_lock:
+            with self._session_persistence_lock:
+                record = self.session_store.load(session_id)
+                live_runtime = self._runtimes.engine(session_id) is not None
+                if record is not None or live_runtime:
+                    self._mark_session_deleted(session_id, record=record)
+                ok = self.session_store.delete(session_id)
+            # Deleting a session is the one implicit unsubscribe (otherwise subscriptions are permanent).
+            self.subscriptions.remove_session(session_id)
+            # ...and releases any Slack threads it owned (§31): the next tag there spawns fresh.
+            self.mention_sessions.remove_session(session_id)
+            # ...and drops its per-session connector overrides (§4.2, like subscriptions).
+            self.session_connections.remove_session(session_id)
+            # ...and closes its pending Inbox items — an orphaned approval/question can never be
+            # meaningfully answered (owner call, 2026-07-03).
+            self.inbox.resolve_session(session_id)
+            engine = self._runtimes.engine(session_id)
+            if engine is not None:
+                engine.request_interrupt()
+            if not self.is_running(session_id):
+                self._finalize_deleted_session(session_id)
+            return {
+                "ok": ok or live_runtime,
+                "session_id": session_id,
+            }
+
+    def is_session_deleted(self, session_id: str) -> bool:
+        with self._session_persistence_lock:
+            return session_id in self._deleted_sessions
+
+    def _mark_session_deleted(
+        self, session_id: str, *, record: Optional[SessionRecord] = None
+    ) -> None:
+        self._deleted_sessions.add(session_id)
+        workspace = ""
+        if record is not None:
+            workspace = record.workspace or ""
+        if not workspace:
+            engine = self._runtimes.engine(session_id)
+            if engine is not None:
+                executor = getattr(engine, "executor", None)
+                if executor is not None and getattr(executor, "cwd", None):
+                    workspace = str(executor.cwd)
+                elif getattr(engine, "roots", None):
+                    workspace = str(engine.roots[0].path)
+        scratch = self._owned_scratch_dir(workspace)
+        if scratch is not None:
+            self._deleted_scratch[session_id] = scratch
+
+    def _finalize_deleted_session(self, session_id: str) -> None:
+        with self._session_persistence_lock:
+            scope = self._runtimes.pop(session_id)
+            scratch = self._deleted_scratch.pop(session_id, None)
+        if scope is not None:
+            scope.close()
+        if scratch is not None:
+            self._delete_scratch_dir(scratch)
+        with self._session_persistence_lock:
+            # A defensive final delete closes the gap against any legacy/direct store writer that
+            # did not consult the process-local tombstone while scratch cleanup was in progress.
+            self.session_store.delete(session_id)
+            # Keep the tombstone for this process lifetime. Session ids are opaque UUIDs, and a
+            # stale WebSocket/request must never be able to recreate an explicitly deleted id.
+            self._engine_build_locks.pop(session_id, None)
+
+    def _owned_scratch_dir(self, workspace: str) -> Optional[str]:
+        if not workspace:
+            return None
+        scratch = self.scratch_base().resolve()
+        try:
+            resolved = Path(workspace).resolve()
+        except OSError:
+            return None
+        if (
+            resolved.is_relative_to(scratch)
+            and resolved != scratch
+            and resolved.is_dir()
+        ):
+            return str(resolved)
+        return None
+
+    def _delete_scratch_dir(self, workspace: str) -> None:
+        try:
+            shutil.rmtree(workspace)
+        except OSError:
+            pass
 
     # -- provider proxy ---------------------------------------------------------
     def provider_complete(self, model, messages, tools=None):
@@ -3880,10 +4450,20 @@ class SessionManager:
         return SkillStore(self._data_base, workspace=resolved)
 
     def _invalidate_idle_skill_runtimes(self) -> None:
-        for session_id, _engine in list(self._runtimes.engine_items()):
-            if self.is_running(session_id):
-                continue
-            self._runtimes.discard(session_id)
+        stale_scopes = []
+        # Claim and invalidation share this lock. A turn therefore either claims the existing
+        # runtime first (and it is kept), or sees it atomically detached and rebuilds with the
+        # refreshed skill inventory. Close resources after the lock is released.
+        with self._session_persistence_lock:
+            for session_id, _engine in list(self._runtimes.engine_items()):
+                scope = self._runtimes.scope(session_id)
+                if scope is None or scope.claimed:
+                    continue
+                popped = self._runtimes.pop(session_id)
+                if popped is not None:
+                    stale_scopes.append(popped)
+        for scope in stale_scopes:
+            scope.close()
 
     def list_skills(self, workspace: Optional[str] = None) -> dict[str, Any]:
         loader = self._skill_loader(workspace)

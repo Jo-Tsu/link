@@ -64,6 +64,15 @@ import { useI18n } from "./i18n";
 import { shouldStartWindowDrag } from "./windowDrag";
 import { useAgentLifecycle } from "./useAgentLifecycle";
 import { projectSessionEvent } from "./sessionEventProjector";
+import {
+  activeRunContextForSession,
+  bindPendingSessionPrompt,
+  bindRunContext,
+  consumePendingSessionPrompt,
+  runTaskOrNull,
+  type PendingSessionPrompts,
+  type RunSessionContext,
+} from "./runContext";
 
 const ScheduledView = lazy(() =>
   import("./components/ScheduledView").then((module) => ({ default: module.ScheduledView })),
@@ -222,7 +231,7 @@ export function App() {
   // Automation-run context (§ owner ask 2026-07-04): which task an open __run__ session belongs
   // to, driving the banner + "Back to runs". Best-effort — a run session without context still
   // shows a generic banner (detected by its __run__ id).
-  const [runContext, setRunContext] = useState<{ id: string; title: string } | null>(null);
+  const [runContext, setRunContext] = useState<RunSessionContext | null>(null);
   // Which automation the Automations surface opens on (set by the banner's Back link
   // or a sidebar Scheduled-band click). Cleared on leaving the surface: a remembered
   // id going stale (e.g. the automation was deleted) reopened a dead detail —
@@ -246,6 +255,7 @@ export function App() {
   >("session");
   const [projectViewId, setProjectViewId] = useState<string | null>(null);
   const [appViewId, setAppViewId] = useState<string | null>(null);
+  const activeRunContext = activeRunContextForSession(sessionId, runContext);
   // A remembered Scheduled-detail target must not outlive the surface (see the
   // scheduledOpenId comment above): nav re-entry lands on the list, never a
   // possibly-deleted automation's dead detail.
@@ -351,12 +361,17 @@ export function App() {
     unattendedRef.current = on;
     setUnattendedState(on);
   }, []);
-  const activateSession = (nextSessionId: string, loadingHistory = false) => {
+  const activateSession = (
+    nextSessionId: string,
+    loadingHistory = false,
+    nextRunContext: RunSessionContext | null = null,
+  ) => {
     activeSessionIdRef.current = nextSessionId;
     transcriptRevisionRef.current += 1;
     sessionRef.current?.close();
     sessionRef.current = null;
     lifecycleActions.reset();
+    setRunContext(nextRunContext);
     setSessionInbox([]);
     setItems([]);
     setTodo([]);
@@ -439,7 +454,7 @@ export function App() {
 
   const scrollRef = useRef<HTMLDivElement | null>(null);
   // A prompt to auto-send once the next session connects (used by "Run now").
-  const pendingPromptRef = useRef<string | null>(null);
+  const pendingPromptRef = useRef<PendingSessionPrompts>({});
   // The in-flight manual run to finalize after its first turn ({taskId, runId, sessionId}).
 
   // Fetch ALL sessions + known projects so the sidebar can group them.
@@ -710,12 +725,15 @@ export function App() {
         if (activeSessionIdRef.current !== connectedSessionId) return;
         lifecycleActions.onConnected();
         // Auto-send the task prompt once a "Run now" session connects.
-        const p = pendingPromptRef.current;
-        if (p) {
-          pendingPromptRef.current = null;
-          updateItems((prev) => [...prev, { kind: "user", text: p, ts: Date.now() / 1000 }]);
+        const { nextPendingPrompts, prompt } = consumePendingSessionPrompt(
+          connectedSessionId,
+          pendingPromptRef.current,
+        );
+        pendingPromptRef.current = nextPendingPrompts;
+        if (prompt) {
+          updateItems((prev) => [...prev, { kind: "user", text: prompt, ts: Date.now() / 1000 }]);
           lifecycleActions.onTurnRequested();
-          sessionRef.current?.userMessage(p);
+          sessionRef.current?.userMessage(prompt);
         }
       },
       onReconnect: () => {
@@ -866,23 +884,23 @@ export function App() {
   const approve = (decision: ApprovalDecision) => {
     updateItems((p) => resolveLastApproval(p, decision));
     dropSessionInbox("approval");
-    sessionRef.current?.approve(decision);
+    sessionRef.current?.approve(decision, pendingApproval?.promptId);
   };
   const respondPlan = (approved: boolean, mode?: string, feedback?: string) => {
     updateItems((p) => resolveLastPlan(p, approved ? "approved" : "rejected"));
     dropSessionInbox("plan");
-    sessionRef.current?.respondPlan(approved, mode, feedback);
+    sessionRef.current?.respondPlan(approved, mode, feedback, pendingPlan?.promptId);
     if (approved && mode) setMode(mode); // the server flips the live engine to this mode
   };
   const respondDirectory = (granted: boolean, path?: string, writable?: boolean) => {
     updateItems((p) => resolveLastDirReq(p, granted ? "granted" : "denied"));
     dropSessionInbox("directory");
-    sessionRef.current?.respondDirectory(granted, path, writable);
+    sessionRef.current?.respondDirectory(granted, path, writable, pendingDirReq?.promptId);
   };
   const answerQuestion = (answer: string) => {
     updateItems((p) => resolveLastQuestion(p, answer));
     dropSessionInbox("question");
-    sessionRef.current?.respondQuestion(answer);
+    sessionRef.current?.respondQuestion(answer, pendingQuestion?.promptId);
   };
   const prefillComposer = (text: string, attachments?: Attachment[]) =>
     setComposerPrefill((p) => ({ text, attachments, nonce: (p?.nonce ?? 0) + 1 }));
@@ -927,7 +945,7 @@ export function App() {
   // manual Run-now — the user is already watching). Rides the app-wide /ws/events
   // stream; View run opens the run's live session.
   const [runToast, setRunToast] = useState<{
-    title: string; sessionId: string; workspace: string; agent: string; time: string;
+    title: string; sessionId: string; workspace: string; agent: string; time: string; taskId: string | null;
   } | null>(null);
   useEffect(() => {
     const stop = connectEvents((msg) => {
@@ -939,6 +957,7 @@ export function App() {
         workspace: d.workspace || "",
         agent: d.agent || "link",
         time: new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }),
+        taskId: d.task_id || null,
       });
       announceAutomationsChanged(); // the Scheduled band's badge is now stale
     });
@@ -951,7 +970,12 @@ export function App() {
   }, [runToast]);
 
   const openSessionFromInbox = (sid: string, ws: string, ag: string) => selectSession(sid, ws, ag);
-  const selectSession = async (id: string, ws: string, ag: string) => {
+  const selectSession = async (
+    id: string,
+    ws: string,
+    ag: string,
+    nextRunTask?: { id: string; title: string } | null,
+  ) => {
     setSurface("session"); // selecting a conversation always returns to the conversation view
     if (ag) setAgent(ag);
     if (!gatesWorkspace(ag)) setShowGate(false);
@@ -959,7 +983,7 @@ export function App() {
       setWorkspace(ws); // switch project to the session's folder
       setBranch(null);
     }
-    activateSession(id, true);
+    activateSession(id, true, bindRunContext(id, nextRunTask));
     await loadSessionHistory(id);
   };
   const switchAgent = async (name: string) => {
@@ -1074,23 +1098,34 @@ export function App() {
     ag: string,
     task?: { id: string; title: string },
   ) => {
-    setRunContext(task ?? null);
     setSurface("session");
     setShowGate(false);
-    selectSession(sessionId, ws, ag);
+    void selectSession(sessionId, ws, ag, task);
   };
   const runTaskNow = async (taskId: string, title?: string) => {
     const r = await runAutomation(taskId);
     if (!r || !r.ok) return;
-    pendingPromptRef.current = r.prompt;
+    pendingPromptRef.current = bindPendingSessionPrompt(
+      pendingPromptRef.current,
+      r.session_id,
+      r.prompt,
+    );
     openRunSession(r.session_id, r.workspace, r.agent, { id: taskId, title: title || "" });
   };
 
   const idle = items.length === 0 && !streaming;
-  const pendingApproval = [...items].reverse().find((i) => i.kind === "approval" && !i.resolved);
-  const pendingDirReq = [...items].reverse().find((i) => i.kind === "dirreq" && !i.resolved);
-  const pendingPlan = [...items].reverse().find((i) => i.kind === "planreq" && !i.resolved);
-  const pendingQuestion = [...items].reverse().find((i) => i.kind === "question" && !i.resolved);
+  const pendingApproval = [...items].reverse().find(
+    (i): i is Extract<Item, { kind: "approval" }> => i.kind === "approval" && !i.resolved,
+  );
+  const pendingDirReq = [...items].reverse().find(
+    (i): i is Extract<Item, { kind: "dirreq" }> => i.kind === "dirreq" && !i.resolved,
+  );
+  const pendingPlan = [...items].reverse().find(
+    (i): i is Extract<Item, { kind: "planreq" }> => i.kind === "planreq" && !i.resolved,
+  );
+  const pendingQuestion = [...items].reverse().find(
+    (i): i is Extract<Item, { kind: "question" }> => i.kind === "question" && !i.resolved,
+  );
   // Facts subtitle (§22): the session's FIXED facts, not controls — model (+ the
   // workspace folder for project-scoped sessions). Renders only once the session has history;
   // until then the model is still choosable in the composer, so there's no locked fact to state.
@@ -1237,7 +1272,12 @@ export function App() {
               className="text-[12.5px] text-accent font-medium"
               data-testid="toast-view-run"
               onClick={() => {
-                selectSession(runToast.sessionId, runToast.workspace, runToast.agent);
+                selectSession(
+                  runToast.sessionId,
+                  runToast.workspace,
+                  runToast.agent,
+                  runTaskOrNull(runToast.taskId, runToast.title),
+                );
                 setRunToast(null);
               }}
             >
@@ -1511,10 +1551,10 @@ export function App() {
                 <Icon name="clock" size={14} className="text-accent shrink-0" />
                 <span className="truncate text-muted">
                   {tr("Scheduled run")}
-                  {runContext?.title ? (
+                  {activeRunContext?.title ? (
                     <>
                       {" — "}
-                      <span className="text-ink font-medium">{runContext.title}</span>
+                      <span className="text-ink font-medium">{activeRunContext.title}</span>
                     </>
                   ) : null}{" "}
                   · {tr("started by an automation")}
@@ -1522,7 +1562,7 @@ export function App() {
                 <button
                   className="ml-auto shrink-0 text-accent font-medium hover:underline"
                   onClick={() => {
-                    if (runContext) setScheduledOpenId(runContext.id);
+                    if (activeRunContext) setScheduledOpenId(activeRunContext.id);
                     setSurface("scheduled");
                   }}
                 >
@@ -1649,7 +1689,7 @@ export function App() {
                 ) : !unattended && pendingDirReq?.kind === "dirreq" ? (
                   <DirectoryRequestCard item={pendingDirReq} onRespond={respondDirectory} />
                 ) : !unattended && pendingApproval?.kind === "approval" ? (
-                  <ApprovalCard item={pendingApproval} onApprove={approve} runTask={runContext} compact />
+                  <ApprovalCard item={pendingApproval} onApprove={approve} runTask={activeRunContext} compact />
                 ) : !unattended && pendingQuestion?.kind === "question" ? (
                   // Live ask_user in an attended session — answer inline (reuses the Inbox card UI).
                   <InboxItemCard

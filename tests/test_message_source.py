@@ -85,6 +85,7 @@ def test_inbound_builds_message_source(tmp_path, monkeypatch):
 
     async def fake_deliver(session_id, message, *, source=None):
         captured.append((session_id, message, source))
+        return True
 
     monkeypatch.setattr(mgr, "deliver_to_session", fake_deliver)
     mgr.subscriptions.subscribe("sA", "slack:C1")
@@ -246,6 +247,7 @@ def test_dm_message_source_kind_dm(tmp_path, monkeypatch):
 
     async def fake_deliver(session_id, message, *, source=None):
         captured.append((session_id, message, source))
+        return True
 
     monkeypatch.setattr(mgr, "deliver_to_session", fake_deliver)
     mgr.set_dm_session("sDM")

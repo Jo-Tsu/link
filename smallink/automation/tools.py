@@ -186,7 +186,8 @@ def scheduling_tools(
             agent=origin.get("agent", "link"),
             always_allowed_tools=grants,
         )
-        store.save(task)
+        with store.transaction():
+            store.save(task)
         return {
             "ok": True,
             "id": task.id,
@@ -205,25 +206,27 @@ def scheduling_tools(
     ):
         from croniter import croniter
 
-        task = store.get(id)
-        if task is None:
-            return {"error": f"no such task: {id}"}
-        if cron is not None:
-            if not croniter.is_valid(cron):
-                return {"error": f"invalid cron expression: {cron}"}
-            task.schedule.cron = cron
-            task.schedule.kind = "cron"
-        if enabled is not None:
-            task.enabled = bool(enabled)
-        if instructions is not None:
-            task.instructions = instructions
-        if title is not None:
-            task.title = title
-        store.save(task)
-        return {"ok": True, "task": task.public()}
+        with store.transaction():
+            task = store.get(id)
+            if task is None:
+                return {"error": f"no such task: {id}"}
+            if cron is not None:
+                if not croniter.is_valid(cron):
+                    return {"error": f"invalid cron expression: {cron}"}
+                task.schedule.cron = cron
+                task.schedule.kind = "cron"
+            if enabled is not None:
+                task.enabled = bool(enabled)
+            if instructions is not None:
+                task.instructions = instructions
+            if title is not None:
+                task.title = title
+            store.save(task)
+            return {"ok": True, "task": task.public()}
 
     def delete_scheduled_task(id):
-        return {"ok": store.delete(id), "id": id}
+        with store.transaction():
+            return {"ok": store.delete(id), "id": id}
 
     return [
         _gated(create_scheduled_task, _CREATE_SCHEMA, approval=True),

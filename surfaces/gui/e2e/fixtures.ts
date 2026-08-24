@@ -252,6 +252,38 @@ async function mockApi(page, state: State) {
     if (path === "/v1/memory/candidates" && method === "GET") {
       return route.fulfill({ json: { candidates: state.candidates } });
     }
+    if (path === "/v1/memory/candidates/confidence-summary") {
+      return route.fulfill({
+        json: {
+          total_pending: state.candidates.length,
+          tiers: {
+            high: state.candidates.filter((item) => Number(item.confidence) >= 0.9).length,
+            medium: 0,
+            low: 0,
+            unscored: 0,
+          },
+        },
+      });
+    }
+    if (path === "/v1/memory/governance/tasks") {
+      return route.fulfill({ json: { tasks: [] } });
+    }
+    if (path === "/v1/memory/governance/schedule") {
+      return route.fulfill({
+        json: {
+          enabled: false,
+          interval_minutes: 60,
+          batch_limit: 50,
+          last_run_at: null,
+          next_run_at: null,
+          last_result: null,
+          running: false,
+        },
+      });
+    }
+    if (path === "/v1/memory/usage-history") {
+      return route.fulfill({ json: { records: [] } });
+    }
     if (path === "/v1/memory/pipeline/run" && method === "POST") {
       state.candidates = [
         {

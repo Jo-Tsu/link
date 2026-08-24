@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import json
 import threading
+from contextlib import contextmanager
+from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
@@ -67,7 +69,51 @@ class TaskStore:
         self.path = str(path)
         self._lock = threading.RLock()
         self._conn = connect_sqlite(self.path)
+        self._tx_depth = 0
+        self._tx_savepoint_seq = 0
         self._init()
+
+    @contextmanager
+    def transaction(self) -> Iterator[None]:
+        """Serialize a compound read-modify-write operation as a real nested transaction."""
+        with self._lock:
+            savepoint: str | None = None
+            outermost = self._tx_depth == 0
+            self._tx_depth += 1
+            try:
+                if outermost:
+                    self._conn.execute("BEGIN")
+                else:
+                    savepoint = f"taskstore_sp_{self._tx_savepoint_seq}"
+                    self._tx_savepoint_seq += 1
+                    self._conn.execute(f"SAVEPOINT {savepoint}")
+                yield
+                if savepoint is not None:
+                    self._conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                elif outermost:
+                    self._conn.commit()
+            except Exception:
+                if savepoint is not None:
+                    self._conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                    self._conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                elif outermost:
+                    self._conn.rollback()
+                raise
+            finally:
+                self._tx_depth -= 1
+
+    def _write(self, fn: Callable[[], None]) -> None:
+        with self._lock:
+            if self._tx_depth > 0:
+                fn()
+                return
+            self._conn.execute("BEGIN")
+            try:
+                fn()
+            except Exception:
+                self._conn.rollback()
+                raise
+            self._conn.commit()
 
     def _init(self) -> None:
         with self._lock:
@@ -92,7 +138,7 @@ class TaskStore:
     def save(self, task: ScheduledTask) -> ScheduledTask:
         task.updated_at = _epoch_now()
         task.next_run = compute_next_run(task) if task.enabled else None
-        with self._lock:
+        def _save() -> None:
             self._conn.execute(
                 "INSERT OR REPLACE INTO scheduled_tasks (id, enabled, next_run, data) VALUES (?, ?, ?, ?)",
                 (
@@ -102,7 +148,7 @@ class TaskStore:
                     json.dumps(task.to_dict()),
                 ),
             )
-            self._conn.commit()
+        self._write(_save)
         return task
 
     def get(self, task_id: str) -> Optional[ScheduledTask]:
@@ -120,13 +166,18 @@ class TaskStore:
         return [ScheduledTask.from_dict(json.loads(r["data"])) for r in rows]
 
     def delete(self, task_id: str) -> bool:
-        with self._lock:
+        deleted = 0
+
+        def _delete() -> None:
+            nonlocal deleted
             cur = self._conn.execute(
                 "DELETE FROM scheduled_tasks WHERE id=?", (task_id,)
             )
             self._conn.execute("DELETE FROM task_runs WHERE task_id=?", (task_id,))
-            self._conn.commit()
-            return cur.rowcount > 0
+            deleted = cur.rowcount
+
+        self._write(_delete)
+        return deleted > 0
 
     def due(self, *, now: Optional[float] = None) -> list[ScheduledTask]:
         now = now if now is not None else _epoch_now()
@@ -139,12 +190,12 @@ class TaskStore:
 
     # -- runs -------------------------------------------------------------------
     def add_run(self, run: TaskRun) -> TaskRun:
-        with self._lock:
+        def _add() -> None:
             self._conn.execute(
                 "INSERT OR REPLACE INTO task_runs (run_id, task_id, started_at, data) VALUES (?, ?, ?, ?)",
                 (run.run_id, run.task_id, run.started_at, json.dumps(run.to_dict())),
             )
-            self._conn.commit()
+        self._write(_add)
         return run
 
     def find_run(self, run_id: str) -> Optional[TaskRun]:
@@ -170,6 +221,31 @@ class TaskStore:
             ).fetchall()
         return [TaskRun.from_dict(json.loads(r["data"])) for r in rows]
 
+    def complete_run(self, run: TaskRun) -> TaskRun:
+        """Persist a final run state and advance task stats exactly once.
+
+        Safe to call whether the run row already exists as `running` or is being created
+        here for the first time. If the owning task and run were both deleted concurrently,
+        this becomes a no-op so completion cannot resurrect deleted automation history.
+        """
+        with self.transaction():
+            existing = self.find_run(run.run_id)
+            task = self.get(run.task_id)
+            if existing is None and task is None:
+                return run
+            self.add_run(run)
+            should_count = (
+                task is not None
+                and run.status not in {"running", "skipped"}
+                and (existing is None or existing.status == "running")
+            )
+            if should_count:
+                task.last_run = run.finished_at or run.started_at
+                task.last_status = run.status
+                task.run_count += 1
+                self.save(task)
+        return run
+
     def recover_incomplete_runs(
         self,
         *,
@@ -179,7 +255,7 @@ class TaskStore:
         """Reconcile legacy automation history from the shared runtime store."""
         finished_at = _epoch_now()
         recovered = 0
-        with self._lock:
+        with self.transaction():
             rows = self._conn.execute(
                 "SELECT data FROM task_runs ORDER BY started_at"
             ).fetchall()
@@ -189,6 +265,10 @@ class TaskStore:
                     continue
                 shared_status = runtime_status(run.session_id) if runtime_status else None
                 if shared_status == "waiting_approval":
+                    continue
+                if shared_status == "completed":
+                    # The runtime may have committed immediately before the manual-run summary.
+                    # Keep it recoverable so SessionManager can finalize it from the transcript.
                     continue
                 run.status = "interrupted"
                 run.error = run.error or reason
@@ -217,7 +297,6 @@ class TaskStore:
                         ),
                     )
                 recovered += 1
-            self._conn.commit()
         return recovered
 
     def close(self) -> None:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import zipfile
 from pathlib import Path
 
@@ -282,3 +283,68 @@ def test_build_engine_code_has_agents_md_and_skills(tmp_path):
         assert engine.agent_name == "code"
     finally:
         engine.executor.close()
+
+
+def test_skill_runtime_invalidation_does_not_discard_a_concurrent_claim(tmp_path):
+    from smallink.server.manager import SessionManager
+
+    manager = SessionManager(workspace=None, data_dir=tmp_path / "data", provider=_Stub())
+    engine = manager.get_engine("skill-race", agent="chat")
+    assert engine is not None
+    entered = threading.Event()
+    release = threading.Event()
+    original_scope = manager._runtimes.scope
+    first_lookup = True
+
+    def blocking_scope(session_id):
+        nonlocal first_lookup
+        scope = original_scope(session_id)
+        if session_id == "skill-race" and first_lookup:
+            first_lookup = False
+            entered.set()
+            release.wait(timeout=5)
+        return scope
+
+    manager._runtimes.scope = blocking_scope
+    invalidated = threading.Event()
+    worker = threading.Thread(
+        target=lambda: (manager._invalidate_idle_skill_runtimes(), invalidated.set())
+    )
+    worker.start()
+    assert entered.wait(timeout=5)
+
+    claimed: list[bool] = []
+    claimant = threading.Thread(
+        target=lambda: claimed.append(
+            manager.try_mark_running("skill-race", engine=engine)
+        )
+    )
+    claimant.start()
+    assert not invalidated.wait(timeout=0.05)
+    release.set()
+    worker.join(timeout=5)
+    claimant.join(timeout=5)
+
+    # Whichever operation wins the shared lock is safe: invalidation may detach the idle
+    # engine first (claim then fails), or claim may win (runtime remains published).
+    if claimed == [True]:
+        assert manager._runtimes.engine("skill-race") is engine
+        manager.mark_idle("skill-race")
+    else:
+        assert claimed == [False]
+        assert manager._runtimes.engine("skill-race") is None
+
+
+def test_skill_runtime_invalidation_preserves_an_already_claimed_runtime(tmp_path):
+    from smallink.server.manager import SessionManager
+
+    manager = SessionManager(workspace=None, data_dir=tmp_path / "data", provider=_Stub())
+    engine = manager.get_engine("active-skill-session", agent="chat")
+    assert engine is not None
+    assert manager.try_mark_running("active-skill-session", engine=engine) is True
+
+    manager._invalidate_idle_skill_runtimes()
+
+    assert manager._runtimes.engine("active-skill-session") is engine
+    assert manager.is_running("active-skill-session") is True
+    manager.mark_idle("active-skill-session")

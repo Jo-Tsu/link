@@ -92,7 +92,9 @@ class InboxStore:
         self.path = Path(path) if path else None
         self._lock = threading.Lock()
         self._items: dict[str, InboxItem] = {}
-        self._waiters: dict[str, asyncio.Event] = {}
+        self._waiters: dict[
+            str, list[tuple[asyncio.AbstractEventLoop, asyncio.Event]]
+        ] = {}
         self._load()
 
     # -- persistence ------------------------------------------------------------
@@ -130,30 +132,36 @@ class InboxStore:
     ) -> InboxItem:
         # Idempotent by (session_id, tool_call_id): a durable resume re-raises the same prompt, and
         # must reuse the existing (possibly already-resolved) item rather than re-prompt.
-        if tool_call_id:
-            existing = self.for_tool_call(session_id, tool_call_id)
-            if existing is not None:
-                return existing
-        item = InboxItem(
-            id=uuid.uuid4().hex,
-            session_id=session_id,
-            kind=kind,
-            title=title,
-            body=body,
-            inbox=inbox,
-            visibility=visibility,
-            data=dict(data or {}),
-            options=list(options or []),
-            allow_text=bool(allow_text),
-            multi=bool(multi),
-            tool_call_id=tool_call_id,
-        )
         with self._lock:
+            if tool_call_id:
+                existing = self._for_tool_call_locked(session_id, tool_call_id)
+                if existing is not None:
+                    return existing
+            item = InboxItem(
+                id=uuid.uuid4().hex,
+                session_id=session_id,
+                kind=kind,
+                title=title,
+                body=body,
+                inbox=inbox,
+                visibility=visibility,
+                data=dict(data or {}),
+                options=list(options or []),
+                allow_text=bool(allow_text),
+                multi=bool(multi),
+                tool_call_id=tool_call_id,
+            )
             self._items[item.id] = item
             self._save()
         return item
 
     def for_tool_call(self, session_id: str, tool_call_id: str) -> Optional[InboxItem]:
+        with self._lock:
+            return self._for_tool_call_locked(session_id, tool_call_id)
+
+    def _for_tool_call_locked(
+        self, session_id: str, tool_call_id: str
+    ) -> Optional[InboxItem]:
         for i in self._items.values():
             if i.session_id == session_id and i.tool_call_id == tool_call_id:
                 return i
@@ -303,9 +311,37 @@ class InboxStore:
             item.resolution = resolution
             item.resolved_at = _now()
             self._save()
-        waiter = self._waiters.get(item_id)
-        if waiter is not None:
-            waiter.set()
+            waiters = tuple(self._waiters.get(item_id, ()))
+        stale_waiters: list[tuple[asyncio.AbstractEventLoop, asyncio.Event]] = []
+        for waiter_loop, waiter in waiters:
+            try:
+                running_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                running_loop = None
+            if waiter_loop is not None and waiter_loop.is_closed():
+                stale_waiters.append((waiter_loop, waiter))
+                continue
+            if (
+                waiter_loop is not None
+                and waiter_loop is not running_loop
+                and waiter_loop.is_running()
+            ):
+                try:
+                    waiter_loop.call_soon_threadsafe(waiter.set)
+                except RuntimeError:
+                    stale_waiters.append((waiter_loop, waiter))
+            else:
+                try:
+                    waiter.set()
+                except RuntimeError:
+                    stale_waiters.append((waiter_loop, waiter))
+        if stale_waiters:
+            with self._lock:
+                current = self._waiters.get(item_id)
+                if current is not None:
+                    current[:] = [entry for entry in current if entry not in stale_waiters]
+                if not current:
+                    self._waiters.pop(item_id, None)
         return True
 
     def resolve_session(
@@ -323,13 +359,26 @@ class InboxStore:
     async def wait(self, item_id: str) -> str:
         """Await an item's resolution; returns the resolution string. Used by the approver to
         suspend the agent until a human answers (from any surface)."""
-        item = self._items.get(item_id)
-        if item is not None and item.state == STATE_RESOLVED:
-            return item.resolution or ""
-        ev = self._waiters.setdefault(item_id, asyncio.Event())
-        await ev.wait()
-        resolved = self._items.get(item_id)
-        return (resolved.resolution if resolved else "") or ""
+        loop = asyncio.get_running_loop()
+        ev = asyncio.Event()
+        waiter = (loop, ev)
+        with self._lock:
+            item = self._items.get(item_id)
+            if item is not None and item.state == STATE_RESOLVED:
+                return item.resolution or ""
+            self._waiters.setdefault(item_id, []).append(waiter)
+        try:
+            await ev.wait()
+            with self._lock:
+                resolved = self._items.get(item_id)
+                return (resolved.resolution if resolved else "") or ""
+        finally:
+            with self._lock:
+                current = self._waiters.get(item_id)
+                if current is not None:
+                    current[:] = [entry for entry in current if entry is not waiter]
+                if not current:
+                    self._waiters.pop(item_id, None)
 
     # -- resume reconciliation --------------------------------------------------
     def reconcile_on_resume(self, session_id: str) -> dict:

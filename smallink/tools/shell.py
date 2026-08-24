@@ -117,21 +117,30 @@ class _BackgroundTask:
         return new
 
     def kill(self) -> None:
-        if self.proc.poll() is not None:
-            return
-        if _IS_WINDOWS:
-            try:
-                subprocess.run(
-                    ["taskkill", "/F", "/T", "/PID", str(self.proc.pid)],
-                    capture_output=True,
-                )
-            except (OSError, subprocess.SubprocessError):
-                pass
-            return
+        if self.proc.poll() is None:
+            if _IS_WINDOWS:
+                try:
+                    subprocess.run(
+                        ["taskkill", "/F", "/T", "/PID", str(self.proc.pid)],
+                        capture_output=True,
+                    )
+                except (OSError, subprocess.SubprocessError):
+                    pass
+            else:
+                try:
+                    os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
+                except (ProcessLookupError, PermissionError, OSError):
+                    pass
         try:
-            os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
-        except (ProcessLookupError, PermissionError, OSError):
+            self.proc.wait(timeout=5)
+        except (subprocess.TimeoutExpired, OSError):
             pass
+        self._reader.join(timeout=1)
+        if self.proc.stdout is not None and not self.proc.stdout.closed:
+            try:
+                self.proc.stdout.close()
+            except OSError:
+                pass
 
 
 class LocalExecutor(Executor):
@@ -341,10 +350,6 @@ class LocalExecutor(Executor):
         if task is None:
             return {"error": f"unknown task: {task_id}"}
         task.kill()
-        try:
-            task.proc.wait(timeout=5)
-        except (subprocess.TimeoutExpired, OSError):
-            pass
         return {
             "task_id": task_id,
             "status": "running" if task.proc.poll() is None else "killed",
@@ -394,6 +399,9 @@ class LocalExecutor(Executor):
         self._interrupt()
 
     def close(self) -> None:
+        for task in self._bg_tasks.values():
+            task.kill()
+        self._bg_tasks.clear()
         if self._is_windows:
             # Kill the whole tree — a timed-out command may have spawned children that
             # `terminate()` (the shell only) would orphan. Then reap so `poll()` reliably
@@ -409,6 +417,7 @@ class LocalExecutor(Executor):
                 self._proc.wait(timeout=5)
             except (subprocess.TimeoutExpired, OSError):
                 pass
+            self._close_pipes()
             return
         try:
             os.killpg(os.getpgid(self._proc.pid), signal.SIGTERM)
@@ -424,6 +433,16 @@ class LocalExecutor(Executor):
             try:
                 self._proc.wait(timeout=1)
             except (subprocess.TimeoutExpired, OSError):
+                pass
+        self._close_pipes()
+
+    def _close_pipes(self) -> None:
+        for pipe in (self._proc.stdin, self._proc.stdout, self._proc.stderr):
+            if pipe is None or pipe.closed:
+                continue
+            try:
+                pipe.close()
+            except OSError:
                 pass
 
     def _result(

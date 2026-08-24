@@ -6,7 +6,7 @@
  * event and inference from legacy content events for backward compatibility.
  */
 
-import { useCallback, useReducer, useRef } from "react";
+import { useCallback, useEffect, useReducer, useRef } from "react";
 import type { WsEvent } from "./types";
 
 export type AgentPhase =
@@ -44,10 +44,19 @@ interface State {
   streamBuffer: string;
   reasoningBuffer: string;
   optimisticRestorePhase: AgentPhase | null;
+  bufferEpoch: number;
+  phaseEpoch: number;
 }
 
 type Action =
   | { type: "EVENT"; event: WsEvent }
+  | {
+      type: "FLUSH_BUFFERS";
+      streamBuffer: string;
+      reasoningBuffer: string;
+      bufferEpoch: number;
+      phaseEpoch: number;
+    }
   | { type: "CONNECTED" }
   | { type: "DISCONNECTED" }
   | { type: "TURN_REQUESTED" }
@@ -121,14 +130,24 @@ function reducer(state: State, action: Action): State {
         streamBuffer: "",
         reasoningBuffer: "",
         optimisticRestorePhase: null,
+        bufferEpoch: state.bufferEpoch + 1,
+        phaseEpoch: state.phaseEpoch + 1,
       };
     case "TURN_REQUESTED":
+      if (BUSY_PHASES.has(state.phase)) {
+        return {
+          ...state,
+          optimisticRestorePhase: state.phase,
+        };
+      }
       return {
         ...state,
-        phase: BUSY_PHASES.has(state.phase) ? state.phase : "starting",
-        streamBuffer: BUSY_PHASES.has(state.phase) ? state.streamBuffer : "",
-        reasoningBuffer: BUSY_PHASES.has(state.phase) ? state.reasoningBuffer : "",
+        phase: "starting",
+        streamBuffer: "",
+        reasoningBuffer: "",
         optimisticRestorePhase: state.phase,
+        bufferEpoch: state.bufferEpoch + 1,
+        phaseEpoch: state.phaseEpoch + 1,
       };
     case "RESET":
       return {
@@ -136,6 +155,26 @@ function reducer(state: State, action: Action): State {
         connected: false,
         streamBuffer: "",
         reasoningBuffer: "",
+        optimisticRestorePhase: null,
+        bufferEpoch: state.bufferEpoch + 1,
+        phaseEpoch: state.phaseEpoch + 1,
+      };
+    case "FLUSH_BUFFERS":
+      if (action.bufferEpoch !== state.bufferEpoch) return state;
+      const phase = action.phaseEpoch === state.phaseEpoch ? "thinking" : state.phase;
+      if (
+        state.phase === phase &&
+        state.streamBuffer === action.streamBuffer &&
+        state.reasoningBuffer === action.reasoningBuffer &&
+        state.optimisticRestorePhase === null
+      ) {
+        return state;
+      }
+      return {
+        ...state,
+        phase,
+        streamBuffer: action.streamBuffer,
+        reasoningBuffer: action.reasoningBuffer,
         optimisticRestorePhase: null,
       };
     case "EVENT": {
@@ -147,20 +186,17 @@ function reducer(state: State, action: Action): State {
           ...state,
           phase: ev.data.phase as AgentPhase,
           optimisticRestorePhase: null,
+          phaseEpoch: state.phaseEpoch + 1,
         };
       }
 
       const next = { ...state };
       const restoredReadyPhase = ev.type === "ready" ? readyPhase(ev.data) : null;
 
-      // Accumulate streaming text
-      if (ev.type === "assistant_delta") {
-        next.streamBuffer += ev.data?.text || ev.data?.delta || "";
-      } else if (ev.type === "reasoning_delta") {
-        next.reasoningBuffer += ev.data?.text || ev.data?.delta || "";
-      } else if (ev.type === "turn_start") {
+      if (ev.type === "turn_start") {
         next.streamBuffer = "";
         next.reasoningBuffer = "";
+        next.bufferEpoch += 1;
       } else if (
         ev.type === "assistant_message" ||
         ev.type === "error" ||
@@ -169,11 +205,13 @@ function reducer(state: State, action: Action): State {
       ) {
         next.streamBuffer = "";
         next.reasoningBuffer = "";
+        next.bufferEpoch += 1;
       } else if (ev.type === "input_rejected") {
         const restorePhase = state.optimisticRestorePhase ?? state.phase;
         if (restorePhase === "idle" && !BUSY_PHASES.has(state.phase)) {
           next.streamBuffer = "";
           next.reasoningBuffer = "";
+          next.bufferEpoch += 1;
         }
       }
 
@@ -190,6 +228,10 @@ function reducer(state: State, action: Action): State {
         }
       }
 
+      if (next.phase !== state.phase) {
+        next.phaseEpoch += 1;
+      }
+
       return next;
     }
   }
@@ -201,11 +243,33 @@ const INITIAL_STATE: State = {
   streamBuffer: "",
   reasoningBuffer: "",
   optimisticRestorePhase: null,
+  bufferEpoch: 0,
+  phaseEpoch: 0,
 };
 
 const BUSY_PHASES: Set<AgentPhase> = new Set([
   "starting", "thinking", "tool_pending", "awaiting_approval", "executing", "completing",
 ]);
+
+type ScheduledFrame = { id: number; kind: "raf" | "timeout" };
+
+function requestFlushFrame(callback: FrameRequestCallback): ScheduledFrame {
+  if (typeof window !== "undefined" && typeof window.requestAnimationFrame === "function") {
+    return { id: window.requestAnimationFrame(callback), kind: "raf" };
+  }
+  return {
+    id: globalThis.setTimeout(() => callback(Date.now()), 16) as unknown as number,
+    kind: "timeout",
+  };
+}
+
+function cancelFlushFrame(frame: ScheduledFrame) {
+  if (frame.kind === "raf" && typeof window !== "undefined" && typeof window.cancelAnimationFrame === "function") {
+    window.cancelAnimationFrame(frame.id);
+    return;
+  }
+  globalThis.clearTimeout(frame.id);
+}
 
 export function useAgentLifecycle(): [AgentLifecycle, LifecycleActions] {
   const [state, dispatch] = useReducer(reducer, INITIAL_STATE);
@@ -213,51 +277,95 @@ export function useAgentLifecycle(): [AgentLifecycle, LifecycleActions] {
   const reasonRef = useRef(state.reasoningBuffer);
   const phaseRef = useRef(state.phase);
   const optimisticRestoreRef = useRef(state.optimisticRestorePhase);
-  streamRef.current = state.streamBuffer;
-  reasonRef.current = state.reasoningBuffer;
+  const bufferEpochRef = useRef(state.bufferEpoch);
+  const phaseEpochRef = useRef(state.phaseEpoch);
+  const scheduledFlushRef = useRef<ScheduledFrame | null>(null);
   phaseRef.current = state.phase;
   optimisticRestoreRef.current = state.optimisticRestorePhase;
+  bufferEpochRef.current = state.bufferEpoch;
+  phaseEpochRef.current = state.phaseEpoch;
+
+  const cancelScheduledFlush = useCallback(() => {
+    const scheduled = scheduledFlushRef.current;
+    if (!scheduled) return;
+    scheduledFlushRef.current = null;
+    cancelFlushFrame(scheduled);
+  }, []);
+
+  const clearBuffers = useCallback(() => {
+    cancelScheduledFlush();
+    streamRef.current = "";
+    reasonRef.current = "";
+    bufferEpochRef.current += 1;
+  }, [cancelScheduledFlush]);
+
+  const scheduleBufferFlush = useCallback(() => {
+    if (scheduledFlushRef.current) return;
+    const bufferEpoch = bufferEpochRef.current;
+    const phaseEpoch = phaseEpochRef.current;
+    scheduledFlushRef.current = requestFlushFrame(() => {
+      scheduledFlushRef.current = null;
+      dispatch({
+        type: "FLUSH_BUFFERS",
+        streamBuffer: streamRef.current,
+        reasoningBuffer: reasonRef.current,
+        bufferEpoch,
+        phaseEpoch,
+      });
+    });
+  }, []);
+
+  useEffect(() => cancelScheduledFlush, [cancelScheduledFlush]);
 
   const handleEvent = useCallback((event: WsEvent) => {
     if (event.type === "assistant_delta") {
       streamRef.current += event.data?.text || event.data?.delta || "";
-    } else if (event.type === "reasoning_delta") {
+      phaseRef.current = "thinking";
+      optimisticRestoreRef.current = null;
+      scheduleBufferFlush();
+      return;
+    }
+    if (event.type === "reasoning_delta") {
       reasonRef.current += event.data?.text || event.data?.delta || "";
-    } else if (
+      phaseRef.current = "thinking";
+      optimisticRestoreRef.current = null;
+      scheduleBufferFlush();
+      return;
+    }
+    if (
       event.type === "turn_start" ||
       event.type === "assistant_message" ||
       event.type === "error" ||
       event.type === "interrupted" ||
       event.type === "turn_done"
     ) {
-      streamRef.current = "";
-      reasonRef.current = "";
+      clearBuffers();
     } else if (event.type === "input_rejected") {
       const restorePhase = optimisticRestoreRef.current ?? phaseRef.current;
       if (restorePhase === "idle" && !BUSY_PHASES.has(phaseRef.current)) {
-        streamRef.current = "";
-        reasonRef.current = "";
+        clearBuffers();
       }
     }
     dispatch({ type: "EVENT", event });
-  }, []);
+  }, [clearBuffers, scheduleBufferFlush]);
 
   const onConnected = useCallback(() => dispatch({ type: "CONNECTED" }), []);
   const onDisconnected = useCallback(() => {
-    streamRef.current = "";
-    reasonRef.current = "";
+    clearBuffers();
     dispatch({ type: "DISCONNECTED" });
-  }, []);
+  }, [clearBuffers]);
   const onTurnRequested = useCallback(() => {
-    streamRef.current = "";
-    reasonRef.current = "";
+    if (!BUSY_PHASES.has(phaseRef.current)) {
+      phaseRef.current = "starting";
+      phaseEpochRef.current += 1;
+      clearBuffers();
+    }
     dispatch({ type: "TURN_REQUESTED" });
-  }, []);
+  }, [clearBuffers]);
   const reset = useCallback(() => {
-    streamRef.current = "";
-    reasonRef.current = "";
+    clearBuffers();
     dispatch({ type: "RESET" });
-  }, []);
+  }, [clearBuffers]);
 
   const lifecycle: AgentLifecycle = {
     phase: state.phase,

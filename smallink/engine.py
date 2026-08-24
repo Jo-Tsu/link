@@ -13,6 +13,7 @@ engine says `needs_user`, the engine emits `PERMISSION_REQUIRED` and awaits the 
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
 import time
 from dataclasses import dataclass
@@ -24,6 +25,10 @@ from .events import Event, EventType
 from .permissions import Mode
 from .providers import AssistantTurn, ToolCall
 from .providers.errors import friendly_model_error
+
+_BLOCKING_WORKER_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    thread_name_prefix="smallink-engine"
+)
 
 
 class ApprovalOutcome(str, Enum):
@@ -115,8 +120,35 @@ class TurnEngine:
         # TOOL_FINISHED event can carry the note to the tool card (§25).
         self._standing_notes: dict[str, str] = {}
         self._interrupt_hooks: list[Callable[[], None]] = list(interrupt_hooks or [])
+        self._owner_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._worker_futures: set[asyncio.Future[Any]] = set()
+        self._worker_threads: set[concurrent.futures.Future[Any]] = set()
 
     # -- external controls ------------------------------------------------------
+    def prepare_turn(self) -> None:
+        """Bind and reset cancellation when the runtime claims this engine.
+
+        Claiming happens immediately before a turn task is scheduled. Recording the loop here
+        closes the small window in which a sync REST delete can interrupt the claimed engine before
+        its async generator starts.
+        """
+        try:
+            self._owner_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._owner_loop = None
+        self._cancel.clear()
+
+    def _begin_turn(self) -> asyncio.AbstractEventLoop:
+        loop = asyncio.get_running_loop()
+        if self._owner_loop is not loop:
+            self._owner_loop = loop
+            self._cancel.clear()
+        return loop
+
+    def _end_turn(self, loop: asyncio.AbstractEventLoop) -> None:
+        if self._owner_loop is loop:
+            self._owner_loop = None
+
     def request_interrupt(self) -> None:
         """Stop the turn as soon as possible, from ANY state: mid-stream (the producer
         thread drops the stream between chunks), mid-tool (interrupt hooks kill the
@@ -124,12 +156,44 @@ class TurnEngine:
         interrupted), or between iterations (the loop checkpoint). Every pending
         tool_call still gets a tool-error result so the history never carries orphans
         (hosted templates reject them, and durable-resume would re-prompt them)."""
-        self._cancel.set()
+        def set_cancel() -> None:
+            try:
+                self._cancel.set()
+            except RuntimeError:
+                pass  # loop is closing/closed; the executor hooks still run below
+
+        # Executor interrupt hooks are documented as thread-safe and may need to run immediately
+        # (for example, to signal a blocking shell process). Only the asyncio.Event mutation must
+        # be marshalled to the turn's owner loop.
         for hook in self._interrupt_hooks:
             try:
                 hook()
             except Exception:
                 pass  # best-effort: a dead executor must not block the stop
+
+        owner_loop = self._owner_loop
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+        if (
+            owner_loop is not None
+            and owner_loop is not running_loop
+            and not owner_loop.is_closed()
+            and owner_loop.is_running()
+        ):
+            try:
+                owner_loop.call_soon_threadsafe(set_cancel)
+                return
+            except RuntimeError:
+                pass  # loop closed between the checks and the scheduling call
+        if (
+            owner_loop is running_loop
+            or owner_loop is None
+            or owner_loop.is_closed()
+            or not owner_loop.is_running()
+        ):
+            set_cancel()
 
     async def _interruptible(self, coro: Any, interrupted: Any) -> Any:
         """Await `coro`, but resolve early with `interrupted` if the user stops the
@@ -145,7 +209,59 @@ class TurnEngine:
             task.cancel()
             return interrupted
         finally:
-            cancel_wait.cancel()
+            pending = [candidate for candidate in (task, cancel_wait) if not candidate.done()]
+            for candidate in pending:
+                candidate.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+
+    async def wait_for_workers(self) -> None:
+        """Wait until any already-started blocking provider/tool calls have returned."""
+        pending_wrappers = tuple(
+            future for future in self._worker_futures if not future.done()
+        )
+        if pending_wrappers:
+            try:
+                await asyncio.gather(*pending_wrappers, return_exceptions=True)
+            except asyncio.CancelledError:
+                # Shutdown may cancel the asyncio wrappers while the underlying blocking worker is
+                # still running. The real safety gate is wait_for_thread_workers(), which tracks
+                # the thread future itself.
+                return
+
+    async def wait_for_thread_workers(self, timeout: float | None = None) -> bool:
+        """Wait for the underlying blocking workers, not just their asyncio wrappers."""
+        pending = tuple(future for future in self._worker_threads if not future.done())
+        if not pending:
+            return True
+
+        done, not_done = await asyncio.to_thread(
+            concurrent.futures.wait,
+            pending,
+            timeout=timeout,
+        )
+        return len(not_done) == 0
+
+    def _track_worker_thread(
+        self, future: concurrent.futures.Future[Any]
+    ) -> concurrent.futures.Future[Any]:
+        self._worker_threads.add(future)
+        future.add_done_callback(self._worker_threads.discard)
+        return future
+
+    def _submit_blocking_worker(
+        self,
+        func: Callable[..., Any],
+        *args: Any,
+    ) -> asyncio.Future[Any]:
+        loop = asyncio.get_running_loop()
+        raw_future = self._track_worker_thread(
+            _BLOCKING_WORKER_EXECUTOR.submit(func, *args)
+        )
+        wrapped = asyncio.wrap_future(raw_future, loop=loop)
+        self._worker_futures.add(wrapped)
+        wrapped.add_done_callback(self._worker_futures.discard)
+        return wrapped
 
     def queue_steering(
         self, text: str, source: Optional[dict[str, Any]] = None
@@ -175,13 +291,16 @@ class TurnEngine:
         if client_message_id:
             message["client_message_id"] = client_message_id
         self.messages.append(message)
-        self._cancel.clear()
-        data: dict[str, Any] = {"input": user_input}
-        if source is not None:
-            data["source"] = source
-        yield Event(EventType.TURN_START, data)
-        async for event in self._loop():
-            yield event
+        loop = self._begin_turn()
+        try:
+            data: dict[str, Any] = {"input": user_input}
+            if source is not None:
+                data["source"] = source
+            yield Event(EventType.TURN_START, data)
+            async for event in self._loop():
+                yield event
+        finally:
+            self._end_turn(loop)
 
     def switch_model(self, model: str) -> Optional[str]:
         """Rebind the session's model mid-conversation (roadmap item 3). History is
@@ -248,10 +367,13 @@ class TurnEngine:
         is the intended recovery path (owner-hit 2026-07-23)."""
         if not self._tail_is_retriable_error():
             return
-        self._cancel.clear()
-        yield Event(EventType.TURN_START, {"input": ""})
-        async for event in self._loop():
-            yield event
+        loop = self._begin_turn()
+        try:
+            yield Event(EventType.TURN_START, {"input": ""})
+            async for event in self._loop():
+                yield event
+        finally:
+            self._end_turn(loop)
 
     async def resume(self) -> AsyncIterator[Event]:
         """Continue a turn that was suspended at a prompt and persisted — durable resume after a
@@ -262,14 +384,17 @@ class TurnEngine:
         pending = self._unanswered_trailing_tool_calls()
         if not pending:
             return
-        self._cancel.clear()
-        yield Event(EventType.TURN_START, {"input": "(resumed)"})
-        async for event in self._handle_tool_calls(pending):
-            yield event
-        yield Event(EventType.ITERATION_END, {"iteration": 0})
-        if not self._cancel.is_set():
-            async for event in self._loop():
+        loop = self._begin_turn()
+        try:
+            yield Event(EventType.TURN_START, {"input": "(resumed)"})
+            async for event in self._handle_tool_calls(pending):
                 yield event
+            yield Event(EventType.ITERATION_END, {"iteration": 0})
+            if not self._cancel.is_set():
+                async for event in self._loop():
+                    yield event
+        finally:
+            self._end_turn(loop)
 
     def _unanswered_trailing_tool_calls(self) -> list[ToolCall]:
         """The tool-calls of the last assistant message that don't yet have a tool result —
@@ -300,6 +425,10 @@ class TurnEngine:
     async def _loop(self) -> AsyncIterator[Event]:
         iterations = 0
         while True:
+            if self._cancel.is_set():
+                self._append_notice("interrupted")
+                yield Event(EventType.INTERRUPTED, {"iterations": iterations})
+                return
             if iterations >= self.max_iterations:
                 yield Event(
                     EventType.TURN_END,
@@ -419,7 +548,7 @@ class TurnEngine:
             finally:
                 loop.call_soon_threadsafe(queue.put_nowait, ("done", None))
 
-        loop.run_in_executor(None, produce)
+        producer = self._submit_blocking_worker(produce)
         while True:
             # Race the queue against Stop so a stalled stream (no chunks arriving —
             # the pre-first-token wait, a wedged connection) can't hold the turn.
@@ -492,9 +621,11 @@ class TurnEngine:
             for tool_call in concurrent:
                 yield Event(EventType.TOOL_STARTED, {"name": tool_call.name})
                 self._audit(tool_call, stage="started")
-            outcomes = await asyncio.gather(
-                *[asyncio.to_thread(self._execute_sync, tc) for tc in concurrent]
-            )
+            workers = [
+                self._submit_blocking_worker(self._execute_sync, tc)
+                for tc in concurrent
+            ]
+            outcomes = await asyncio.gather(*workers)
             for tool_call, (result, status) in zip(concurrent, outcomes):
                 yield self._record_result(tool_call, result, status)
 
@@ -504,7 +635,8 @@ class TurnEngine:
                 continue
             yield Event(EventType.TOOL_STARTED, {"name": tool_call.name})
             self._audit(tool_call, stage="started")
-            result, status = await asyncio.to_thread(self._execute_sync, tool_call)
+            worker = self._submit_blocking_worker(self._execute_sync, tool_call)
+            result, status = await worker
             yield self._record_result(tool_call, result, status)
 
     def _interrupted_tool(self, tool_call: ToolCall) -> Event:

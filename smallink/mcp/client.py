@@ -26,6 +26,8 @@ except ImportError:  # pragma: no cover - exercised only with MCP SDK 1.x
 
 from .config import MCPServerDef
 
+MCP_SHUTDOWN_TIMEOUT_SECONDS = 5.0
+
 
 class _Conn:
     def __init__(self, session: ClientSession, tools: list[Any]) -> None:
@@ -80,13 +82,23 @@ class MCPManager:
     async def aclose(self) -> None:
         for conn in self._conns.values():
             conn.shutdown.set()
-        for task in list(self._tasks.values()):
-            try:
-                await asyncio.wait_for(asyncio.shield(task), timeout=5)
-            except (asyncio.TimeoutError, Exception):
-                task.cancel()
-        self._conns.clear()
-        self._tasks.clear()
+        tasks = dict(self._tasks)
+        if not tasks:
+            self._conns.clear()
+            return
+
+        _done, pending = await asyncio.wait(
+            tasks.values(), timeout=MCP_SHUTDOWN_TIMEOUT_SECONDS
+        )
+        for task in pending:
+            task.cancel()
+        # Cancellation is only a request. Await every task through its AsyncExitStack so
+        # transports and stdio children are closed before the application loop exits.
+        await asyncio.gather(*tasks.values(), return_exceptions=True)
+        for name, task in tasks.items():
+            if self._tasks.get(name) is task:
+                self._tasks.pop(name, None)
+                self._conns.pop(name, None)
 
     # -- per-server lifecycle (one task owns enter+exit) ------------------------
     async def _serve(

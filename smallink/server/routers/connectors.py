@@ -45,7 +45,7 @@ def connectors_router(manager: Any) -> APIRouter:
         d = get_descriptor(name)
         if d is None or not d.mcp_url:
             return {"ok": False, "error": f"{name} has no MCP connect path"}
-        asyncio.create_task(manager.mcp_connect_connector(name))
+        manager.spawn_background_task(manager.mcp_connect_connector(name))
         return {"ok": True, "started": True}
 
     @router.post("/v1/connectors/{name}/disconnect")

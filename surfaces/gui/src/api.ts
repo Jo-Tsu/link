@@ -2889,28 +2889,35 @@ export class Session {
     }, clientMessageId);
   }
 
-  approve(decision: string) {
-    this.send({ type: "approval", decision });
+  approve(decision: string, promptId?: string) {
+    this.send({ type: "approval", decision, ...(promptId ? { prompt_id: promptId } : {}) });
   }
 
   // Reply to a `request_directory` prompt: grant a folder (with access level) or decline.
-  respondDirectory(granted: boolean, path?: string, writable?: boolean) {
-    this.send({ type: "directory_response", granted, ...(path ? { path } : {}), writable: !!writable });
+  respondDirectory(granted: boolean, path?: string, writable?: boolean, promptId?: string) {
+    this.send({
+      type: "directory_response",
+      granted,
+      ...(path ? { path } : {}),
+      writable: !!writable,
+      ...(promptId ? { prompt_id: promptId } : {}),
+    });
   }
 
   // Reply to a `propose_plan` prompt: approve (choosing the execution mode) or reject with feedback.
-  respondPlan(approved: boolean, mode?: string, feedback?: string) {
+  respondPlan(approved: boolean, mode?: string, feedback?: string, promptId?: string) {
     this.send({
       type: "plan_response",
       approved,
       ...(mode ? { mode } : {}),
       ...(feedback ? { feedback } : {}),
+      ...(promptId ? { prompt_id: promptId } : {}),
     });
   }
 
   // Answer a live `ask_user` prompt (attended sessions; unattended ones answer via the Inbox).
-  respondQuestion(answer: string) {
-    this.send({ type: "question_response", answer });
+  respondQuestion(answer: string, promptId?: string) {
+    this.send({ type: "question_response", answer, ...(promptId ? { prompt_id: promptId } : {}) });
   }
 
   interrupt() {

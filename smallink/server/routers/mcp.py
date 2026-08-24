@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from typing import Any
 
 from fastapi import APIRouter
@@ -39,7 +38,7 @@ def mcp_router(manager: Any) -> APIRouter:
 
     @router.post("/v1/mcp/{name}/connect")
     async def mcp_connect(name: str) -> dict[str, Any]:
-        asyncio.create_task(manager.connect_mcp(name))
+        manager.spawn_background_task(manager.connect_mcp(name))
         return {"ok": True, "started": True}
 
     @router.post("/v1/mcp/{name}/signout")

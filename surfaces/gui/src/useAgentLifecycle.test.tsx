@@ -1,9 +1,41 @@
 import { act, renderHook } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { useAgentLifecycle } from "./useAgentLifecycle";
 
+const originalRequestAnimationFrame = window.requestAnimationFrame;
+const originalCancelAnimationFrame = window.cancelAnimationFrame;
+
 describe("useAgentLifecycle", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    Object.defineProperty(window, "requestAnimationFrame", {
+      value: undefined,
+      configurable: true,
+      writable: true,
+    });
+    Object.defineProperty(window, "cancelAnimationFrame", {
+      value: undefined,
+      configurable: true,
+      writable: true,
+    });
+  });
+
+  afterEach(() => {
+    Object.defineProperty(window, "requestAnimationFrame", {
+      value: originalRequestAnimationFrame,
+      configurable: true,
+      writable: true,
+    });
+    Object.defineProperty(window, "cancelAnimationFrame", {
+      value: originalCancelAnimationFrame,
+      configurable: true,
+      writable: true,
+    });
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
   it("owns connection, busy state, and streaming buffers", () => {
     const { result } = renderHook(() => useAgentLifecycle());
 
@@ -11,6 +43,9 @@ describe("useAgentLifecycle", () => {
     act(() => result.current[1].onTurnRequested());
     act(() => result.current[1].handleEvent({ type: "assistant_delta", data: { text: "Hi" } }));
     act(() => result.current[1].handleEvent({ type: "reasoning_delta", data: { text: "Think" } }));
+    act(() => {
+      vi.advanceTimersByTime(16);
+    });
 
     expect(result.current[0]).toMatchObject({
       connected: true,
@@ -74,6 +109,7 @@ describe("useAgentLifecycle", () => {
     act(() => {
       result.current[1].onTurnRequested();
       result.current[1].handleEvent({ type: "assistant_delta", data: { text: "live" } });
+      vi.advanceTimersByTime(16);
     });
 
     expect(result.current[0].phase).toBe("thinking");
@@ -149,6 +185,200 @@ describe("useAgentLifecycle", () => {
 
     expect(result.current[0].phase).toBe("starting");
     expect(result.current[0].busy).toBe(true);
+  });
+
+  it("batches multiple delta flushes to one animation frame while getters stay synchronous", () => {
+    let nextFrameId = 1;
+    const callbacks = new Map<number, FrameRequestCallback>();
+    const requestAnimationFrame = vi.fn((cb: FrameRequestCallback) => {
+      const id = nextFrameId++;
+      callbacks.set(id, cb);
+      return id;
+    });
+    const cancelAnimationFrame = vi.fn((id: number) => {
+      callbacks.delete(id);
+    });
+    Object.defineProperty(window, "requestAnimationFrame", {
+      value: requestAnimationFrame,
+      configurable: true,
+      writable: true,
+    });
+    Object.defineProperty(window, "cancelAnimationFrame", {
+      value: cancelAnimationFrame,
+      configurable: true,
+      writable: true,
+    });
+
+    const { result } = renderHook(() => useAgentLifecycle());
+
+    act(() => {
+      result.current[1].onTurnRequested();
+      result.current[1].handleEvent({ type: "assistant_delta", data: { text: "Hel" } });
+      result.current[1].handleEvent({ type: "assistant_delta", data: { text: "lo" } });
+      result.current[1].handleEvent({ type: "reasoning_delta", data: { text: "Think" } });
+    });
+
+    expect(requestAnimationFrame).toHaveBeenCalledTimes(1);
+    expect(result.current[1].getStreamBuffer()).toBe("Hello");
+    expect(result.current[1].getReasoningBuffer()).toBe("Think");
+    expect(result.current[0].streamBuffer).toBe("");
+    expect(result.current[0].reasoningBuffer).toBe("");
+
+    act(() => {
+      callbacks.get(1)?.(0);
+    });
+
+    expect(result.current[0].streamBuffer).toBe("Hello");
+    expect(result.current[0].reasoningBuffer).toBe("Think");
+  });
+
+  it("cancels a pending delta flush when a terminal event arrives", () => {
+    let nextFrameId = 1;
+    const callbacks = new Map<number, FrameRequestCallback>();
+    const requestAnimationFrame = vi.fn((cb: FrameRequestCallback) => {
+      const id = nextFrameId++;
+      callbacks.set(id, cb);
+      return id;
+    });
+    const cancelAnimationFrame = vi.fn((id: number) => {
+      callbacks.delete(id);
+    });
+    Object.defineProperty(window, "requestAnimationFrame", {
+      value: requestAnimationFrame,
+      configurable: true,
+      writable: true,
+    });
+    Object.defineProperty(window, "cancelAnimationFrame", {
+      value: cancelAnimationFrame,
+      configurable: true,
+      writable: true,
+    });
+
+    const { result } = renderHook(() => useAgentLifecycle());
+
+    act(() => {
+      result.current[1].onTurnRequested();
+      result.current[1].handleEvent({ type: "assistant_delta", data: { text: "stale" } });
+      result.current[1].handleEvent({ type: "assistant_message", data: { text: "final" } });
+    });
+
+    expect(cancelAnimationFrame).toHaveBeenCalledWith(1);
+    expect(result.current[1].getStreamBuffer()).toBe("");
+    expect(result.current[0].streamBuffer).toBe("");
+    expect(result.current[0].phase).toBe("thinking");
+
+    act(() => {
+      callbacks.get(1)?.(0);
+    });
+
+    expect(result.current[0].streamBuffer).toBe("");
+    expect(result.current[0].reasoningBuffer).toBe("");
+  });
+
+  it("cancels pending flushes on reset disconnect and unmount", () => {
+    const { result, unmount } = renderHook(() => useAgentLifecycle());
+
+    act(() => {
+      result.current[1].onTurnRequested();
+      result.current[1].handleEvent({ type: "assistant_delta", data: { text: "pending" } });
+      result.current[1].reset();
+    });
+    act(() => {
+      vi.advanceTimersByTime(16);
+    });
+    expect(result.current[0].streamBuffer).toBe("");
+    expect(result.current[1].getStreamBuffer()).toBe("");
+
+    act(() => {
+      result.current[1].onConnected();
+      result.current[1].onTurnRequested();
+      result.current[1].handleEvent({ type: "assistant_delta", data: { text: "pending" } });
+      result.current[1].onDisconnected();
+    });
+    act(() => {
+      vi.advanceTimersByTime(16);
+    });
+    expect(result.current[0].streamBuffer).toBe("");
+    expect(result.current[1].getStreamBuffer()).toBe("");
+
+    act(() => {
+      result.current[1].onTurnRequested();
+      result.current[1].handleEvent({ type: "assistant_delta", data: { text: "pending" } });
+    });
+    unmount();
+    act(() => {
+      vi.advanceTimersByTime(16);
+    });
+  });
+
+  it("keeps non-delta events immediate while delta state waits for the frame", () => {
+    const { result } = renderHook(() => useAgentLifecycle());
+
+    act(() => {
+      result.current[1].handleEvent({ type: "assistant_delta", data: { text: "partial" } });
+      result.current[1].handleEvent({ type: "phase_changed", data: { phase: "executing" } });
+    });
+
+    expect(result.current[1].getStreamBuffer()).toBe("partial");
+    expect(result.current[0].phase).toBe("executing");
+    expect(result.current[0].streamBuffer).toBe("");
+
+    act(() => {
+      vi.advanceTimersByTime(16);
+    });
+
+    expect(result.current[0].phase).toBe("executing");
+    expect(result.current[0].streamBuffer).toBe("partial");
+  });
+
+  it("preserves pending delta refs across a later render before RAF flush", () => {
+    let nextFrameId = 1;
+    const callbacks = new Map<number, FrameRequestCallback>();
+    const requestAnimationFrame = vi.fn((cb: FrameRequestCallback) => {
+      const id = nextFrameId++;
+      callbacks.set(id, cb);
+      return id;
+    });
+    const cancelAnimationFrame = vi.fn((id: number) => {
+      callbacks.delete(id);
+    });
+    Object.defineProperty(window, "requestAnimationFrame", {
+      value: requestAnimationFrame,
+      configurable: true,
+      writable: true,
+    });
+    Object.defineProperty(window, "cancelAnimationFrame", {
+      value: cancelAnimationFrame,
+      configurable: true,
+      writable: true,
+    });
+
+    const { result } = renderHook(() => useAgentLifecycle());
+
+    act(() => {
+      result.current[1].onTurnRequested();
+      result.current[1].handleEvent({ type: "assistant_delta", data: { text: "first" } });
+    });
+
+    expect(result.current[1].getStreamBuffer()).toBe("first");
+    expect(result.current[0].streamBuffer).toBe("");
+    expect(requestAnimationFrame).toHaveBeenCalledTimes(1);
+
+    act(() => {
+      result.current[1].handleEvent({ type: "phase_changed", data: { phase: "executing" } });
+    });
+
+    expect(result.current[0].phase).toBe("executing");
+    expect(result.current[0].streamBuffer).toBe("");
+    expect(result.current[1].getStreamBuffer()).toBe("first");
+
+    act(() => {
+      callbacks.get(1)?.(0);
+    });
+
+    expect(result.current[0].phase).toBe("executing");
+    expect(result.current[0].streamBuffer).toBe("first");
+    expect(result.current[1].getStreamBuffer()).toBe("first");
   });
 
   it("keeps legacy ready payloads backward compatible", () => {

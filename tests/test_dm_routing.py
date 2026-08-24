@@ -46,6 +46,7 @@ def test_dm_with_designated_session_delivers(tmp_path, monkeypatch):
 
     async def fake_deliver(session_id, message, *, source=None):
         delivered.append((session_id, message))
+        return True
 
     monkeypatch.setattr(mgr, "deliver_to_session", fake_deliver)
     mgr.set_dm_session("sDM")
@@ -67,6 +68,27 @@ def test_dm_without_designation_is_parked(tmp_path):
     assert len(parked) == 1
     assert parked[0]["text"] == "hello there"
     assert parked[0]["reason"] == "no DM session designated"
+
+
+def test_dm_delivery_exception_is_dead_lettered(tmp_path, monkeypatch, caplog):
+    mgr = SessionManager(workspace=tmp_path, provider=ScriptedProvider())
+    _connect_slack(mgr)
+    mgr.set_dm_session("sDM")
+
+    async def fake_deliver(session_id, message, *, source=None):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(mgr, "deliver_to_session", fake_deliver)
+
+    with caplog.at_level("WARNING"):
+        asyncio.run(mgr._dispatch_inbound(_dm("hello there")))
+
+    assert "DM delivery crashed" in caplog.text
+    parked = mgr.unrouted.list()
+    assert len(parked) == 1
+    assert parked[0]["source"] == "slack:D1"
+    assert parked[0]["text"] == "hello there"
+    assert "delivery crashed for DM session sDM: boom" in parked[0]["reason"]
 
 
 def test_dm_route_endpoints(tmp_path):

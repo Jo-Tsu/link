@@ -75,9 +75,7 @@ def test_interaction_click_resolves_item(tmp_path):
 
     async def fake_wait(item_id):
         # stand in for the suspended agent: record what the item resolved to
-        ev = mgr.inbox._waiters.setdefault(item_id, asyncio.Event())
-        await ev.wait()
-        resolved.append(mgr.inbox.get(item_id).resolution)
+        resolved.append(await mgr.inbox.wait(item_id))
 
     async def scenario():
         waiter = asyncio.create_task(fake_wait(item.id))
@@ -97,3 +95,48 @@ def test_interaction_click_resolves_item(tmp_path):
     asyncio.run(scenario())
     assert resolved == ["allow"]
     assert mgr.inbox.get(item.id).state == "resolved"
+
+
+def test_reply_token_routes_through_resolve_inbox_and_broadcasts_prompt_resolved(tmp_path):
+    from smallink.connectors.base import MessageEvent, SessionSource
+
+    mgr = SessionManager(workspace=tmp_path, provider=ScriptedProvider([]))
+    item = mgr.inbox.add_question("sX", "Which region?", tool_call_id="call_q")
+
+    events: list[dict] = []
+
+    async def cb(message):
+        events.append(message)
+
+    resolved: list[str] = []
+
+    async def fake_wait(item_id):
+        resolved.append(await mgr.inbox.wait(item_id))
+
+    async def scenario():
+        mgr.register_session_client("sX", cb)
+        waiter = asyncio.create_task(fake_wait(item.id))
+        await asyncio.sleep(0)
+        consumed = mgr._resolve_inbox_reply(
+            MessageEvent(
+                text=f"us-west-2 [link:{item.id}]",
+                source=SessionSource("slack", "C1", user_id="U_BOB"),
+            )
+        )
+        assert consumed is True
+        await asyncio.wait_for(waiter, timeout=2)
+        mgr.unregister_session_client("sX", cb)
+
+    asyncio.run(scenario())
+    assert resolved == ["us-west-2"]
+    assert mgr.inbox.get(item.id).resolution == "us-west-2"
+    assert events == [
+        {
+            "type": "prompt_resolved",
+            "data": {
+                "prompt_id": item.id,
+                "kind": "question",
+                "resolution": "us-west-2",
+            },
+        }
+    ]

@@ -9,13 +9,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import secrets
 import uuid
 from collections import deque
 from contextlib import asynccontextmanager, suppress
-from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
@@ -71,8 +71,7 @@ from ..attachments import (
     MAX_TEXT_CHARS,
     build_user_content,
 )
-from ..engine import ApprovalOutcome
-from ..inbox import VIS_INBOX, VIS_INLINE, args_preview
+from ..inbox import VIS_INBOX
 from ..permissions import Mode
 from ..providers import AssistantTurn
 from .routers import (
@@ -93,8 +92,36 @@ from .routers import (
 )
 from .manager import SessionManager
 
+logger = logging.getLogger("smallink.server.app")
+
 
 def create_app(manager: SessionManager) -> FastAPI:
+    turn_tasks: set[asyncio.Task[None]] = set()
+
+    def _track_turn_task(coroutine, *, session_id: str) -> None:
+        task = asyncio.create_task(
+            coroutine, name=f"smallink-session-turn:{session_id}"
+        )
+        turn_tasks.add(task)
+
+        def _finished(done: asyncio.Task[None]) -> None:
+            turn_tasks.discard(done)
+            if done.cancelled():
+                return
+            try:
+                error = done.exception()
+            except asyncio.CancelledError:
+                return
+            if error is not None:
+                logger.error(
+                    "session turn task failed after cleanup for %s: %s",
+                    session_id,
+                    error,
+                    exc_info=(type(error), error, error.__traceback__),
+                )
+
+        task.add_done_callback(_finished)
+
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         async def restore_background_services() -> None:
@@ -114,10 +141,16 @@ def create_app(manager: SessionManager) -> FastAPI:
         try:
             yield
         finally:
+            manager.begin_shutdown()
             if not gateway_task.done():
                 gateway_task.cancel()
                 with suppress(asyncio.CancelledError):
                     await gateway_task
+            pending_turns = tuple(turn_tasks)
+            for task in pending_turns:
+                task.cancel()
+            if pending_turns:
+                await asyncio.gather(*pending_turns, return_exceptions=True)
             await manager.aclose()  # stop gateway + close MCP connections on shutdown
 
     app = FastAPI(title="Smallink", version=__version__, lifespan=lifespan)
@@ -459,172 +492,15 @@ def create_app(manager: SessionManager) -> FastAPI:
             return
         await ws.accept(subprotocol="link" if api_token else None)
         agent = ws.query_params.get("agent") or "code"
-        early_resolutions: deque[str] = deque()
+        route_agent = manager.session_persona(session_id, fallback=agent)
 
-        def _consume_early_resolution(item) -> None:
-            if item.state == "pending" and early_resolutions:
-                manager.inbox.resolve(item.id, early_resolutions.popleft())
-
-        # All four interactive prompts (approval / question / directory / plan) are parked as Inbox
-        # items and awaited via inbox.wait — so they survive a dropped socket (redelivered on
-        # reconnect) and can be resolved from any surface. `visibility` decides where they SHOW:
-        # Unattended → the cross-session Inbox; attended → inline in this session only. The agent
-        # stays blocked until the item is resolved (live WS response, REST, or a bound channel).
-        def _visibility() -> str:
-            return (
-                VIS_INBOX
-                if manager.unattended.is_unattended(session_id)
-                else VIS_INLINE
-            )
-
-        async def _mirror(item) -> None:
-            # Unattended items mirror to a bound channel as buttons (see mirror_inbox_item).
-            await manager.mirror_inbox_item(item)
-
-        def _route() -> str:
-            return manager.inbox_routing.route_for(session_id, agent)
-
-        async def approver(_request) -> ApprovalOutcome:
-            # The engine has already emitted PERMISSION_REQUIRED (the live inline card). Park the
-            # item so the answer can also come from the Inbox / a reconnect / after a restart.
-            item = manager.inbox.add_approval(
-                session_id,
-                f"Run `{_request.tool_name}`?",
-                body="\n".join(
-                    p
-                    for p in (
-                        (getattr(_request, "reason", "") or "").strip(),
-                        args_preview(getattr(_request, "arguments", None)),
-                    )
-                    if p
-                ),
-                inbox=_route(),
-                visibility=_visibility(),
-                # Automation-run context (manual "Run now" rides this socket): lets the
-                # card offer the task-persistent "Allow every time" (§25). {} elsewhere.
-                data=manager.approval_prompt_data(session_id, _request),
-                tool_call_id=getattr(_request, "tool_call_id", None),
-            )
-            _consume_early_resolution(item)
-            if (
-                item.state == "pending"
-            ):  # freshly raised (not a durable-resume re-raise)
-                manager.persist_session(
-                    session_id
-                )  # the pending tool call is now on disk
-                if item.visibility == VIS_INBOX:
-                    await _mirror(item)
-            resolution = await manager.inbox.wait(item.id)
-            # Accept every vocabulary: the live card sends once/always_tool/always_command/
-            # always_task/deny; the Inbox / a channel send allow/always/deny.
-            return manager.approval_outcome(resolution, _request, session_id)
-
-        async def question_asker(args: dict, tool_call_id=None) -> dict:
-            # ask_user (engine does NOT emit the event — we do, only when attended).
-            item = manager.inbox.add_question(
-                session_id,
-                str(args.get("question", "")),
-                inbox=_route(),
-                visibility=_visibility(),
-                options=list(args.get("options") or []),
-                allow_text=bool(args.get("allow_text", True)),
-                multi=bool(args.get("multi", False)),
-                tool_call_id=tool_call_id,
-            )
-            _consume_early_resolution(item)
-            if item.state == "pending":
-                manager.persist_session(session_id)
-                if item.visibility == VIS_INBOX:
-                    await _mirror(item)
-                else:
-                    await ws.send_json(
-                        {
-                            "type": "question_requested",
-                            "data": {
-                                "question": item.title,
-                                "options": item.options,
-                                "allow_text": item.allow_text,
-                                "multi": item.multi,
-                                "header": str(args.get("header", "")),
-                            },
-                        }
-                    )
-            return {"answer": await manager.inbox.wait(item.id)}
-
-        async def directory_requester(args: dict, tool_call_id=None) -> dict:
-            # The engine has already emitted DIRECTORY_REQUESTED. Park, await, then apply the grant.
-            item = manager.inbox.add_directory(
-                session_id,
-                "Grant access to a folder?",
-                body=str(args.get("reason", "")),
-                inbox=_route(),
-                visibility=_visibility(),
-                data={
-                    "path": str(args.get("path", "")),
-                    "writable": bool(args.get("writable", False)),
-                },
-                tool_call_id=tool_call_id,
-            )
-            _consume_early_resolution(item)
-            if item.state == "pending":
-                manager.persist_session(session_id)
-                if item.visibility == VIS_INBOX:
-                    await _mirror(item)
-            resp = _parse_json(
-                await manager.inbox.wait(item.id)
-            )  # {granted, path, writable}
-            if not resp.get("granted"):
-                return {"granted": False, "reason": "the user declined the request"}
-            path = (resp.get("path") or args.get("path") or "").strip()
-            if not path:
-                return {"granted": False, "error": "no directory was provided"}
-            writable = bool(resp.get("writable", args.get("writable", False)))
-            res = manager.add_root(session_id, path, writable)
-            if not res.get("ok"):
-                return {
-                    "granted": False,
-                    "error": res.get("error", "could not grant access"),
-                }
-            primary = next(
-                (
-                    r
-                    for r in res.get("roots", [])
-                    if r.get("path")
-                    and Path(r["path"]).expanduser().resolve()
-                    == Path(path).expanduser().resolve()
-                ),
-                None,
-            )
-            return {
-                "granted": True,
-                "path": (primary or {}).get("path", path),
-                "writable": writable,
-            }
-
-        async def plan_approver(_args: dict, tool_call_id=None) -> dict:
-            # The engine has already emitted PLAN_PROPOSED. Park, await the verdict.
-            item = manager.inbox.add_plan(
-                session_id,
-                "Approve the plan?",
-                body=str(_args.get("plan", "")),
-                inbox=_route(),
-                visibility=_visibility(),
-                tool_call_id=tool_call_id,
-            )
-            _consume_early_resolution(item)
-            if item.state == "pending":
-                manager.persist_session(session_id)
-                if item.visibility == VIS_INBOX:
-                    await _mirror(item)
-            resp = _parse_json(
-                await manager.inbox.wait(item.id)
-            )  # {approved, mode, feedback}
-            if not resp.get("approved"):
-                return {
-                    "approved": False,
-                    "feedback": resp.get("feedback") or "the user rejected the plan",
-                }
-            return {"approved": True, "mode": resp.get("mode") or "interactive"}
+        # Prompt callbacks are session-owned and broadcast to every viewer. They deliberately do
+        # not capture this socket, so opening or closing a second view cannot steal the shared
+        # engine's approval/question transport.
+        approver = manager.inbox_approver(session_id, route_agent)
+        question_asker = manager.inbox_question_asker(session_id, route_agent)
+        directory_requester = manager.inbox_directory_requester(session_id, route_agent)
+        plan_approver = manager.inbox_plan_approver(session_id, route_agent)
 
         async def _apply_model(model: Optional[str]) -> None:
             # Mid-session rebind is allowed (roadmap item 3, supersedes the 2026-07-04
@@ -644,23 +520,37 @@ def create_app(manager: SessionManager) -> FastAPI:
                 {"type": "model_changed", "data": {"model": model, "text": notice}},
             )
 
-        def _resolve_pending(resolution: str) -> None:
-            # Live WS responses resolve THE session's single pending prompt (one at a time, since the
-            # agent blocks). Reconnect / Inbox resolve by id via REST instead.
-            pend = manager.inbox.pending(session_id)
-            if pend:
-                manager.inbox.resolve(pend[0].id, resolution)
-            else:
-                early_resolutions.append(resolution)
+        _PROMPT_MESSAGE_TYPES = {
+            "approval": "approval",
+            "question_response": "question",
+            "directory_response": "directory",
+            "plan_response": "plan",
+        }
+
+        async def _resolve_pending(kind: str, prompt_id: Any, resolution: str) -> bool:
+            # Live WS responses must echo the exact prompt id they are answering. Missing,
+            # stale, wrong-session, wrong-kind, or already-resolved ids fail closed.
+            expected_kind = _PROMPT_MESSAGE_TYPES.get(kind)
+            if expected_kind is None or not isinstance(prompt_id, str) or not prompt_id:
+                return False
+            item = manager.inbox.get(prompt_id)
+            if (
+                item is None
+                or item.session_id != session_id
+                or item.kind != expected_kind
+                or item.state != "pending"
+            ):
+                return False
+            return await manager.resolve_inbox(item.id, resolution)
 
         workspace = ws.query_params.get("workspace")
         mcp_tools = await manager.prepare_mcp_tools(
-            session_id, workspace=workspace, agent=agent
+            session_id, workspace=workspace, agent=route_agent
         )
         engine = manager.get_engine(
             session_id,
             workspace=workspace,
-            agent=agent,
+            agent=route_agent,
             approver=approver,
             extra_tools=mcp_tools,
             directory_requester=directory_requester,
@@ -721,6 +611,7 @@ def create_app(manager: SessionManager) -> FastAPI:
         ) -> None:
             # The receive loop atomically claims this session before scheduling the task.
             # Keeping the claim outside prevents two back-to-back frames from both starting.
+            saw_error_event = False
             try:
                 events = manager.tracked_engine_events(
                     session_id,
@@ -731,22 +622,59 @@ def create_app(manager: SessionManager) -> FastAPI:
                     client_message_id=client_message_id,
                 )
                 async for event in events:
+                    if event.type.value == "error":
+                        saw_error_event = True
                     if event.type.value in _CHECKPOINTS:
                         await asyncio.to_thread(manager.save, session_id, engine)
+                    if event.type.value in {
+                        "permission_required",
+                        "directory_requested",
+                        "plan_proposed",
+                    }:
+                        continue
                     # Broadcast to every socket viewing this session (this socket included — it's a
                     # registered client), so a second view of the same session stays in sync too.
                     await manager.broadcast_session(
                         session_id, {"type": event.type.value, "data": event.data}
                     )
+            except Exception as exc:
+                logger.exception("interactive turn crashed for %s", session_id)
+                if not saw_error_event:
+                    with suppress(Exception):
+                        await manager.broadcast_session(
+                            session_id, {"type": "error", "data": {"error": str(exc)}}
+                        )
             finally:
-                # The backend owns automation completion. The GUI may disconnect or the model may
-                # fail, but the durable runtime outcome above is still sufficient to finalize it.
-                manager.finalize_manual_run_session(session_id)
+                saved = False
+                try:
+                    saved = await asyncio.to_thread(manager.save, session_id, engine)
+                except Exception:
+                    logger.exception("interactive turn save failed for %s", session_id)
+                    with suppress(Exception):
+                        await manager.broadcast_session(
+                            session_id,
+                            {
+                                "type": "error",
+                                "data": {"error": "Failed to save session state."},
+                            },
+                        )
+                # Manual automation completion reads its result from the durable transcript, so it
+                # must run after the final save. A failed/deleted save deliberately leaves the run
+                # active for recovery instead of recording a false successful result.
+                if saved:
+                    try:
+                        await asyncio.to_thread(
+                            manager.finalize_manual_run_session, session_id
+                        )
+                    except Exception:
+                        logger.exception(
+                            "manual automation finalization failed for %s", session_id
+                        )
                 manager.mark_idle(session_id)
-                await asyncio.to_thread(manager.save, session_id, engine)
-                await manager.broadcast_session(
-                    session_id, {"type": "turn_done", "data": {}}
-                )
+                with suppress(Exception):
+                    await manager.broadcast_session(
+                        session_id, {"type": "turn_done", "data": {}}
+                    )
 
         # This socket is now a live view of the session; background turns (channel delivery,
         # self-wake, durable resume) broadcast here too, not just locally driven run_turns.
@@ -764,7 +692,7 @@ def create_app(manager: SessionManager) -> FastAPI:
             content=None,
             client_message_id: str | None = None,
         ) -> None:
-            if not manager.try_mark_running(session_id):
+            if not manager.try_mark_running(session_id, engine=engine):
                 await reject_input(
                     "This session is already running a turn. Wait for it to finish or stop it."
                 )
@@ -776,12 +704,13 @@ def create_app(manager: SessionManager) -> FastAPI:
                         "data": {"client_message_id": client_message_id},
                     }
                 )
-            asyncio.create_task(
+            _track_turn_task(
                 run_turn(
                     content,
                     retry=retry,
                     client_message_id=client_message_id,
-                )
+                ),
+                session_id=session_id,
             )
 
         try:
@@ -812,9 +741,18 @@ def create_app(manager: SessionManager) -> FastAPI:
                     await reject_input("Invalid WebSocket message: missing string type.")
                     continue
                 if kind == "approval":
-                    _resolve_pending(message.get("decision", "deny"))
+                    if not await _resolve_pending(
+                        "approval",
+                        message.get("prompt_id"),
+                        message.get("decision", "deny"),
+                    ):
+                        await reject_input(
+                            "No pending approval request for this session."
+                        )
                 elif kind == "directory_response":
-                    _resolve_pending(
+                    if not await _resolve_pending(
+                        "directory_response",
+                        message.get("prompt_id"),
                         json.dumps(
                             {
                                 "granted": bool(message.get("granted")),
@@ -822,9 +760,14 @@ def create_app(manager: SessionManager) -> FastAPI:
                                 "writable": bool(message.get("writable", False)),
                             }
                         )
-                    )
+                    ):
+                        await reject_input(
+                            "No pending directory request for this session."
+                        )
                 elif kind == "plan_response":
-                    _resolve_pending(
+                    if not await _resolve_pending(
+                        "plan_response",
+                        message.get("prompt_id"),
                         json.dumps(
                             {
                                 "approved": bool(message.get("approved")),
@@ -832,9 +775,15 @@ def create_app(manager: SessionManager) -> FastAPI:
                                 "feedback": message.get("feedback", ""),
                             }
                         )
-                    )
+                    ):
+                        await reject_input("No pending plan request for this session.")
                 elif kind == "question_response":
-                    _resolve_pending(str(message.get("answer", "")))
+                    if not await _resolve_pending(
+                        "question_response",
+                        message.get("prompt_id"),
+                        str(message.get("answer", "")),
+                    ):
+                        await reject_input("No pending question for this session.")
                 elif kind == "interrupt":
                     engine.request_interrupt()
                 elif kind == "retry":

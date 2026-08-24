@@ -10,6 +10,7 @@ export type EventType =
   | "directory_requested"
   | "question_requested"
   | "plan_proposed"
+  | "prompt_resolved"
   | "tool_started"
   | "tool_finished"
   | "memory_cited"
@@ -90,6 +91,7 @@ export type Item =
   | { kind: "tool"; id: string; name: string; args: any; status: string; preview?: string; hidden?: number; standingRule?: string }
   | {
       kind: "approval";
+      promptId?: string;
       name: string;
       args: any;
       reason: string;
@@ -101,6 +103,7 @@ export type Item =
     }
   | {
       kind: "dirreq";
+      promptId?: string;
       reason: string;
       path?: string;
       writable?: boolean;
@@ -108,12 +111,14 @@ export type Item =
     }
   | {
       kind: "planreq";
+      promptId?: string;
       plan: string;
       resolved?: "approved" | "rejected";
     }
   | {
       // A live ask_user prompt (attended sessions answer inline; unattended ones route to the Inbox).
       kind: "question";
+      promptId?: string;
       question: string;
       options?: string[];
       allow_text?: boolean;

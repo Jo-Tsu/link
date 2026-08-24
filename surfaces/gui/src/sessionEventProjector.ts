@@ -168,6 +168,7 @@ export function projectSessionEvent(
           effects,
           updateItems: append({
             kind: "approval",
+            promptId: data.prompt_id || undefined,
             name: data.name,
             args: data.arguments,
             reason: data.reason,
@@ -184,6 +185,7 @@ export function projectSessionEvent(
           effects,
           updateItems: append({
             kind: "dirreq",
+            promptId: data.prompt_id || undefined,
             reason: data.reason || "",
             path: data.path || "",
             writable: !!data.writable,
@@ -196,7 +198,11 @@ export function projectSessionEvent(
       if (!context.unattended) {
         return {
           effects,
-          updateItems: append({ kind: "planreq", plan: data.plan || "" }),
+          updateItems: append({
+            kind: "planreq",
+            promptId: data.prompt_id || undefined,
+            plan: data.plan || "",
+          }),
         };
       }
       break;
@@ -206,11 +212,38 @@ export function projectSessionEvent(
         effects,
         updateItems: append({
           kind: "question",
+          promptId: data.prompt_id || undefined,
           question: data.question || "",
           options: data.options || [],
           allow_text: data.allow_text !== false,
           multi: !!data.multi,
         }),
+      };
+
+    case "prompt_resolved":
+      return {
+        effects,
+        updateItems: (items) =>
+          items.map((item) => {
+            if (!("promptId" in item) || item.promptId !== data.prompt_id) return item;
+            if (item.kind === "approval") {
+              return { ...item, resolved: data.resolution as any };
+            }
+            if (item.kind === "dirreq") {
+              let granted = false;
+              try { granted = !!JSON.parse(String(data.resolution || "{}")).granted; } catch {}
+              return { ...item, resolved: granted ? "granted" : "denied" };
+            }
+            if (item.kind === "planreq") {
+              let approved = false;
+              try { approved = !!JSON.parse(String(data.resolution || "{}")).approved; } catch {}
+              return { ...item, resolved: approved ? "approved" : "rejected" };
+            }
+            if (item.kind === "question") {
+              return { ...item, resolved: String(data.resolution || "answered") };
+            }
+            return item;
+          }),
       };
 
     case "tool_finished":

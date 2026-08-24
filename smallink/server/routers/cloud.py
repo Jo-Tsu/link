@@ -92,7 +92,7 @@ def cloud_router(manager: Any) -> APIRouter:
             except Exception:
                 pass
 
-        asyncio.get_running_loop().create_task(_restore_connections())
+        manager.spawn_background_task(_restore_connections())
         return HTMLResponse(
             _browser_page(
                 "Signed in",

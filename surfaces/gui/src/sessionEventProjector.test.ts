@@ -153,6 +153,23 @@ describe("projectSessionEvent", () => {
     }
   });
 
+  it("resolves the exact prompt when another surface answers it", () => {
+    const items: Item[] = [
+      { kind: "approval", promptId: "old", name: "shell", args: {}, reason: "" },
+      { kind: "approval", promptId: "current", name: "write_file", args: {}, reason: "" },
+    ];
+    const result = apply(
+      {
+        type: "prompt_resolved",
+        data: { prompt_id: "old", kind: "approval", resolution: "deny" },
+      },
+      items,
+    );
+
+    expect(result.items[0]).toMatchObject({ promptId: "old", resolved: "deny" });
+    expect(result.items[1]).not.toHaveProperty("resolved");
+  });
+
   it("reports browser/session refresh effects without embedding UI work", () => {
     const browser = apply({
       type: "tool_finished",

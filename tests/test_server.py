@@ -11,7 +11,9 @@ from smallink.providers import (
     ProviderClient,
     ToolCall,
 )
+from smallink.events import Event, EventType
 from smallink.memory import Scope
+from smallink.automation import Schedule, ScheduledTask
 from smallink.server import SessionManager, create_app
 from smallink.sessions import SessionRecord
 
@@ -27,6 +29,26 @@ class ScriptedProvider(ProviderClient):
 
     def capabilities(self, model):
         return ModelCapabilities()
+
+
+class RecordingScriptedProvider(ScriptedProvider):
+    """ScriptedProvider that also records every complete() call's messages."""
+
+    def __init__(self, turns):
+        super().__init__(turns)
+        self.calls = []
+
+    def complete(self, *, model, messages, tools=None, **settings):
+        self.calls.append(
+            {
+                "model": model,
+                "messages": [dict(message) for message in messages],
+                "tools": tools,
+            }
+        )
+        return super().complete(
+            model=model, messages=messages, tools=tools, **settings
+        )
 
 
 def _text(text):
@@ -399,9 +421,62 @@ def _drain(ws, on_permission=None):
         event = ws.receive_json()
         types.append(event["type"])
         if event["type"] == "permission_required" and on_permission:
-            ws.send_json({"type": "approval", "decision": on_permission})
+            ws.send_json(
+                {
+                    "type": "approval",
+                    "prompt_id": event["data"]["prompt_id"],
+                    "decision": on_permission,
+                }
+            )
         if event["type"] == "turn_done":
             return types
+
+
+def _drain_events(
+    ws,
+    *,
+    on_permission=None,
+    on_question=None,
+    on_directory=None,
+    on_plan=None,
+):
+    """Collect full WS events until turn_done; optionally answer interactive prompts."""
+    events = []
+    while True:
+        event = ws.receive_json()
+        events.append(event)
+        if event["type"] == "permission_required" and on_permission:
+            ws.send_json(
+                {
+                    "type": "approval",
+                    "prompt_id": event["data"]["prompt_id"],
+                    "decision": on_permission,
+                }
+            )
+        elif event["type"] == "question_requested" and on_question:
+            ws.send_json(
+                {
+                    "type": "question_response",
+                    "prompt_id": event["data"]["prompt_id"],
+                    "answer": on_question(event),
+                }
+            )
+        elif event["type"] == "directory_requested" and on_directory:
+            ws.send_json(
+                {
+                    "prompt_id": event["data"]["prompt_id"],
+                    **on_directory(event),
+                }
+            )
+        elif event["type"] == "plan_proposed" and on_plan:
+            ws.send_json(
+                {
+                    "prompt_id": event["data"]["prompt_id"],
+                    **on_plan(event),
+                }
+            )
+        if event["type"] == "turn_done":
+            return events
 
 
 def test_ws_simple_turn(tmp_path):
@@ -754,15 +829,23 @@ def test_ws_session_persisted_while_parked_on_approval(tmp_path):
     with client.websocket_connect("/ws/session/persist1") as ws:
         assert ws.receive_json()["type"] == "ready"
         ws.send_json({"type": "user_message", "text": "make x.py"})
-        while ws.receive_json()["type"] != "permission_required":
-            pass
+        while True:
+            prompt = ws.receive_json()
+            if prompt["type"] == "permission_required":
+                break
         # Parked on the approval — nothing approved, turn far from done. Already saved?
         rec = manager.session_store.load("persist1")
         assert rec is not None
         roles = [m.get("role") for m in rec.messages]
         assert "user" in roles  # turn_start checkpoint
         assert "assistant" in roles  # iteration progress checkpoint
-        ws.send_json({"type": "approval", "decision": "deny"})
+        ws.send_json(
+            {
+                "type": "approval",
+                "prompt_id": prompt["data"]["prompt_id"],
+                "decision": "deny",
+            }
+        )
         while ws.receive_json()["type"] != "turn_done":
             pass
 
@@ -783,6 +866,204 @@ def test_ws_browser_tool_audit_round_trip(tmp_path):
         r["tool"] == "browser_close" and r["stage"] == "approval_resolved" for r in rows
     )
     assert any(r["tool"] == "browser_close" and r["stage"] == "finished" for r in rows)
+
+
+def test_ws_question_round_trip_feeds_tool_result_into_next_model_call(tmp_path):
+    provider = RecordingScriptedProvider(
+        [
+            _tool(
+                "ask_user",
+                {
+                    "question": "Which region?",
+                    "options": ["us-east-1", "us-west-2"],
+                    "allow_text": True,
+                },
+            ),
+            _text("Using us-west-2"),
+        ]
+    )
+    manager = SessionManager(workspace=tmp_path, provider=provider)
+    client = TestClient(create_app(manager))
+
+    with client.websocket_connect("/ws/session/question1") as ws:
+        assert ws.receive_json()["type"] == "ready"
+        ws.send_json({"type": "user_message", "text": "pick a region"})
+        events = _drain_events(ws, on_question=lambda _event: "us-west-2")
+
+    types = [event["type"] for event in events]
+    assert "question_requested" in types
+    assert "tool_finished" in types
+    assert "assistant_message" in types
+    assert types[-1] == "turn_done"
+
+    question = next(event for event in events if event["type"] == "question_requested")
+    assert question["data"]["question"] == "Which region?"
+    assert question["data"]["options"] == ["us-east-1", "us-west-2"]
+
+    assert len(provider.calls) >= 2
+    assert any(
+        any(
+            message.get("role") == "tool"
+            and message.get("content") == '{"answer": "us-west-2"}'
+            for message in call["messages"]
+        )
+        for call in provider.calls[1:]
+    )
+
+
+def test_ws_question_survives_second_view_disconnect(tmp_path):
+    provider = RecordingScriptedProvider(
+        [
+            _tool(
+                "ask_user",
+                {
+                    "question": "Which region?",
+                    "options": ["us-east-1", "us-west-2"],
+                    "allow_text": True,
+                },
+            ),
+            _text("Using us-west-2"),
+        ]
+    )
+    manager = SessionManager(workspace=tmp_path, provider=provider)
+    client = TestClient(create_app(manager))
+
+    with client.websocket_connect("/ws/session/multi-view") as first:
+        assert first.receive_json()["type"] == "ready"
+        with client.websocket_connect("/ws/session/multi-view") as second:
+            assert second.receive_json()["type"] == "ready"
+        first.send_json({"type": "user_message", "text": "pick a region"})
+        while True:
+            prompt = first.receive_json()
+            if prompt["type"] == "question_requested":
+                break
+        first.send_json(
+            {
+                "type": "question_response",
+                "prompt_id": prompt["data"]["prompt_id"],
+                "answer": "us-west-2",
+            }
+        )
+        assert "turn_done" in _drain(first)
+
+    assert any(
+        any(
+            message.get("role") == "tool"
+            and message.get("content") == '{"answer": "us-west-2"}'
+            for message in call["messages"]
+        )
+        for call in provider.calls[1:]
+    )
+
+
+def test_ws_directory_round_trip_consumes_response_and_grants_root(tmp_path):
+    provider = RecordingScriptedProvider(
+        [
+            _tool(
+                "request_directory",
+                {
+                    "reason": "Need repo access",
+                    "path": "",
+                    "writable": True,
+                },
+            ),
+            _text("Folder granted"),
+        ]
+    )
+    manager = SessionManager(workspace=tmp_path, provider=provider)
+    client = TestClient(create_app(manager))
+    granted = tmp_path / "granted"
+    granted.mkdir()
+
+    with client.websocket_connect("/ws/session/directory1") as ws:
+        assert ws.receive_json()["type"] == "ready"
+        ws.send_json({"type": "user_message", "text": "use another folder"})
+        events = _drain_events(
+            ws,
+            on_directory=lambda _event: {
+                "type": "directory_response",
+                "granted": True,
+                "path": str(granted),
+                "writable": True,
+            },
+        )
+
+    types = [event["type"] for event in events]
+    assert "directory_requested" in types
+    assert "tool_finished" in types
+    assert types[-1] == "turn_done"
+
+    directory = next(event for event in events if event["type"] == "directory_requested")
+    assert directory["data"]["reason"] == "Need repo access"
+    assert directory["data"]["writable"] is True
+
+    engine = manager._runtimes.engine("directory1")
+    assert engine is not None
+    roots = manager.get_roots("directory1")
+    granted_root = next(root for root in roots if root["path"] == str(granted.resolve()))
+    assert granted_root["writable"] is True
+    assert granted_root["primary"] is False
+
+    assert len(provider.calls) >= 2
+    assert any(
+        any(
+            message.get("role") == "tool"
+            and message.get("content")
+            == '{"granted": true, "path": "%s", "writable": true}'
+            % str(granted.resolve())
+            for message in call["messages"]
+        )
+        for call in provider.calls[1:]
+    )
+
+
+def test_ws_plan_round_trip_switches_mode_and_consumes_response(tmp_path):
+    provider = RecordingScriptedProvider(
+        [
+            _tool("propose_plan", {"plan": "1. write plan.py\n2. verify"}),
+            _tool("write_file", {"path": "plan.py", "content": "done\n"}, "call_2"),
+            _text("implemented"),
+        ]
+    )
+    manager = SessionManager(workspace=tmp_path, provider=provider)
+    client = TestClient(create_app(manager))
+
+    with client.websocket_connect("/ws/session/plan1") as ws:
+        assert ws.receive_json()["type"] == "ready"
+        ws.send_json({"type": "set_mode", "mode": "plan"})
+        ws.send_json({"type": "user_message", "text": "fix it"})
+        events = _drain_events(
+            ws,
+            on_plan=lambda _event: {
+                "type": "plan_response",
+                "approved": True,
+                "mode": "auto",
+                "feedback": "",
+            },
+        )
+
+    types = [event["type"] for event in events]
+    assert "plan_proposed" in types
+    assert "tool_finished" in types
+    assert "permission_required" not in types
+    assert types[-1] == "turn_done"
+    assert (tmp_path / "plan.py").read_text() == "done\n"
+
+    engine = manager._runtimes.engine("plan1")
+    assert engine is not None
+    assert engine.permissions.mode.value == "auto"
+
+    assert len(provider.calls) >= 3
+    assert any(
+        any(
+            message.get("role") == "tool"
+            and '"approved": true' in message.get("content", "")
+            and '"mode": "auto"' in message.get("content", "")
+            and "plan approved" in message.get("content", "")
+            for message in call["messages"]
+        )
+        for call in provider.calls[1:]
+    )
 
 
 def test_open_and_recent_workspaces(tmp_path):
@@ -1166,7 +1447,13 @@ def test_always_allow_grants_survive_restart(tmp_path):
                 ev = ws.receive_json()
                 if ev["type"] == "permission_required":
                     asked += 1
-                    ws.send_json({"type": "approval", "decision": "always_command"})
+                    ws.send_json(
+                        {
+                            "type": "approval",
+                            "prompt_id": ev["data"]["prompt_id"],
+                            "decision": "always_command",
+                        }
+                    )
                 if ev["type"] == "turn_done":
                     break
             assert asked == expect_prompts
@@ -1205,3 +1492,631 @@ def test_set_provider_persists_extra_fields(tmp_path):
     manager.set_provider("ollama", {"base_url": ""})
     providers = {p["name"]: p for p in manager.get_providers()}
     assert "base_url" not in providers["ollama"]["values"]
+
+
+def test_ws_question_response_before_prompt_is_rejected_and_does_not_answer_later_question(
+    tmp_path,
+):
+    provider = RecordingScriptedProvider(
+        [
+            _tool(
+                "ask_user",
+                {
+                    "question": "Which region?",
+                    "options": ["us-east-1", "us-west-2"],
+                    "allow_text": True,
+                },
+            ),
+            _text("Using us-west-2"),
+        ]
+    )
+    manager = SessionManager(workspace=tmp_path, provider=provider)
+    client = TestClient(create_app(manager))
+
+    with client.websocket_connect("/ws/session/question-early") as ws:
+        assert ws.receive_json()["type"] == "ready"
+        ws.send_json({"type": "question_response", "answer": "too-early"})
+        rejected = ws.receive_json()
+        assert rejected["type"] == "input_rejected"
+        assert "pending question" in rejected["data"]["error"].lower()
+
+        ws.send_json({"type": "user_message", "text": "pick a region"})
+        prompt = None
+        while True:
+            event = ws.receive_json()
+            if event["type"] == "question_requested":
+                prompt = event
+                break
+            assert event["type"] != "turn_done"
+        assert prompt is not None
+        ws.send_json(
+            {
+                "type": "question_response",
+                "prompt_id": prompt["data"]["prompt_id"],
+                "answer": "us-west-2",
+            }
+        )
+
+        types = []
+        while True:
+            event = ws.receive_json()
+            types.append(event["type"])
+            if event["type"] == "turn_done":
+                break
+
+    assert "tool_finished" in types
+    assert "assistant_message" in types
+    assert any(
+        any(
+            message.get("role") == "tool"
+            and message.get("content") == '{"answer": "us-west-2"}'
+            for message in call["messages"]
+        )
+        for call in provider.calls[1:]
+    )
+
+
+def test_ws_wrong_prompt_type_is_rejected_and_pending_approval_stays_blocked(tmp_path):
+    client = _client(
+        tmp_path,
+        [
+            _tool("write_file", {"path": "made.py", "content": "print(1)\n"}),
+            _text("wrote it"),
+        ],
+    )
+    with client.websocket_connect("/ws/session/approval-mismatch") as ws:
+        assert ws.receive_json()["type"] == "ready"
+        ws.send_json({"type": "user_message", "text": "create made.py"})
+
+        prompt = None
+        while True:
+            event = ws.receive_json()
+            if event["type"] == "permission_required":
+                prompt = event
+                break
+        assert prompt is not None
+
+        ws.send_json(
+            {
+                "type": "question_response",
+                "prompt_id": prompt["data"]["prompt_id"],
+                "answer": "not-this-prompt",
+            }
+        )
+        while True:
+            rejected = ws.receive_json()
+            if rejected["type"] == "input_rejected":
+                break
+        assert rejected["type"] == "input_rejected"
+        assert "pending question" in rejected["data"]["error"].lower()
+
+        ws.send_json(
+            {
+                "type": "approval",
+                "prompt_id": prompt["data"]["prompt_id"],
+                "decision": "once",
+            }
+        )
+        types = []
+        while True:
+            event = ws.receive_json()
+            types.append(event["type"])
+            if event["type"] == "turn_done":
+                break
+
+    assert "tool_finished" in types
+    assert (tmp_path / "made.py").read_text() == "print(1)\n"
+
+
+def test_ws_directory_response_before_prompt_is_rejected_and_does_not_answer_later_directory(
+    tmp_path,
+):
+    provider = RecordingScriptedProvider(
+        [
+            _tool(
+                "request_directory",
+                {
+                    "reason": "Need repo access",
+                    "path": "",
+                    "writable": True,
+                },
+            ),
+            _text("Folder granted"),
+        ]
+    )
+    manager = SessionManager(workspace=tmp_path, provider=provider)
+    client = TestClient(create_app(manager))
+    granted = tmp_path / "granted-late"
+    granted.mkdir()
+
+    with client.websocket_connect("/ws/session/directory-early") as ws:
+        assert ws.receive_json()["type"] == "ready"
+        ws.send_json(
+            {
+                "type": "directory_response",
+                "granted": True,
+                "path": str(granted),
+                "writable": True,
+            }
+        )
+        rejected = ws.receive_json()
+        assert rejected["type"] == "input_rejected"
+        assert "pending directory request" in rejected["data"]["error"].lower()
+
+        ws.send_json({"type": "user_message", "text": "use another folder"})
+        prompt = None
+        while True:
+            event = ws.receive_json()
+            if event["type"] == "directory_requested":
+                prompt = event
+                break
+            assert event["type"] != "turn_done"
+        assert prompt is not None
+
+        ws.send_json(
+            {
+                "type": "directory_response",
+                "prompt_id": prompt["data"]["prompt_id"],
+                "granted": True,
+                "path": str(granted),
+                "writable": True,
+            }
+        )
+        types = []
+        while True:
+            event = ws.receive_json()
+            types.append(event["type"])
+            if event["type"] == "turn_done":
+                break
+
+    assert "tool_finished" in types
+    roots = manager.get_roots("directory-early")
+    granted_root = next(root for root in roots if root["path"] == str(granted.resolve()))
+    assert granted_root["writable"] is True
+
+
+def test_ws_plan_response_before_prompt_is_rejected_and_does_not_answer_later_plan(tmp_path):
+    provider = RecordingScriptedProvider(
+        [
+            _tool("propose_plan", {"plan": "1. write plan.py\n2. verify"}),
+            _tool("write_file", {"path": "plan.py", "content": "done\n"}, "call_2"),
+            _text("implemented"),
+        ]
+    )
+    manager = SessionManager(workspace=tmp_path, provider=provider)
+    client = TestClient(create_app(manager))
+
+    with client.websocket_connect("/ws/session/plan-early") as ws:
+        assert ws.receive_json()["type"] == "ready"
+        ws.send_json({"type": "set_mode", "mode": "plan"})
+        ws.send_json(
+            {
+                "type": "plan_response",
+                "approved": True,
+                "mode": "auto",
+                "feedback": "",
+            }
+        )
+        rejected = ws.receive_json()
+        assert rejected["type"] == "input_rejected"
+        assert "pending plan request" in rejected["data"]["error"].lower()
+
+        ws.send_json({"type": "user_message", "text": "fix it"})
+        prompt = None
+        while True:
+            event = ws.receive_json()
+            if event["type"] == "plan_proposed":
+                prompt = event
+                break
+            assert event["type"] != "turn_done"
+        assert prompt is not None
+
+        ws.send_json(
+            {
+                "type": "plan_response",
+                "prompt_id": prompt["data"]["prompt_id"],
+                "approved": True,
+                "mode": "auto",
+                "feedback": "",
+            }
+        )
+        types = []
+        while True:
+            event = ws.receive_json()
+            types.append(event["type"])
+            if event["type"] == "turn_done":
+                break
+
+    assert "tool_finished" in types
+    assert (tmp_path / "plan.py").read_text() == "done\n"
+
+
+def test_ws_prompt_responses_require_exact_prompt_id(tmp_path):
+    manager = SessionManager(
+        workspace=tmp_path,
+        provider=ScriptedProvider(
+            [
+                _tool("write_file", {"path": "made.py", "content": "print(1)\n"}),
+                _text("wrote it"),
+            ]
+        ),
+    )
+    client = TestClient(create_app(manager))
+
+    with client.websocket_connect("/ws/session/approval-race") as ws:
+        assert ws.receive_json()["type"] == "ready"
+        ws.send_json({"type": "user_message", "text": "create made.py"})
+        while True:
+            prompt = ws.receive_json()
+            if prompt["type"] == "permission_required":
+                break
+
+        ws.send_json(
+            {
+                "type": "question_response",
+                "prompt_id": prompt["data"]["prompt_id"],
+                "answer": "wrong-type",
+            }
+        )
+        rejected = ws.receive_json()
+        assert rejected["type"] == "input_rejected"
+        assert "pending question" in rejected["data"]["error"].lower()
+
+        ws.send_json(
+            {
+                "type": "approval",
+                "prompt_id": "stale-prompt",
+                "decision": "once",
+            }
+        )
+        rejected = ws.receive_json()
+        assert rejected["type"] == "input_rejected"
+
+        ws.send_json(
+            {
+                "type": "approval",
+                "prompt_id": prompt["data"]["prompt_id"],
+                "decision": "once",
+            }
+        )
+
+        types = []
+        while True:
+            event = ws.receive_json()
+            types.append(event["type"])
+            if event["type"] == "turn_done":
+                break
+
+    assert "tool_finished" in types
+    assert (tmp_path / "made.py").read_text() == "print(1)\n"
+
+
+def test_ws_repeated_approval_cannot_resolve_the_next_prompt(tmp_path):
+    manager = SessionManager(
+        workspace=tmp_path,
+        provider=ScriptedProvider(
+            [
+                AssistantTurn(
+                    tool_calls=[
+                        ToolCall(
+                            id="call_1",
+                            name="write_file",
+                            arguments={"path": "one.txt", "content": "one"},
+                        ),
+                        ToolCall(
+                            id="call_2",
+                            name="write_file",
+                            arguments={"path": "two.txt", "content": "two"},
+                        ),
+                    ]
+                ),
+                _text("done"),
+            ]
+        ),
+    )
+    client = TestClient(create_app(manager))
+
+    with client.websocket_connect("/ws/session/repeated-approval") as ws:
+        assert ws.receive_json()["type"] == "ready"
+        ws.send_json({"type": "user_message", "text": "write both files"})
+        while True:
+            first = ws.receive_json()
+            if first["type"] == "permission_required":
+                break
+        first_id = first["data"]["prompt_id"]
+        ws.send_json(
+            {"type": "approval", "prompt_id": first_id, "decision": "once"}
+        )
+        while True:
+            second = ws.receive_json()
+            if second["type"] == "permission_required":
+                break
+        second_id = second["data"]["prompt_id"]
+        assert second_id != first_id
+
+        ws.send_json(
+            {"type": "approval", "prompt_id": first_id, "decision": "once"}
+        )
+        rejected = ws.receive_json()
+        assert rejected["type"] == "input_rejected"
+        assert not (tmp_path / "two.txt").exists()
+
+        ws.send_json(
+            {"type": "approval", "prompt_id": second_id, "decision": "once"}
+        )
+        assert "turn_done" in _drain(ws)
+
+    assert (tmp_path / "one.txt").read_text() == "one"
+    assert (tmp_path / "two.txt").read_text() == "two"
+
+
+def test_ws_directory_response_rejects_stale_prompt_id(tmp_path):
+    provider = RecordingScriptedProvider(
+        [
+            _tool(
+                "request_directory",
+                {
+                    "reason": "Need repo access",
+                    "path": "",
+                    "writable": True,
+                },
+            ),
+            _text("Folder granted"),
+        ]
+    )
+    manager = SessionManager(workspace=tmp_path, provider=provider)
+    client = TestClient(create_app(manager))
+    granted = tmp_path / "granted-race"
+    granted.mkdir()
+
+    with client.websocket_connect("/ws/session/directory-race") as ws:
+        assert ws.receive_json()["type"] == "ready"
+        ws.send_json({"type": "user_message", "text": "use another folder"})
+        while True:
+            prompt = ws.receive_json()
+            if prompt["type"] == "directory_requested":
+                break
+
+        ws.send_json(
+            {
+                "type": "plan_response",
+                "prompt_id": prompt["data"]["prompt_id"],
+                "approved": True,
+                "mode": "auto",
+                "feedback": "",
+            }
+        )
+        rejected = ws.receive_json()
+        assert rejected["type"] == "input_rejected"
+        assert "pending plan request" in rejected["data"]["error"].lower()
+        ws.send_json(
+            {
+                "type": "directory_response",
+                "prompt_id": "stale-prompt",
+                "granted": True,
+                "path": str(granted),
+                "writable": True,
+            }
+        )
+        rejected = ws.receive_json()
+        assert rejected["type"] == "input_rejected"
+
+        ws.send_json(
+            {
+                "type": "directory_response",
+                "prompt_id": prompt["data"]["prompt_id"],
+                "granted": True,
+                "path": str(granted),
+                "writable": True,
+            }
+        )
+
+        types = []
+        while True:
+            event = ws.receive_json()
+            types.append(event["type"])
+            if event["type"] == "turn_done":
+                break
+
+    assert "tool_finished" in types
+    granted_root = next(
+        root for root in manager.get_roots("directory-race") if root["path"] == str(granted.resolve())
+    )
+    assert granted_root["writable"] is True
+    assert any(
+        any(
+            message.get("role") == "tool"
+            and message.get("content")
+            == '{"granted": true, "path": "%s", "writable": true}'
+            % str(granted.resolve())
+            for message in call["messages"]
+        )
+        for call in provider.calls[1:]
+    )
+
+
+def test_second_ws_agent_cannot_rebind_existing_session_prompt_route(tmp_path):
+    manager = SessionManager(
+        workspace=tmp_path,
+        provider=ScriptedProvider(
+            [
+                _tool(
+                    "write_file",
+                    {"path": "locked.txt", "content": "ok"},
+                    "call_route",
+                ),
+                _text("done"),
+            ]
+        ),
+    )
+    manager.inbox_routing.set_persona_default("link", "link-inbox")
+    manager.inbox_routing.set_persona_default("chat", "chat-inbox")
+    client = TestClient(create_app(manager))
+
+    with client.websocket_connect("/ws/session/route-locked?agent=link") as first:
+        ready = first.receive_json()
+        assert ready["type"] == "ready"
+        assert ready["data"]["agent"] == "link"
+        with client.websocket_connect("/ws/session/route-locked?agent=chat") as second:
+            second_ready = second.receive_json()
+            assert second_ready["type"] == "ready"
+            assert second_ready["data"]["agent"] == "link"
+
+        first.send_json({"type": "user_message", "text": "create locked.txt"})
+        while True:
+            prompt = first.receive_json()
+            if prompt["type"] == "permission_required":
+                break
+
+        inbox_item = manager.inbox.get(prompt["data"]["prompt_id"])
+        assert inbox_item is not None
+        assert inbox_item.inbox == "link-inbox"
+        assert inbox_item.inbox != "chat-inbox"
+
+        first.send_json(
+            {
+                "type": "approval",
+                "prompt_id": prompt["data"]["prompt_id"],
+                "decision": "once",
+            }
+        )
+        assert "turn_done" in _drain(first)
+
+
+def test_ws_unexpected_run_turn_exception_broadcasts_error_then_turn_done(
+    tmp_path, monkeypatch
+):
+    manager = SessionManager(workspace=tmp_path, provider=ScriptedProvider([]))
+    client = TestClient(create_app(manager))
+
+    async def broken_events(*args, **kwargs):
+        yield Event(EventType.TURN_START, {"input": "hello"})
+        raise RuntimeError("tracked events exploded")
+
+    monkeypatch.setattr(manager, "tracked_engine_events", broken_events)
+
+    with client.websocket_connect("/ws/session/run-turn-crash") as ws:
+        assert ws.receive_json()["type"] == "ready"
+        ws.send_json({"type": "user_message", "text": "hello"})
+
+        events = []
+        while True:
+            event = ws.receive_json()
+            events.append(event)
+            if event["type"] == "turn_done":
+                break
+
+        assert [event["type"] for event in events] == ["turn_start", "error", "turn_done"]
+        assert events[1]["data"]["error"] == "tracked events exploded"
+
+    assert manager.is_running("run-turn-crash") is False
+
+
+def test_ws_final_save_failure_broadcasts_error_then_turn_done(tmp_path, monkeypatch):
+    manager = SessionManager(workspace=tmp_path, provider=ScriptedProvider([_text("done")]))
+    client = TestClient(create_app(manager))
+
+    original_save = manager.save
+    calls = {"count": 0}
+
+    def flaky_save(session_id, engine):
+        calls["count"] += 1
+        if calls["count"] == 2:
+            raise RuntimeError("disk full")
+        return original_save(session_id, engine)
+
+    monkeypatch.setattr(manager, "save", flaky_save)
+
+    with client.websocket_connect("/ws/session/save-crash") as ws:
+        assert ws.receive_json()["type"] == "ready"
+        ws.send_json({"type": "user_message", "text": "hello"})
+
+        events = []
+        while True:
+            event = ws.receive_json()
+            events.append(event)
+            if event["type"] == "turn_done":
+                break
+
+    types = [event["type"] for event in events]
+    assert "assistant_message" in types
+    assert types[-2:] == ["error", "turn_done"]
+    assert events[-2]["data"]["error"] == "Failed to save session state."
+    assert manager.is_running("save-crash") is False
+
+
+def test_ws_manual_run_persists_final_answer_before_automation_finalizes(tmp_path):
+    workspace = tmp_path / "automation-workspace"
+    workspace.mkdir()
+    manager = SessionManager(
+        data_dir=tmp_path / "data",
+        provider=ScriptedProvider([_text("Final automation result")]),
+    )
+    task = ScheduledTask(
+        title="Daily brief",
+        instructions="Produce the brief",
+        schedule=Schedule(kind="cron", cron="10 19 * * *"),
+        workspace=str(workspace),
+        agent="link",
+    )
+    manager.task_store.save(task)
+    prepared = manager.prepare_manual_run(task.id)
+    client = TestClient(create_app(manager))
+
+    with client.websocket_connect(
+        f"/ws/session/{prepared['session_id']}?agent=link&workspace={workspace}"
+    ) as ws:
+        assert ws.receive_json()["type"] == "ready"
+        ws.send_json({"type": "user_message", "text": prepared["prompt"]})
+        events = _drain_events(ws)
+
+    assert events[-1]["type"] == "turn_done"
+    stored = manager.session_store.load(prepared["session_id"])
+    assert stored is not None
+    assert stored.messages[-1]["content"] == "Final automation result"
+    run = manager.get_automation(task.id)["runs"][0]
+    assert run["status"] == "ok"
+    assert run["result_text"] == "Final automation result"
+    assert manager.task_store.get(task.id).run_count == 1
+
+
+def test_ws_manual_run_save_failure_does_not_finalize_success(tmp_path, monkeypatch):
+    workspace = tmp_path / "automation-save-failure"
+    workspace.mkdir()
+    manager = SessionManager(
+        data_dir=tmp_path / "data",
+        provider=ScriptedProvider([_text("Unsaved result")]),
+    )
+    task = ScheduledTask(
+        title="Fragile brief",
+        instructions="Produce the brief",
+        schedule=Schedule(kind="cron", cron="10 19 * * *"),
+        workspace=str(workspace),
+        agent="link",
+    )
+    manager.task_store.save(task)
+    prepared = manager.prepare_manual_run(task.id)
+    original_save = manager.save
+    calls = 0
+
+    def fail_final_save(session_id, engine):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("disk full")
+        return original_save(session_id, engine)
+
+    monkeypatch.setattr(manager, "save", fail_final_save)
+    client = TestClient(create_app(manager))
+    with client.websocket_connect(
+        f"/ws/session/{prepared['session_id']}?agent=link&workspace={workspace}"
+    ) as ws:
+        assert ws.receive_json()["type"] == "ready"
+        ws.send_json({"type": "user_message", "text": prepared["prompt"]})
+        events = _drain_events(ws)
+
+    assert [event["type"] for event in events][-2:] == ["error", "turn_done"]
+    run = manager.get_automation(task.id)["runs"][0]
+    assert run["status"] == "running"
+    assert run["result_text"] is None
+    assert manager.task_store.get(task.id).run_count == 0

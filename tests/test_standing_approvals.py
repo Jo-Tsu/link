@@ -398,12 +398,12 @@ async def test_blocked_run_does_not_stall_other_tasks(tmp_path):
     store = TaskStore(tmp_path / "auto.db")
     blocked = _task(title="blocked")
     quick = _task(title="quick")
-    for t in (blocked, quick):
-        store.save(t)
-        store._conn.execute(
-            "UPDATE scheduled_tasks SET next_run=1.0 WHERE id=?", (t.id,)
-        )
-    store._conn.commit()
+    with store.transaction():
+        for t in (blocked, quick):
+            store.save(t)
+            store._conn.execute(
+                "UPDATE scheduled_tasks SET next_run=1.0 WHERE id=?", (t.id,)
+            )
 
     gate = asyncio.Event()
 

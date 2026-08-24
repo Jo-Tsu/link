@@ -179,6 +179,7 @@ def test_muted_connector_not_delivered(tmp_path, monkeypatch):
 
     async def fake_deliver(session_id, message, *, source=None):
         delivered.append(session_id)
+        return True
 
     monkeypatch.setattr(mgr, "deliver_to_session", fake_deliver)
 
@@ -207,6 +208,7 @@ def test_dm_muted_session_not_delivered(tmp_path, monkeypatch):
 
     async def fake_deliver(session_id, message, *, source=None):
         delivered.append(session_id)
+        return True
 
     monkeypatch.setattr(mgr, "deliver_to_session", fake_deliver)
 

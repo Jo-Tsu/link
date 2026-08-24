@@ -154,6 +154,7 @@ def test_dispatch_fans_out_to_subscribers(tmp_path, monkeypatch):
 
     async def fake_deliver(session_id, message, *, source=None):
         delivered.append((session_id, message))
+        return True
 
     monkeypatch.setattr(mgr, "deliver_to_session", fake_deliver)
 
@@ -203,6 +204,48 @@ def test_subscriptions_endpoint_and_collision(tmp_path):
     assert all("subscriptions" in s for s in sessions)
 
 
+def test_stale_subscription_is_dead_lettered(tmp_path, monkeypatch, caplog):
+    mgr = SessionManager(workspace=tmp_path, provider=ScriptedProvider([]))
+    _connect_slack(mgr)
+    mgr.subscriptions.subscribe("stale-sub", "slack:C1")
+
+    async def fake_deliver(session_id, message, *, source=None):
+        return False
+
+    monkeypatch.setattr(mgr, "deliver_to_session", fake_deliver)
+
+    with caplog.at_level("WARNING"):
+        asyncio.run(mgr._dispatch_inbound(_event("deploy failed", chat_type="channel")))
+
+    assert "subscription delivery dropped" in caplog.text
+    parked = mgr.unrouted.list()
+    assert parked[0]["source"] == "slack:C1"
+    assert parked[0]["sender"] == "bob"
+    assert parked[0]["text"] == "deploy failed"
+    assert "delivery failed for subscribed session stale-sub" in parked[0]["reason"]
+
+
+def test_subscription_delivery_exception_is_dead_lettered(tmp_path, monkeypatch, caplog):
+    mgr = SessionManager(workspace=tmp_path, provider=ScriptedProvider([]))
+    _connect_slack(mgr)
+    mgr.subscriptions.subscribe("sA", "slack:C1")
+
+    async def fake_deliver(session_id, message, *, source=None):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(mgr, "deliver_to_session", fake_deliver)
+
+    with caplog.at_level("WARNING"):
+        asyncio.run(mgr._dispatch_inbound(_event("deploy failed", chat_type="channel")))
+
+    assert "subscription delivery crashed" in caplog.text
+    parked = mgr.unrouted.list()
+    assert parked[0]["source"] == "slack:C1"
+    assert parked[0]["sender"] == "bob"
+    assert parked[0]["text"] == "deploy failed"
+    assert "delivery crashed for subscribed session sA: boom" in parked[0]["reason"]
+
+
 def test_subscribe_unsubscribe_and_recent_endpoints(tmp_path):
     from fastapi.testclient import TestClient
     from smallink.server import create_app
@@ -242,6 +285,7 @@ def test_unauthorized_messages_park_and_resolve(tmp_path, monkeypatch):
 
     async def fake_deliver(session_id, message, *, source=None):
         delivered.append((session_id, message))
+        return True
 
     monkeypatch.setattr(mgr, "deliver_to_session", fake_deliver)
     mgr.subscriptions.subscribe("sA", "slack:C1")

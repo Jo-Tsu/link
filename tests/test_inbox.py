@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 
 from smallink.inbox import (
     KIND_APPROVAL,
@@ -36,6 +37,129 @@ def test_resolve_is_idempotent_first_responder_wins(tmp_path):
 def test_resolve_unknown_item(tmp_path):
     store = InboxStore(tmp_path / "inbox.json")
     assert store.resolve("nope", "allow") is False
+
+
+def test_resolve_wakes_waiter_from_another_thread_under_asyncio_debug(tmp_path):
+    store = InboxStore(tmp_path / "inbox.json")
+    item = store.add_approval("s1", "Run shell?")
+    resolved = threading.Event()
+    errors: list[BaseException] = []
+
+    async def scenario() -> str:
+        def resolve_from_worker() -> None:
+            try:
+                assert store.resolve(item.id, "allow") is True
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                resolved.set()
+
+        worker = threading.Thread(target=resolve_from_worker)
+        waiter = asyncio.create_task(store.wait(item.id))
+        await asyncio.sleep(0)
+        worker.start()
+        try:
+            return await asyncio.wait_for(waiter, timeout=2)
+        finally:
+            worker.join(timeout=2)
+
+    assert asyncio.run(scenario(), debug=True) == "allow"
+    assert resolved.is_set()
+    assert errors == []
+
+
+def test_resolve_wakes_same_item_waiters_on_two_event_loops(tmp_path):
+    store = InboxStore(tmp_path / "inbox.json")
+    item = store.add_question("s1", "Which environment?")
+    ready = threading.Barrier(3)
+    results: list[str] = []
+    errors: list[BaseException] = []
+
+    def wait_in_thread() -> None:
+        async def scenario() -> None:
+            waiter = asyncio.create_task(store.wait(item.id))
+            await asyncio.sleep(0)
+            ready.wait(timeout=5)
+            results.append(await asyncio.wait_for(waiter, timeout=2))
+
+        try:
+            asyncio.run(scenario(), debug=True)
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=wait_in_thread) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    ready.wait(timeout=5)
+    assert store.resolve(item.id, "production") is True
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert errors == []
+    assert results == ["production", "production"]
+
+
+def test_resolve_skips_and_cleans_waiter_on_closed_loop(tmp_path):
+    store = InboxStore(tmp_path / "inbox.json")
+    item = store.add_question("s1", "Which environment?")
+    started = threading.Event()
+    finished = threading.Event()
+
+    def wait_then_close_loop() -> None:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        async def scenario() -> None:
+            waiter = asyncio.create_task(store.wait(item.id))
+            await asyncio.sleep(0)
+            started.set()
+            waiter.cancel()
+            try:
+                await waiter
+            except asyncio.CancelledError:
+                pass
+
+        try:
+            loop.run_until_complete(scenario())
+        finally:
+            loop.close()
+            asyncio.set_event_loop(None)
+            finished.set()
+
+    thread = threading.Thread(target=wait_then_close_loop)
+    thread.start()
+    assert started.wait(timeout=5)
+    assert finished.wait(timeout=5)
+    thread.join(timeout=5)
+
+    assert store.resolve(item.id, "production") is True
+    assert store.get(item.id).resolution == "production"
+    assert store._waiters.get(item.id) in (None, [])
+
+
+def test_add_is_atomic_for_the_same_tool_call(tmp_path):
+    store = InboxStore(tmp_path / "inbox.json")
+    ready = threading.Barrier(3)
+    items = []
+
+    def add_from_thread() -> None:
+        ready.wait(timeout=5)
+        items.append(
+            store.add_question(
+                "s1", "Which environment?", tool_call_id="tool-call-1"
+            )
+        )
+
+    threads = [threading.Thread(target=add_from_thread) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    ready.wait(timeout=5)
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert len(items) == 2
+    assert items[0].id == items[1].id
+    assert len(store.pending("s1")) == 1
 
 
 def test_persistence(tmp_path):

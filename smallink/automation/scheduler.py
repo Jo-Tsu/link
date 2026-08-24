@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Awaitable, Callable, Optional
 
 from .models import ScheduledTask, TaskRun
@@ -89,25 +90,41 @@ class Scheduler:
                 logger.exception("scheduler extra_tick (wake resume) failed")
 
     async def run_task(self, task: ScheduledTask, *, trigger: str) -> Optional[TaskRun]:
-        if task.id in self._running_ids:  # skip-on-overlap
-            logger.info("skipping %s — previous run still going", task.id)
+        fresh = task
+        if trigger in {"schedule", "catchup"}:
+            fresh = self.store.get(task.id)
+            if fresh is None:
+                logger.info("skipping %s — task was deleted before run start", task.id)
+                return None
+            if not fresh.enabled:
+                logger.info("skipping %s — task disabled before run start", task.id)
+                return None
+            due_now = {due.id for due in self.store.due()}
+            if fresh.id not in due_now:
+                logger.info("skipping %s — task no longer due", task.id)
+                return None
+        if fresh.id in self._running_ids:  # skip-on-overlap
+            logger.info("skipping %s — previous run still going", fresh.id)
             return None
-        self._running_ids.add(task.id)
+        self._running_ids.add(fresh.id)
         try:
-            run = await self.runner(task, trigger)
+            run = await self.runner(fresh, trigger)
+            if run.status == "running":
+                logger.warning("task %s runner returned a running run; marking as error", fresh.id)
+                run.status = "error"
+                run.error = run.error or "runner returned unfinished run"
+                run.finished_at = run.finished_at or time.time()
+            self.store.complete_run(run)
         except Exception as exc:
-            logger.exception("task %s run failed", task.id)
+            logger.exception("task %s run failed", fresh.id)
             run = TaskRun(
-                task_id=task.id, status="error", error=str(exc), trigger=trigger
+                task_id=fresh.id,
+                status="error",
+                error=str(exc),
+                trigger=trigger,
+                finished_at=time.time(),
             )
-            self.store.add_run(run)
+            self.store.complete_run(run)
         finally:
-            self._running_ids.discard(task.id)
-        # advance the task (run_count/last_run) → save recomputes next_run.
-        fresh = self.store.get(task.id)
-        if fresh is not None:
-            fresh.run_count += 1
-            fresh.last_run = run.started_at if run else None
-            fresh.last_status = run.status if run else "error"
-            self.store.save(fresh)
+            self._running_ids.discard(fresh.id)
         return run

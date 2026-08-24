@@ -84,6 +84,7 @@ def _capture_deliveries(mgr, monkeypatch):
 
     async def fake_deliver(session_id, message, *, source=None):
         captured.append((session_id, message, source))
+        return True
 
     monkeypatch.setattr(mgr, "deliver_to_session", fake_deliver)
     return captured
@@ -250,6 +251,101 @@ def test_untagged_channel_traffic_stays_judgement_only(tmp_path, monkeypatch):
     mgr.subscriptions.unsubscribe("sA", "slack:C1")
     asyncio.run(mgr._dispatch_inbound(_plain_event(ts="1700000013.000400")))
     assert captured == [] and mgr.list_sessions() == []
+
+
+def test_stale_mention_session_is_dead_lettered(tmp_path, monkeypatch, caplog):
+    mgr = _mgr(tmp_path)
+    thread_target = "slack:C1:1700000010.000100"
+    mgr.mention_sessions.set(thread_target, "stale-session", channel="slack:C1")
+    record = SessionRecord(
+        session_id="stale-session",
+        workspace=str(tmp_path),
+        model="gpt-5.6-sol",
+        mode="interactive",
+        messages=[],
+        agent="chat",
+    )
+    mgr.session_store.save(record)
+
+    async def fake_deliver(session_id, message, *, source=None):
+        return False
+
+    monkeypatch.setattr(mgr, "deliver_to_session", fake_deliver)
+
+    with caplog.at_level("WARNING"):
+        asyncio.run(
+            mgr._dispatch_inbound(
+                _mention_event(
+                    "<@UBOT> and staging too",
+                    ts="1700000012.000300",
+                    thread_ts="1700000010.000100",
+                )
+            )
+        )
+
+    assert "mention follow-up dropped" in caplog.text
+    parked = mgr.unrouted.list()
+    assert parked[0]["source"] == "slack:C1:1700000010.000100"
+    assert parked[0]["text"] == "<@UBOT> and staging too"
+    assert "mention follow-up failed for session stale-session" in parked[0]["reason"]
+
+
+def test_mention_followup_exception_is_dead_lettered(tmp_path, monkeypatch, caplog):
+    mgr = _mgr(tmp_path)
+    thread_target = "slack:C1:1700000010.000100"
+    mgr.mention_sessions.set(thread_target, "stale-session", channel="slack:C1")
+    record = SessionRecord(
+        session_id="stale-session",
+        workspace=str(tmp_path),
+        model="gpt-5.6-sol",
+        mode="interactive",
+        messages=[],
+        agent="chat",
+    )
+    mgr.session_store.save(record)
+
+    async def fake_deliver(session_id, message, *, source=None):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(mgr, "deliver_to_session", fake_deliver)
+
+    with caplog.at_level("WARNING"):
+        asyncio.run(
+            mgr._dispatch_inbound(
+                _mention_event(
+                    "<@UBOT> and staging too",
+                    ts="1700000012.000300",
+                    thread_ts="1700000010.000100",
+                )
+            )
+        )
+
+    assert "mention follow-up crashed" in caplog.text
+    parked = mgr.unrouted.list()
+    assert parked[0]["source"] == "slack:C1:1700000010.000100"
+    assert parked[0]["text"] == "<@UBOT> and staging too"
+    assert "mention follow-up crashed for session stale-session: boom" in parked[0]["reason"]
+
+
+def test_subscribed_mention_delivery_exception_is_dead_lettered(
+    tmp_path, monkeypatch, caplog
+):
+    mgr = _mgr(tmp_path)
+    mgr.subscriptions.subscribe("sA", "slack:C1")
+
+    async def fake_deliver(session_id, message, *, source=None):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(mgr, "deliver_to_session", fake_deliver)
+
+    with caplog.at_level("WARNING"):
+        asyncio.run(mgr._dispatch_inbound(_mention_event()))
+
+    assert "mention delivery crashed" in caplog.text
+    parked = mgr.unrouted.list()
+    assert parked[0]["source"] == "slack:C1"
+    assert parked[0]["text"] == "<@UBOT> check the deploy?"
+    assert "mention delivery crashed for session sA: boom" in parked[0]["reason"]
 
 
 # -- origin persistence ---------------------------------------------------------------

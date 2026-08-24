@@ -120,6 +120,48 @@ def test_failed_background_turn_is_parked_not_swallowed(tmp_path):
     assert "dead" in parked[0]["reason"] or "401" in parked[0]["reason"]
 
 
+def test_background_prompt_is_broadcast_once_with_prompt_id(tmp_path):
+    from smallink.providers import ToolCall
+
+    mgr = SessionManager(
+        workspace=tmp_path,
+        provider=ScriptedProvider(
+            [
+                AssistantTurn(
+                    tool_calls=[
+                        ToolCall(
+                            id="call-1",
+                            name="write_file",
+                            arguments={"path": "x.txt", "content": "x"},
+                        )
+                    ],
+                    finish_reason="tool_calls",
+                ),
+                _text("done"),
+            ]
+        ),
+    )
+    mgr.get_engine("S", agent="link")
+    events, cb = _collector()
+    mgr.register_session_client("S", cb)
+
+    async def scenario():
+        delivery = asyncio.create_task(mgr.deliver_to_session("S", "write it"))
+        for _ in range(200):
+            prompts = [event for event in events if event["type"] == "permission_required"]
+            if prompts:
+                break
+            await asyncio.sleep(0.005)
+        assert len(prompts) == 1
+        prompt_id = prompts[0]["data"].get("prompt_id")
+        assert prompt_id
+        assert mgr.inbox.resolve(prompt_id, "once") is True
+        assert await asyncio.wait_for(delivery, timeout=2) is True
+
+    asyncio.run(scenario())
+    assert len([event for event in events if event["type"] == "permission_required"]) == 1
+
+
 def test_unrouted_endpoint(tmp_path):
     from fastapi.testclient import TestClient
     from smallink.server import create_app

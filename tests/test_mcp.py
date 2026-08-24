@@ -14,6 +14,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from smallink.mcp import build_callables, load_mcp_servers, tool_name
+from smallink.mcp.client import MCPManager
 from smallink.mcp.config import MCPServerDef
 from smallink.secrets import SecretStore
 from smallink.server.app import create_app
@@ -134,6 +135,28 @@ async def test_bridge_invokes_session_on_loop():
     result = await asyncio.to_thread(fn, path="a.txt")
     assert result == {"echo": {"path": "a.txt"}}
     assert seen == [("read_file", {"path": "a.txt"})]
+
+
+async def test_aclose_waits_for_cancelled_connection_cleanup(monkeypatch):
+    manager = MCPManager()
+    cleanup_done = asyncio.Event()
+
+    async def slow_cleanup():
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await asyncio.sleep(0.02)
+            cleanup_done.set()
+
+    task = asyncio.create_task(slow_cleanup())
+    manager._tasks["slow"] = task
+    monkeypatch.setattr("smallink.mcp.client.MCP_SHUTDOWN_TIMEOUT_SECONDS", 0.01)
+
+    await manager.aclose()
+
+    assert cleanup_done.is_set()
+    assert task.done()
+    assert manager._tasks == {}
 
 
 # -- REST ----------------------------------------------------------------------
